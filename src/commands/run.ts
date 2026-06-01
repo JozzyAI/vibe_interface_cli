@@ -108,7 +108,7 @@ export function registerRunCommand(program: Command): void {
     .action((run_id: string) => {
       const record = readRun(run_id)
 
-      if (record.status === 'completed' || record.status === 'failed' || record.status === 'stopped') {
+      if (record.status === 'completed' || record.status === 'failed' || record.status === 'stopped' || record.status === 'cancelled') {
         err(`error: run ${run_id} is already in terminal state: ${record.status}`)
         process.exit(1)
       }

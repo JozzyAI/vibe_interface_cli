@@ -1,4 +1,11 @@
-export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'blocked'
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'cancelled'
+  | 'blocked'
 
 export type AgentBackend = 'mock' | 'claude-code' | 'codex' | 'opencode'
 
@@ -67,8 +74,65 @@ export type RunEvent =
   | PrCreatedEvent
   | ErrorEvent
 
-export const TERMINAL_STATUSES: RunStatus[] = ['completed', 'failed', 'stopped']
+export const TERMINAL_STATUSES: RunStatus[] = ['completed', 'failed', 'stopped', 'cancelled']
 
 export function isTerminal(event: RunEvent): boolean {
   return event.type === 'status' && TERMINAL_STATUSES.includes((event as StatusEvent).status)
+}
+
+// ── Structured error (for future HTTP API / relay responses) ───────────────
+
+export type VibeErrorCode = 'user_error' | 'not_found' | 'backend_error' | 'read_only'
+
+export interface VibeError {
+  error: true
+  code: VibeErrorCode
+  message: string
+  run_id?: string
+  ts: string
+}
+
+// ── Envelope abstraction (MVP 4 will swap plaintext → encrypted) ───────────
+//
+// All inter-node messages use this envelope. MVP 0.5 only ever emits
+// kind="plaintext". When remote transport (MVP 3) and E2E encryption
+// (MVP 4) arrive, add kind="encrypted" senders without touching the
+// event schema — only the envelope wrapping changes.
+
+export type VibeEnvelope =
+  | {
+      version: 1
+      kind: 'plaintext'
+      from: string          // node_id or "local"
+      to: string            // node_id, run_id, or "*"
+      run_id?: string
+      ts: string
+      payload: RunEvent
+    }
+  | {
+      version: 1
+      kind: 'encrypted'
+      from: string
+      to: string
+      run_id?: string
+      ts: string
+      key_id: string
+      nonce: string
+      ciphertext: string    // base64-encoded encrypted payload
+    }
+
+export function wrapPlaintext(
+  event: RunEvent,
+  from: string,
+  to: string,
+): VibeEnvelope {
+  return {
+    version: 1,
+    kind: 'plaintext',
+    from,
+    to,
+    run_id: event.run_id,
+    ts: event.ts,
+    payload: event,
+  }
 }

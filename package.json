@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "tsc && node --test dist/test/contract.test.js"
+    "test": "tsc && node --test dist/test/contract.test.js dist/test/orchestrator.smoke.test.js"
   },
   "dependencies": {
     "commander": "^13.0.0"
