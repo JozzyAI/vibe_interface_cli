@@ -16,14 +16,47 @@ vibe symphony status <run_id>
 vibe symphony stop   <run_id> [--reason <reason>]
 ```
 
-## Quick start
+## 5-minute quickstart
 
 ```bash
-npm install && npm run build
+git clone https://github.com/JozzyAI/vibe_interface_cli
+cd vibe_interface_cli
+npm install
+npm run build
+npm link          # exposes `vibe` as a global command
 
-# Mock backend (no real agent, safe for testing)
-vibe run start --agent mock --workspace-key test1
-vibe run stream <run_id>
+vibe --version    # 0.1.0
+vibe --help
+```
+
+**Run a mock job (no API key, no agent needed):**
+
+```bash
+result=$(vibe run start --agent mock --workspace-key demo --json)
+run_id=$(echo "$result" | jq -r .run_id)
+
+vibe run stream "$run_id" --jsonl
+# → streams log events, approval_required, then status:completed
+```
+
+**Use with Symphony (universe-symphony fork):**
+
+```bash
+# Clone and build vibe first (above), then:
+cd path/to/universe-symphony/elixir
+bash scripts/smoke_vibe_mock.sh
+
+# Optional — requires `claude` in PATH:
+bash scripts/smoke_vibe_claude.sh
+```
+
+**Symphony WORKFLOW.md config:**
+
+```yaml
+agent_kind: vibe
+external:
+  command: vibe
+  agent: mock       # or claude-code
 ```
 
 ## Backends
@@ -45,9 +78,24 @@ vibe run start --agent claude-code --permission-mode unsafe-skip --prompt-file t
 
 **Do not use `--permission-mode unsafe-skip` on untrusted workspaces, shared machines, or in production environments.** It is intended for local development and CI environments where the workspace is fully controlled.
 
-## State files
+## Architecture
 
-All state is local. No network required for MVP 0–1.
+```
+Orchestrator (Symphony or any CLI caller)
+  ↓
+vibe run start / vibe symphony start      → returns run_id (JSON)
+  ↓
+Background runner (detached process)
+  ↓ writes JSONL events to ~/.vibe/events/<run_id>.jsonl
+  ↑
+vibe run stream / vibe symphony stream    → tails event log (JSONL)
+vibe run status / vibe symphony status   → reads run record (JSON)
+vibe run stop   / vibe symphony stop     → kills runner, writes stopped
+```
+
+All state is local files. No network required for mock or claude-code backends.
+
+## State files
 
 ```
 ~/.vibe/
@@ -68,6 +116,14 @@ All events are JSONL with `{ type, run_id, ts, ... }`.
 | `tool_call` | `tool: string`, `input?: unknown` |
 | `error` | `message: string` |
 
+## Development
+
+```bash
+npm run build          # clean build to dist/
+npm test               # build + run 26 contract tests
+npm run dev            # watch mode
+```
+
 ## Symphony integration
 
 ```bash
@@ -82,12 +138,12 @@ result=$(vibe symphony start \
 
 run_id=$(echo "$result" | jq -r .run_id)
 
-vibe symphony stream "$run_id" | while IFS= read -r line; do
+vibe symphony stream "$run_id" --jsonl | while IFS= read -r line; do
   type=$(echo "$line" | jq -r .type)
   case "$type" in
     completed|failed|stopped) break ;;
   esac
 done
 
-vibe symphony status "$run_id"
+vibe symphony status "$run_id" --json
 ```
