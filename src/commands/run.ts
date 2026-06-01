@@ -10,12 +10,17 @@ import { claudeCodeBackend } from '../backends/claude-code.js'
 import type { AgentBackend, RunRecord } from '../types.js'
 import type { Backend } from '../backends/types.js'
 
+// All human-readable messages go to stderr so stdout stays machine-readable.
+function err(msg: string): void {
+  process.stderr.write(msg + '\n')
+}
+
 function getBackend(agent: AgentBackend): Backend {
   switch (agent) {
     case 'mock': return mockBackend
     case 'claude-code': return claudeCodeBackend
     default:
-      process.stderr.write(`error: unknown agent backend "${agent}"\n`)
+      err(`error: unknown agent backend "${agent}"`)
       process.exit(1)
   }
 }
@@ -32,6 +37,7 @@ export function registerRunCommand(program: Command): void {
     .option('--workspace-key <key>', 'unique key for workspace directory (default: run_id)')
     .option('--prompt-file <path>', 'path to prompt file')
     .option('--metadata-file <path>', 'path to JSON metadata file')
+    .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
       const config = resolveConfig()
       const run_id = generateRunId()
@@ -80,14 +86,16 @@ export function registerRunCommand(program: Command): void {
   run
     .command('stream <run_id>')
     .description('stream events for a run as JSONL')
+    .option('--jsonl', 'output machine-readable JSONL to stdout (default behaviour)')
     .action((run_id: string) => {
-      readRun(run_id) // validates existence
+      readRun(run_id) // validates existence, exits 3 if not found
       streamEvents(run_id)
     })
 
   run
     .command('status <run_id>')
     .description('get current status of a run')
+    .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action((run_id: string) => {
       const record = readRun(run_id)
       process.stdout.write(JSON.stringify(record) + '\n')
@@ -96,26 +104,25 @@ export function registerRunCommand(program: Command): void {
   run
     .command('stop <run_id>')
     .description('stop a running run')
+    .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action((run_id: string) => {
       const record = readRun(run_id)
 
       if (record.status === 'completed' || record.status === 'failed' || record.status === 'stopped') {
-        process.stderr.write(`run ${run_id} is already in terminal state: ${record.status}\n`)
+        err(`error: run ${run_id} is already in terminal state: ${record.status}`)
         process.exit(1)
       }
 
       if (record.session_id) {
-        if (record.session_id.startsWith('mock_') || record.session_id.startsWith('vi_')) {
-          try { execSync(`tmux kill-session -t ${record.session_id}`, { stdio: 'ignore' }) } catch {}
+        const pid = parseInt(record.session_id, 10)
+        if (!isNaN(pid) && pid > 0) {
+          try { process.kill(pid, 'SIGTERM') } catch {}
         } else {
-          const pid = parseInt(record.session_id, 10)
-          if (!isNaN(pid)) {
-            try { process.kill(pid, 'SIGTERM') } catch {}
-          }
+          try { execSync(`tmux kill-session -t ${record.session_id}`, { stdio: 'ignore' }) } catch {}
         }
       }
 
-      appendEvent({ type: 'stopped', run_id, ts: new Date().toISOString() })
+      appendEvent({ type: 'status', run_id, session_id: record.session_id, status: 'stopped', ts: new Date().toISOString() })
       const updated = updateRun(run_id, { status: 'stopped' })
       process.stdout.write(JSON.stringify(updated) + '\n')
     })

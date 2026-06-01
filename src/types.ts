@@ -18,25 +18,57 @@ export interface RunRecord {
   updated_at: string
 }
 
-export type RunEventType =
-  | 'session_started'
-  | 'output'
-  | 'status_change'
-  | 'approval_required'
-  | 'completed'
-  | 'failed'
-  | 'stopped'
+// ── Stable JSONL event schema ──────────────────────────────────────────────
 
-export interface RunEvent {
-  type: RunEventType
+interface BaseEvent {
   run_id: string
+  session_id?: string
   ts: string
-  data?: {
-    text?: string
-    status?: RunStatus
-    message?: string
-    exit_code?: number
-  }
 }
 
-export const TERMINAL_EVENTS: RunEventType[] = ['completed', 'failed', 'stopped']
+export interface StatusEvent extends BaseEvent {
+  type: 'status'
+  status: RunStatus
+}
+
+export interface LogEvent extends BaseEvent {
+  type: 'log'
+  stream: 'stdout' | 'stderr'
+  message: string
+}
+
+export interface ApprovalRequiredEvent extends BaseEvent {
+  type: 'approval_required'
+  approval_id: string
+  message: string
+}
+
+export interface ToolCallEvent extends BaseEvent {
+  type: 'tool_call'
+  tool: string
+  input?: unknown
+}
+
+export interface PrCreatedEvent extends BaseEvent {
+  type: 'pr_created'
+  url: string
+}
+
+export interface ErrorEvent extends BaseEvent {
+  type: 'error'
+  message: string
+}
+
+export type RunEvent =
+  | StatusEvent
+  | LogEvent
+  | ApprovalRequiredEvent
+  | ToolCallEvent
+  | PrCreatedEvent
+  | ErrorEvent
+
+export const TERMINAL_STATUSES: RunStatus[] = ['completed', 'failed', 'stopped']
+
+export function isTerminal(event: RunEvent): boolean {
+  return event.type === 'status' && TERMINAL_STATUSES.includes((event as StatusEvent).status)
+}

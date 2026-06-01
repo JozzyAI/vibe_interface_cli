@@ -1,7 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { vibeDir } from './config.js'
-import { TERMINAL_EVENTS, type RunEvent } from './types.js'
+import { isTerminal, type RunEvent } from './types.js'
 
 function eventsPath(run_id: string): string {
   return path.join(vibeDir(), 'events', `${run_id}.jsonl`)
@@ -41,7 +41,7 @@ export function streamEvents(run_id: string): void {
       process.stdout.write(line + '\n')
       try {
         const event = JSON.parse(line) as RunEvent
-        if (TERMINAL_EVENTS.includes(event.type)) return true
+        if (isTerminal(event)) return true
       } catch {
         // skip malformed line
       }
@@ -49,14 +49,10 @@ export function streamEvents(run_id: string): void {
     return false
   }
 
-  // drain existing content first
   if (flush()) return
 
-  // poll for new content every 250ms
   const interval = setInterval(() => {
-    if (flush()) {
-      clearInterval(interval)
-    }
+    if (flush()) clearInterval(interval)
   }, 250)
 
   process.on('SIGINT', () => {

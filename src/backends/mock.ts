@@ -9,14 +9,12 @@ const ENTRY = path.resolve(__dirname, '..', 'index.js')
 
 export const mockBackend: Backend = {
   async start(run: RunRecord, _opts: StartOptions): Promise<StartResult> {
-    const session_id = `mock_${run.run_id}`
-
     const child = spawn(process.execPath, [ENTRY, '_mock-runner', run.run_id], {
       detached: true,
       stdio: 'ignore',
     })
+    const pid = child.pid ?? 0
     child.unref()
-
-    return { session_id }
+    return { session_id: String(pid) }
   },
 }

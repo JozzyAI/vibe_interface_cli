@@ -1,7 +1,7 @@
 import { appendEvent } from './events.js'
-import { updateRun } from './store.js'
+import { readRun, updateRun } from './store.js'
 
-const FAKE_OUTPUT = [
+const FAKE_LOGS = [
   'Cloning repository...',
   'Installing dependencies...',
   'Analyzing codebase...',
@@ -14,28 +14,31 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function runMockRunner(run_id: string): Promise<void> {
+  const record = readRun(run_id)
+  const session_id = record.session_id
   const ts = () => new Date().toISOString()
 
-  appendEvent({ type: 'session_started', run_id, ts: ts() })
+  appendEvent({ type: 'status', run_id, session_id, status: 'running', ts: ts() })
 
-  for (const line of FAKE_OUTPUT) {
+  for (const message of FAKE_LOGS) {
     await sleep(400)
-    appendEvent({ type: 'output', run_id, ts: ts(), data: { text: line } })
+    appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message, ts: ts() })
   }
-
-  appendEvent({ type: 'status_change', run_id, ts: ts(), data: { status: 'running' } })
 
   await sleep(1500)
 
+  const approval_id = `appr_${Date.now().toString(36)}`
   appendEvent({
     type: 'approval_required',
     run_id,
+    session_id,
+    approval_id,
+    message: 'Proceed with modifying tracked files?',
     ts: ts(),
-    data: { message: 'Proceed with modifying tracked files?' },
   })
 
   await sleep(2000)
 
-  appendEvent({ type: 'completed', run_id, ts: ts(), data: { exit_code: 0 } })
+  appendEvent({ type: 'status', run_id, session_id, status: 'completed', ts: ts() })
   updateRun(run_id, { status: 'completed' })
 }
