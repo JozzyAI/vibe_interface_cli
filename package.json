@@ -1,0 +1,20 @@
+{
+  "name": "vibe-interface-cli",
+  "version": "0.1.0",
+  "description": "Universal worker-node runtime for coding-agent orchestrators",
+  "type": "module",
+  "bin": {
+    "vibe": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "commander": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
