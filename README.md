@@ -5,15 +5,18 @@ Universal worker-node runtime for coding-agent orchestrators.
 Provides a stable, machine-readable CLI contract that any orchestrator (e.g. Symphony) can call to start, stream, inspect, and stop coding-agent runs.
 
 ```
-vibe run start  --agent <backend> --workspace-key <key> [options]
+vibe run start  --agent <backend> --workspace-key <key> [--node auto|local] [options]
 vibe run stream <run_id>
 vibe run status <run_id>
 vibe run stop   <run_id>
 
-vibe symphony start  --issue-id <id> --agent <backend> [options]
+vibe symphony start  --issue-id <id> --agent <backend> [--node auto|local] [options]
 vibe symphony stream <run_id>
 vibe symphony status <run_id>
 vibe symphony stop   <run_id> [--reason <reason>]
+
+vibe node list
+vibe node status <node_id>
 ```
 
 ## 5-minute quickstart
@@ -29,10 +32,19 @@ vibe --version    # 0.1.0
 vibe --help
 ```
 
+**Inspect available nodes:**
+
+```bash
+vibe node list --json
+# → [{"node_id":"local","name":"Local Machine","status":"online","agents":["mock","claude-code"],...}]
+
+vibe node status local --json
+```
+
 **Run a mock job (no API key, no agent needed):**
 
 ```bash
-result=$(vibe run start --agent mock --workspace-key demo --json)
+result=$(vibe run start --agent mock --workspace-key demo --node auto --json)
 run_id=$(echo "$result" | jq -r .run_id)
 
 vibe run stream "$run_id" --jsonl

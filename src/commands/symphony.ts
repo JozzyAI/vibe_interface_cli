@@ -27,6 +27,7 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--prompt-file <path>', 'path to prompt file')
     .option('--metadata-file <path>', 'path to JSON metadata file')
     .option('--permission-mode <mode>', 'permission mode: default | unsafe-skip (unsafe-skip enables --dangerously-skip-permissions)')
+    .option('--node <id>', 'node to run on: auto | local | <node_id> (default: auto)')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
       const extraMetadata: Record<string, unknown> = { source: 'symphony' }
@@ -37,6 +38,7 @@ export function registerSymphonyCommand(program: Command): void {
 
       const record = await startRun({
         agent: opts.agent as AgentBackend,
+        node: opts.node as string | undefined,
         workspaceKey,
         repoUrl: opts.repoUrl,
         branch: opts.branch,

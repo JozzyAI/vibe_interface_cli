@@ -16,6 +16,7 @@ export interface RunRecord {
   run_id: string
   session_id: string
   node_id: string
+  node_selector?: string   // 'auto' | 'local' | explicit node_id passed by caller
   agent: AgentBackend
   status: RunStatus
   workspace_path: string
@@ -26,6 +27,22 @@ export interface RunRecord {
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
   child_pid?: number       // PID of spawned agent process (for kill-on-stop)
+  created_at: string
+  updated_at: string
+}
+
+// ── Node abstraction ──────────────────────────────────────────────────────────
+
+export interface VibeNode {
+  node_id: string
+  name: string
+  status: 'online' | 'offline'
+  transport: 'local'
+  capabilities: string[]
+  agents: string[]
+  active_runs: number
+  max_runs: number
+  workspace_roots: string[]
   created_at: string
   updated_at: string
 }
@@ -87,7 +104,13 @@ export function isTerminal(event: RunEvent): boolean {
 
 // ── Structured error (for future HTTP API / relay responses) ───────────────
 
-export type VibeErrorCode = 'user_error' | 'not_found' | 'backend_error' | 'read_only'
+export type VibeErrorCode =
+  | 'user_error'
+  | 'not_found'
+  | 'backend_error'
+  | 'read_only'
+  | 'node_not_found'
+  | 'agent_not_supported'
 
 export interface VibeError {
   error: true
