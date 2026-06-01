@@ -121,6 +121,11 @@ export function registerRunCommand(program: Command): void {
           try { execSync(`tmux kill-session -t ${record.session_id}`, { stdio: 'ignore' }) } catch {}
         }
       }
+      // Also kill the agent child process (separate process group)
+      if (record.child_pid) {
+        try { process.kill(-record.child_pid, 'SIGTERM') } catch {}
+        try { process.kill(record.child_pid, 'SIGTERM') } catch {}
+      }
 
       appendEvent({ type: 'status', run_id, session_id: record.session_id, status: 'stopped', ts: new Date().toISOString() })
       const updated = updateRun(run_id, { status: 'stopped' })

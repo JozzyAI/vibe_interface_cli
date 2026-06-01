@@ -17,7 +17,7 @@ import { fileURLToPath } from 'url'
 import type { RunRecord, RunEvent, StatusEvent, LogEvent, ApprovalRequiredEvent } from '../src/types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const CLI = path.resolve(__dirname, '..', 'index.js')
+const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
 
 function vibe(...args: string[]) {

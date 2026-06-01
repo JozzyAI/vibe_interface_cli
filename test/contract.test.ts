@@ -5,7 +5,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const CLI = path.resolve(__dirname, '..', 'index.js')
+const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
 
 function vibe(...args: string[]) {
@@ -49,11 +49,15 @@ test('run start rejects path traversal', () => {
   assert.equal(r.stdout.trim(), '')
 })
 
-test('run start claude-code stub: exits non-zero, error on stderr, nothing on stdout', () => {
+test('run start claude-code: returns valid running RunRecord immediately', () => {
+  // claude-code now spawns a real runner; start itself always exits 0 with JSON
   const r = vibe('run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey('stub'))
-  assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /claude-code/)
-  assert.equal(r.stdout.trim(), '')
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`)
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.agent, 'claude-code')
+  assert.ok(['queued', 'running'].includes(record.status))
+  // clean up — stop the detached runner
+  vibe('run', 'stop', record.run_id)
 })
 
 // ── stream ─────────────────────────────────────────────────────────────────

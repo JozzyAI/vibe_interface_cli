@@ -1,0 +1,49 @@
+#!/usr/bin/env node
+// Fake claude CLI for contract tests.
+// FAKE_CLAUDE_EXIT_CODE — exit code to use (default 0)
+// FAKE_CLAUDE_HANG     — if set, hang after init (for stop tests)
+
+const exitCode = parseInt(process.env.FAKE_CLAUDE_EXIT_CODE ?? '0', 10)
+const hang = !!process.env.FAKE_CLAUDE_HANG
+
+const sessionId = `fake-${Date.now().toString(36)}`
+
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n')
+}
+
+let prompt = ''
+process.stdin.on('data', (d) => { prompt += d })
+process.stdin.on('end', () => {
+  emit({ type: 'system', subtype: 'init', session_id: sessionId, cwd: process.cwd(), tools: [] })
+
+  if (hang) {
+    // Hang indefinitely until killed
+    setInterval(() => {}, 60000)
+    return
+  }
+
+  setTimeout(() => {
+    if (exitCode === 0) {
+      emit({
+        type: 'assistant',
+        session_id: sessionId,
+        message: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: `Completed task: ${prompt.substring(0, 80).trim()}` }],
+        },
+      })
+    }
+
+    emit({
+      type: 'result',
+      subtype: exitCode === 0 ? 'success' : 'error',
+      is_error: exitCode !== 0,
+      result: exitCode === 0 ? 'Done' : 'Failed',
+      session_id: sessionId,
+    })
+
+    process.exit(exitCode)
+  }, 100)
+})

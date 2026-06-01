@@ -21,6 +21,7 @@ export interface RunRecord {
   branch?: string
   prompt_file?: string
   metadata?: Record<string, unknown>
+  child_pid?: number       // PID of spawned agent process (for kill-on-stop)
   created_at: string
   updated_at: string
 }

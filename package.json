@@ -4,12 +4,12 @@
   "description": "Universal worker-node runtime for coding-agent orchestrators",
   "type": "module",
   "bin": {
-    "vibe": "./dist/index.js"
+    "vibe": "./dist/src/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && tsc",
     "dev": "tsc --watch",
-    "test": "tsc && node --test dist/test/contract.test.js dist/test/orchestrator.smoke.test.js"
+    "test": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && tsc && node --test dist/test/contract.test.js dist/test/orchestrator.smoke.test.js dist/test/claude.test.js"
   },
   "dependencies": {
     "commander": "^13.0.0"
