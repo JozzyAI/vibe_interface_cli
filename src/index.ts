@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander'
 import { registerRunCommand } from './commands/run.js'
+import { registerSymphonyCommand } from './commands/symphony.js'
 import { runMockRunner } from './mock-runner.js'
 import { runClaudeRunner } from './claude-runner.js'
 
@@ -26,5 +27,6 @@ program
   })
 
 registerRunCommand(program)
+registerSymphonyCommand(program)
 
 program.parse()

@@ -50,11 +50,16 @@ export async function runClaudeRunner(run_id: string): Promise<void> {
     prompt = fs.readFileSync(record.prompt_file, 'utf8').trim()
   }
 
-  const child = spawn(
-    'claude',
-    ['-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions', '--no-session-persistence'],
-    { cwd: record.workspace_path, stdio: ['pipe', 'pipe', 'pipe'], detached: true },
-  )
+  const claudeArgs = ['-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence']
+  if (record.permission_mode === 'unsafe-skip') {
+    claudeArgs.push('--dangerously-skip-permissions')
+  }
+
+  const child = spawn('claude', claudeArgs, {
+    cwd: record.workspace_path,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
+  })
 
   let childStarted = false
   let timedOut = false

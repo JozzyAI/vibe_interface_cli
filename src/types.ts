@@ -9,6 +9,9 @@ export type RunStatus =
 
 export type AgentBackend = 'mock' | 'claude-code' | 'codex' | 'opencode'
 
+// 'unsafe-skip' enables --dangerously-skip-permissions. Must be explicit; not the default.
+export type PermissionMode = 'default' | 'unsafe-skip'
+
 export interface RunRecord {
   run_id: string
   session_id: string
@@ -20,6 +23,7 @@ export interface RunRecord {
   repo_url?: string
   branch?: string
   prompt_file?: string
+  permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
   child_pid?: number       // PID of spawned agent process (for kill-on-stop)
   created_at: string
