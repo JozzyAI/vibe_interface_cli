@@ -8,11 +8,12 @@ import path from 'path'
 import { WebSocket } from 'ws'
 import { resolveConfig, vibeDir } from '../config.js'
 import { getHeartbeatMs } from '../node-state.js'
-import { generateRunId, updateRun, writeRun } from '../store.js'
+import { generateRunId, tryReadRun, updateRun, writeRun } from '../store.js'
+import { appendEvent } from '../events.js'
 import { mockBackend } from '../backends/mock.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
-import type { RelayMessage, RunStartMsg } from './types.js'
+import type { RelayMessage, RunStartMsg, RunStopRequestMsg } from './types.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -217,6 +218,17 @@ export async function relayNodeDaemon(
               error: err.message, code: 'internal_error',
             })
           })
+        } else if (msg.type === 'run_stop_request') {
+          const reqId = msg.req_id
+          const runId = msg.run_id
+          handleRunStop(ws, nodeId, msg).catch((err: Error) => {
+            process.stderr.write(`[vibe-node] run_stop error: ${err.message}\n`)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+              type: 'run_stop_ack', req_id: reqId, run_id: runId, ok: false,
+              error: err.message, code: 'internal_error',
+            })
+          })
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           ws.close()
@@ -242,6 +254,52 @@ export async function relayNodeDaemon(
     }
     process.on('SIGINT', () => shutdown('SIGINT'))
     process.on('SIGTERM', () => shutdown('SIGTERM'))
+  })
+}
+
+/**
+ * Stop a run on the node: kill the runner process, append stopped event, update RunRecord.
+ * Uses tryReadRun (no process.exit) so it is safe to call from a long-running daemon.
+ */
+async function handleRunStop(ws: WebSocket, nodeId: string, msg: RunStopRequestMsg): Promise<void> {
+  const record = tryReadRun(msg.run_id)
+  if (!record) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+      error: `Run not found: ${msg.run_id}`, code: 'run_not_found',
+    })
+    return
+  }
+
+  const TERMINAL = ['completed', 'failed', 'stopped', 'cancelled']
+  if (TERMINAL.includes(record.status)) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+      error: `Run is already terminal: ${record.status}`, code: 'already_terminal',
+    })
+    return
+  }
+
+  // Kill the runner process (same logic as local stopRun in run-actions.ts)
+  if (record.session_id) {
+    const pid = parseInt(record.session_id, 10)
+    if (!isNaN(pid) && pid > 0) {
+      try { process.kill(pid, 'SIGTERM') } catch {}
+    }
+  }
+  if (record.child_pid) {
+    try { process.kill(-record.child_pid, 'SIGTERM') } catch {}
+    try { process.kill(record.child_pid, 'SIGTERM') } catch {}
+  }
+
+  appendEvent({ type: 'status', run_id: msg.run_id, session_id: record.session_id, status: 'stopped', ts: t() })
+  const updated = updateRun(msg.run_id, { status: 'stopped' })
+
+  sendMsg(ws, {
+    version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+    type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: true, record: updated,
   })
 }
 
@@ -390,5 +448,50 @@ export async function remoteStream(relay: string, token: string, runId: string):
 
     ws.on('close', () => resolve())
     ws.on('error', (err) => reject(err))
+  })
+}
+
+/** One-shot: connect to relay, send run_stop_request to owning node, return updated RunRecord. */
+export async function remoteStop(relay: string, token: string, runId: string): Promise<RunRecord> {
+  return new Promise<RunRecord>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+
+    let settled = false
+    const done = (record?: RunRecord, err?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      record ? resolve(record) : reject(err!)
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate()
+      done(undefined, new Error('Timeout waiting for run_stop_ack from relay'))
+    }, 10_000)
+
+    ws.on('open', () => {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
+        type: 'run_stop_request', req_id: reqId, run_id: runId, reason: 'requested_by_user',
+      })
+    })
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_stop_ack' && msg.req_id === reqId) {
+          ws.close()
+          if (msg.ok && msg.record) {
+            done(msg.record)
+          } else {
+            done(undefined, new Error(`${msg.code ?? 'stop_failed'}: ${msg.error ?? 'unknown error'}`))
+          }
+        }
+      } catch {}
+    })
+
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before run_stop_ack')))
+    ws.on('error', (err) => done(undefined, err))
   })
 }

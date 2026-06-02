@@ -24,6 +24,13 @@ export function readRun(run_id: string): RunRecord {
   return JSON.parse(fs.readFileSync(p, 'utf8')) as RunRecord
 }
 
+/** Returns the RunRecord or null — never calls process.exit. Safe for use in long-running processes. */
+export function tryReadRun(run_id: string): RunRecord | null {
+  const p = runPath(run_id)
+  if (!fs.existsSync(p)) return null
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')) as RunRecord } catch { return null }
+}
+
 export function updateRun(run_id: string, patch: Partial<RunRecord>): RunRecord {
   const record = readRun(run_id)
   const updated = { ...record, ...patch, updated_at: new Date().toISOString() }

@@ -8,6 +8,9 @@
  * Event streaming: relay maintains a subscribers map (run_id → Set<ws>).
  * run_event messages from node daemons are fanned out to all subscribers.
  * No event buffering — late subscribers miss past events.
+ *
+ * Run ownership: relay records run_id → node_id when run_start_ack ok=true
+ * arrives. This allows run_stop_request to be routed to the correct node.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
@@ -51,6 +54,10 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const allConns = new Set<WebSocket>()
     // req_id → requester ws, for routing run_start_ack back to CLI
     const pendingReqs = new Map<string, WebSocket>()
+    // req_id → requester ws, for routing run_stop_ack back to CLI
+    const pendingStops = new Map<string, WebSocket>()
+    // run_id → node_id, populated on run_start_ack ok=true for routing stop requests
+    const runOwnership = new Map<string, string>()
     // run_id → set of subscriber ws, for streaming run events to CLI clients
     const subscribers = new Map<string, Set<WebSocket>>()
     const staleMs = getStaleMs(opts.staleMs)
@@ -147,7 +154,6 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
           }
 
           case 'run_event': {
-            // Fan out to all subscribers for this run.
             const subs = subscribers.get(msg.run_id)
             if (subs) {
               for (const sub of subs) sendMsg(sub, msg)
@@ -177,6 +183,45 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
               sendMsg(requester, msg)
               pendingReqs.delete(msg.req_id)
             }
+            // Record run ownership so stop can be routed to the correct node.
+            if (msg.ok && msg.record) {
+              runOwnership.set(msg.record.run_id, msg.from)
+            }
+            break
+          }
+
+          case 'run_stop_request': {
+            pendingStops.set(msg.req_id, ws)
+            const ownerId = runOwnership.get(msg.run_id)
+            if (!ownerId) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+                error: `Run not found in relay: ${msg.run_id}`, code: 'run_not_found',
+              })
+              pendingStops.delete(msg.req_id)
+              break
+            }
+            const target = registry.get(ownerId)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+                error: `Owning node is offline: ${ownerId}`, code: 'node_offline',
+              })
+              pendingStops.delete(msg.req_id)
+              break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+
+          case 'run_stop_ack': {
+            const requester = pendingStops.get(msg.req_id)
+            if (requester) {
+              sendMsg(requester, msg)
+              pendingStops.delete(msg.req_id)
+            }
             break
           }
         }
@@ -185,11 +230,12 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
       ws.on('close', () => {
         allConns.delete(ws)
         if (nodeId) registry.delete(nodeId)
-        // Clean up any in-flight requests from this connection.
         for (const [reqId, reqWs] of pendingReqs) {
           if (reqWs === ws) pendingReqs.delete(reqId)
         }
-        // Remove from all subscriber sets.
+        for (const [reqId, reqWs] of pendingStops) {
+          if (reqWs === ws) pendingStops.delete(reqId)
+        }
         for (const [runId, subs] of subscribers) {
           subs.delete(ws)
           if (subs.size === 0) subscribers.delete(runId)

@@ -56,12 +56,31 @@ export interface RunStartMsg extends RelayMsgBase {
   metadata?: Record<string, unknown>
 }
 
+// ── cli → relay → node daemon (bidirectional stop) ────────────────────────
+
+export interface RunStopRequestMsg extends RelayMsgBase {
+  type: 'run_stop_request'
+  req_id: string
+  run_id: string
+  reason?: string
+}
+
 // ── node daemon → relay → cli subscribers ─────────────────────────────────
 
 export interface RunEventMsg extends RelayMsgBase {
   type: 'run_event'
   run_id: string
   event: RunEvent
+}
+
+export interface RunStopAckMsg extends RelayMsgBase {
+  type: 'run_stop_ack'
+  req_id: string
+  run_id: string
+  ok: boolean
+  record?: RunRecord   // updated RunRecord (status: stopped) if ok=true
+  error?: string
+  code?: string
 }
 
 // ── relay → client ─────────────────────────────────────────────────────────
@@ -109,10 +128,12 @@ export type RelayMessage =
   | NodeListRequestMsg
   | RunStreamSubscribeMsg
   | RunStartMsg
+  | RunStopRequestMsg
   | RunEventMsg
   | NodeRegisterAckMsg
   | NodeHeartbeatAckMsg
   | NodeListResponseMsg
   | RunStartAckMsg
   | RunStreamSubscribeAckMsg
+  | RunStopAckMsg
   | RelayErrorMsg

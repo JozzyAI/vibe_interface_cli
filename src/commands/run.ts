@@ -99,7 +99,24 @@ export function registerRunCommand(program: Command): void {
     .command('stop <run_id>')
     .description('stop a running run')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
-    .action((run_id: string) => {
+    .option('--relay <url>', 'relay WebSocket URL for remote stop')
+    .option('--token <token>', 'auth token for relay')
+    .action(async (run_id: string, opts) => {
+      if (opts.relay) {
+        if (!opts.token) {
+          process.stderr.write('error: --token is required with --relay\n')
+          process.exit(1)
+        }
+        try {
+          const { remoteStop } = await import('../relay/client.js')
+          const record = await remoteStop(opts.relay as string, opts.token as string, run_id)
+          process.stdout.write(JSON.stringify(record) + '\n')
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        return
+      }
       const updated = stopRun(run_id)
       process.stdout.write(JSON.stringify(updated) + '\n')
     })

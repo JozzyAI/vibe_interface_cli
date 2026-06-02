@@ -16,7 +16,7 @@ import { fileURLToPath } from 'url'
 import type { RunRecord, VibeNode } from '../src/types.js'
 import type { RelayMessage } from '../src/relay/types.js'
 import { startRelayServer } from '../src/relay/server.js'
-import { remoteRunStart, remoteStream } from '../src/relay/client.js'
+import { remoteRunStart, remoteStop, remoteStream } from '../src/relay/client.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -803,6 +803,154 @@ test('vibe run stream --relay: CLI outputs JSONL events and exits 0', async () =
     assert.ok(lines.length > 0, 'CLI stream output has lines')
     const events = lines.map((l) => JSON.parse(l))
     assert.ok(events.some((e: any) => e.type === 'status' && e.status === 'completed'), 'CLI stream output has completed event')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+// ── MVP 3D-3B: remote stop ────────────────────────────────────────────────
+
+test('relay: run_stop_request for unknown run_id returns run_not_found', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    await assert.rejects(
+      remoteStop(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'run_does_not_exist'),
+      /run_not_found/,
+    )
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay: run_stop_request when owning node is offline returns node_offline', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'offline-node-test')
+
+  try {
+    // Start a run to populate relay's ownership map
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'offline-node-test',
+      { agent: 'mock', workspaceKey: 'offline-node-ws' },
+    )
+    const runId = record.run_id
+
+    // Kill daemon — node goes offline, ownership entry remains in relay
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 600))
+
+    // Stop should fail with node_offline
+    await assert.rejects(
+      remoteStop(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, runId),
+      /node_offline/,
+    )
+  } finally {
+    if (!daemonProc.killed) daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 200))
+    await server.close()
+  }
+})
+
+test('relay daemon: remote stop returns stopped RunRecord', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'stop-ack-daemon')
+
+  try {
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'stop-ack-daemon',
+      { agent: 'mock', workspaceKey: 'stop-ack-test' },
+    )
+    assert.equal(record.status, 'running')
+
+    // Stop before mock runner completes (~6s)
+    await new Promise((r) => setTimeout(r, 500))
+    const stopped = await remoteStop(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, record.run_id)
+    assert.equal(stopped.status, 'stopped', 'stop returns stopped record')
+    assert.equal(stopped.run_id, record.run_id, 'run_id matches')
+    assert.equal(stopped.node_id, 'stop-ack-daemon', 'node_id preserved')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('relay daemon: remote stop → stream subscriber receives stopped event and exits', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'stop-stream-node')
+
+  try {
+    // Start run
+    const startR = await vibeAsync([
+      'run', 'start',
+      '--node', 'stop-stream-node',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--workspace-key', 'stop-stream-ws',
+    ])
+    assert.equal(startR.status, 0, `run start stderr: ${startR.stderr}`)
+    const record = JSON.parse(startR.stdout.trim()) as RunRecord
+
+    // Start streaming (exits on terminal event)
+    const streamP = vibeAsync([
+      'run', 'stream', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ], undefined, 20_000)
+
+    // Wait for stream to subscribe, then stop
+    await new Promise((r) => setTimeout(r, 800))
+    const stopR = await vibeAsync([
+      'run', 'stop', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ])
+    assert.equal(stopR.status, 0, `stop stderr: ${stopR.stderr}`)
+    const stoppedRecord = JSON.parse(stopR.stdout.trim()) as RunRecord
+    assert.equal(stoppedRecord.status, 'stopped', 'stop returns stopped record')
+
+    // Stream must exit after receiving stopped event
+    const streamR = await streamP
+    assert.equal(streamR.status, 0, `stream stderr: ${streamR.stderr}`)
+    const lines = streamR.stdout.trim().split('\n').filter(Boolean)
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(events.some((e: any) => e.type === 'status' && e.status === 'stopped'), 'stream received stopped event')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('vibe run stop --relay: CLI returns stopped RunRecord JSON', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'cli-stop-node')
+
+  try {
+    const startR = await vibeAsync([
+      'run', 'start',
+      '--node', 'cli-stop-node',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--workspace-key', 'cli-stop-run',
+    ])
+    assert.equal(startR.status, 0)
+    const record = JSON.parse(startR.stdout.trim()) as RunRecord
+
+    await new Promise((r) => setTimeout(r, 400))
+
+    const stopR = await vibeAsync([
+      'run', 'stop', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ])
+    assert.equal(stopR.status, 0, `stderr: ${stopR.stderr}`)
+    const stopped = JSON.parse(stopR.stdout.trim()) as RunRecord
+    assert.equal(stopped.status, 'stopped', 'CLI stop output has status=stopped')
+    assert.equal(stopped.run_id, record.run_id, 'run_id matches')
   } finally {
     daemonProc.kill('SIGTERM')
     await new Promise((r) => setTimeout(r, 400))
