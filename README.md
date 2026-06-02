@@ -487,6 +487,11 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 - **Note**: `approval_required` VibeEvents are already encrypted by MVP 4C (they are run_events).
   All approval surfaces are now end-to-end encrypted: the relay sees approval routing metadata but
   never the approval ID, decision, or message.
+- **Run-local key storage**: `event_aes_key`, `stop_aes_key`, and `approval_aes_key` are stored
+  in `~/.vibe/runs/<run_id>.json` on the controller machine for the lifetime of the run. Protect
+  `~/.vibe/runs/` with normal filesystem permissions (the directory is created with mode 0700).
+  Anyone with read access to that file can decrypt past event stream, stop, and approval traffic
+  for that run. Future hardening may move run keys into the OS keychain or encrypted local storage.
 - **Prompt content over relay**: The controller reads the prompt file and sends text in the
   `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
   filesystem paths are never sent over the wire.
