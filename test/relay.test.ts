@@ -1178,6 +1178,107 @@ test('relay daemon: unsupported agent (codex) returns agent_not_supported', asyn
   }
 })
 
+// ── MVP 3F: Symphony relay integration ───────────────────────────────────────
+
+test('vibe symphony start --node --relay: returns running RunRecord with symphony metadata', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'sym-start-node')
+
+  try {
+    const r = await vibeAsync([
+      'symphony', 'start',
+      '--node', 'sym-start-node',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--issue-id', 'SYM-RELAY-1',
+      '--issue-title', 'relay integration test',
+      '--workspace-key', 'sym-relay-ws',
+    ])
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`)
+    const record = JSON.parse(r.stdout.trim()) as RunRecord
+    assert.equal(record.status, 'running', 'status is running')
+    assert.equal(record.agent, 'mock', 'agent is mock')
+    assert.equal(record.node_id, 'sym-start-node', 'dispatched to correct node')
+    assert.equal(record.metadata?.source, 'symphony', 'metadata.source is symphony')
+    assert.equal(record.metadata?.issue_id, 'SYM-RELAY-1', 'issue_id in metadata')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('vibe symphony stream --relay: outputs JSONL events and exits on completed', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'sym-stream-node')
+
+  try {
+    const startR = await vibeAsync([
+      'symphony', 'start',
+      '--node', 'sym-stream-node',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--issue-id', 'SYM-RELAY-2',
+      '--workspace-key', 'sym-stream-ws',
+    ])
+    assert.equal(startR.status, 0, `start stderr: ${startR.stderr}`)
+    const record = JSON.parse(startR.stdout.trim()) as RunRecord
+
+    const streamR = await vibeAsync([
+      'symphony', 'stream', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ], undefined, 30_000)
+    assert.equal(streamR.status, 0, `stream stderr: ${streamR.stderr}`)
+
+    const lines = streamR.stdout.trim().split('\n').filter(Boolean)
+    assert.ok(lines.length > 0, 'received events')
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(events.some((e: any) => e.type === 'status' && e.status === 'completed'), 'completed event received')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('vibe symphony stop --relay: returns stopped RunRecord', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'sym-stop-node')
+
+  try {
+    const startR = await vibeAsync([
+      'symphony', 'start',
+      '--node', 'sym-stop-node',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--issue-id', 'SYM-RELAY-3',
+      '--workspace-key', 'sym-stop-ws',
+    ])
+    assert.equal(startR.status, 0)
+    const record = JSON.parse(startR.stdout.trim()) as RunRecord
+
+    await new Promise((r) => setTimeout(r, 400))
+
+    const stopR = await vibeAsync([
+      'symphony', 'stop', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ])
+    assert.equal(stopR.status, 0, `stop stderr: ${stopR.stderr}`)
+    const stopped = JSON.parse(stopR.stdout.trim()) as RunRecord
+    assert.equal(stopped.status, 'stopped', 'stop returns stopped record')
+    assert.equal(stopped.run_id, record.run_id, 'run_id matches')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
 // ── existing local node behavior unchanged ─────────────────────────────────
 
 test('vibe node list (local, no --remote): unaffected by relay feature', () => {

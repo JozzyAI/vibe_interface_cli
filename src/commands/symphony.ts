@@ -5,6 +5,9 @@
  * and maps them to the underlying vibe run start/stream/status/stop.
  * All state lives in the same ~/.vibe/ store as plain `vibe run` records,
  * differentiated by metadata.source === 'symphony'.
+ *
+ * Remote relay support: pass --node <id> --relay <ws-url> --token <tok> to
+ * dispatch the run to a remote Vibe Node through the relay.
  */
 import type { Command } from 'commander'
 import { readRun } from '../store.js'
@@ -28,8 +31,40 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--metadata-file <path>', 'path to JSON metadata file')
     .option('--permission-mode <mode>', 'permission mode: default | unsafe-skip (unsafe-skip enables --dangerously-skip-permissions)')
     .option('--node <id>', 'node to run on: auto | local | <node_id> (default: auto)')
+    .option('--relay <url>', 'relay WebSocket URL (required for remote nodes)')
+    .option('--token <token>', 'auth token for relay')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
+      const nodeSelector: string = opts.node ?? 'auto'
+      const isRemote = opts.relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
+
+      if (isRemote) {
+        if (!opts.token) {
+          process.stderr.write('error: --token is required with --relay for remote nodes\n')
+          process.exit(1)
+        }
+        try {
+          const { remoteRunStart } = await import('../relay/client.js')
+          const extraMetadata: Record<string, unknown> = { source: 'symphony' }
+          if (opts.issueId) extraMetadata.issue_id = opts.issueId
+          if (opts.issueTitle) extraMetadata.issue_title = opts.issueTitle
+          const record = await remoteRunStart(opts.relay as string, opts.token as string, nodeSelector, {
+            agent: opts.agent as AgentBackend,
+            workspaceKey: opts.workspaceKey ?? opts.issueId,
+            repoUrl: opts.repoUrl,
+            branch: opts.branch,
+            promptFile: opts.promptFile,
+            permissionMode: opts.permissionMode as PermissionMode | undefined,
+            metadata: extraMetadata,
+          })
+          process.stdout.write(JSON.stringify(record) + '\n')
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        return
+      }
+
       const extraMetadata: Record<string, unknown> = { source: 'symphony' }
       if (opts.issueId) extraMetadata.issue_id = opts.issueId
       if (opts.issueTitle) extraMetadata.issue_title = opts.issueTitle
@@ -38,7 +73,7 @@ export function registerSymphonyCommand(program: Command): void {
 
       const record = await startRun({
         agent: opts.agent as AgentBackend,
-        node: opts.node as string | undefined,
+        node: nodeSelector,
         workspaceKey,
         repoUrl: opts.repoUrl,
         branch: opts.branch,
@@ -54,7 +89,23 @@ export function registerSymphonyCommand(program: Command): void {
     .command('stream <run_id>')
     .description('stream events for a Symphony run as JSONL')
     .option('--jsonl', 'output machine-readable JSONL to stdout (default behaviour)')
-    .action((run_id: string) => {
+    .option('--relay <url>', 'relay WebSocket URL for remote stream')
+    .option('--token <token>', 'auth token for relay')
+    .action(async (run_id: string, opts) => {
+      if (opts.relay) {
+        if (!opts.token) {
+          process.stderr.write('error: --token is required with --relay\n')
+          process.exit(1)
+        }
+        try {
+          const { remoteStream } = await import('../relay/client.js')
+          await remoteStream(opts.relay as string, opts.token as string, run_id)
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        return
+      }
       readRun(run_id) // validates existence, exits 3 if not found
       streamEvents(run_id)
     })
@@ -72,11 +123,26 @@ export function registerSymphonyCommand(program: Command): void {
     .command('stop <run_id>')
     .description('stop a Symphony run')
     .option('--reason <reason>', 'human-readable reason for stopping')
+    .option('--relay <url>', 'relay WebSocket URL for remote stop')
+    .option('--token <token>', 'auth token for relay')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
-    .action((run_id: string, opts) => {
+    .action(async (run_id: string, opts) => {
+      if (opts.relay) {
+        if (!opts.token) {
+          process.stderr.write('error: --token is required with --relay\n')
+          process.exit(1)
+        }
+        try {
+          const { remoteStop } = await import('../relay/client.js')
+          const record = await remoteStop(opts.relay as string, opts.token as string, run_id)
+          process.stdout.write(JSON.stringify(record) + '\n')
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        return
+      }
       const updated = stopRun(run_id)
-      // Attach stop reason to metadata without a separate store write — it's
-      // informational only and visible in the final record returned here.
       if (opts.reason) {
         process.stderr.write(`[symphony] stop reason: ${opts.reason}\n`)
       }
