@@ -114,9 +114,10 @@ export interface EncryptedPayload {
 }
 
 // Separate HKDF contexts for cryptographic domain separation.
-const HKDF_INFO       = Buffer.from('vibe-run-start-v1', 'utf8')
-const HKDF_INFO_EVENT = Buffer.from('vibe-run-event-v1', 'utf8')
-const HKDF_INFO_STOP  = Buffer.from('vibe-run-stop-v1',  'utf8')
+const HKDF_INFO          = Buffer.from('vibe-run-start-v1',          'utf8')
+const HKDF_INFO_EVENT    = Buffer.from('vibe-run-event-v1',           'utf8')
+const HKDF_INFO_STOP     = Buffer.from('vibe-run-stop-v1',            'utf8')
+const HKDF_INFO_APPROVAL = Buffer.from('vibe-approval-response-v1',   'utf8')
 
 function deriveAesKeyWith(sharedSecret: Buffer, info: Buffer): Buffer {
   return Buffer.from(crypto.hkdfSync('sha256', sharedSecret, Buffer.alloc(0), info, 32))
@@ -203,6 +204,16 @@ export function deriveRunEventKey(myPrivKeyBase64: string, theirPubKeyBase64: st
  */
 export function deriveRunStopKey(myPrivKeyBase64: string, theirPubKeyBase64: string): string {
   return deriveAesKeyWith(ecdhSharedSecret(myPrivKeyBase64, theirPubKeyBase64), HKDF_INFO_STOP).toString('base64')
+}
+
+/**
+ * Derive the per-run AES-256 approval-response key from the same ECDH exchange.
+ * Uses HKDF context 'vibe-approval-response-v1' — distinct from start/event/stop keys.
+ *   CLI:  deriveApprovalKey(ephemeral_private, node_enc_public)
+ *   Node: deriveApprovalKey(node_enc_private, ephemeral_public_from_run_start)
+ */
+export function deriveApprovalKey(myPrivKeyBase64: string, theirPubKeyBase64: string): string {
+  return deriveAesKeyWith(ecdhSharedSecret(myPrivKeyBase64, theirPubKeyBase64), HKDF_INFO_APPROVAL).toString('base64')
 }
 
 /** Encrypt a VibeEvent (or any JSON-serialisable value) with a run-level AES-256 key. */

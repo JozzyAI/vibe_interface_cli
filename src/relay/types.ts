@@ -129,6 +129,56 @@ export interface RunStopAckPayload {
   code?: string
 }
 
+// ── MVP 4F: encrypted approval_response ────────────────────────────────────
+//
+// CLI sends encrypted approval decision; relay routes to owning node by run_id.
+// Node decrypts, appends approval_response event to run log, returns encrypted ack.
+// approval_required events are already encrypted by MVP 4C (they are run_events).
+//
+// Relay sees: version/kind/from/to/run_id/req_id/key_id/nonce/ciphertext/ts
+// Relay cannot see: approval_id, decision (approve/deny), message/comment
+
+export interface EncryptedApprovalResponseMsg {
+  version: 1
+  kind: 'encrypted'
+  from: string       // 'cli'
+  to: 'relay'
+  ts: string
+  type: 'encrypted_approval_response'
+  req_id: string     // correlation id for routing ack back to requester
+  run_id: string     // visible for relay routing via runOwnership map
+  key_id: string     // run_id (identifies which approval key to use)
+  nonce: string
+  ciphertext: string // base64 AES-256-GCM(ApprovalResponsePayload JSON ‖ auth_tag)
+}
+
+// Decrypted inner payload
+export interface ApprovalResponsePayload {
+  approval_id: string
+  decision: 'approve' | 'deny'
+  message?: string
+}
+
+export interface EncryptedApprovalResponseAckMsg {
+  version: 1
+  kind: 'encrypted'
+  from: string       // node_id
+  to: 'relay'
+  ts: string
+  type: 'encrypted_approval_response_ack'
+  req_id: string
+  run_id: string
+  nonce: string
+  ciphertext: string // base64 AES-256-GCM(ApprovalResponseAckPayload JSON ‖ auth_tag)
+}
+
+// Decrypted inner ack payload
+export interface ApprovalResponseAckPayload {
+  ok: boolean
+  error?: string
+  code?: string
+}
+
 // ── node → relay: pairing (MVP 4A) ────────────────────────────────────────
 
 export interface NodePairRequestMsg extends RelayMsgBase {
@@ -254,6 +304,8 @@ export type RelayMessage =
   | EncryptedRunEventMsg
   | EncryptedRunStopRequestMsg
   | EncryptedRunStopAckMsg
+  | EncryptedApprovalResponseMsg
+  | EncryptedApprovalResponseAckMsg
   | NodePairRequestMsg
   | NodePairAckMsg
   | NodeRegisterMsg

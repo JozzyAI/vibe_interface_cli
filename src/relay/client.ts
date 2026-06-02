@@ -14,9 +14,9 @@ import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
-import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload } from './types.js'
+import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
-import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
+import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, deriveApprovalKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -63,7 +63,7 @@ function sendSigned(ws: WebSocket, msg: RelayMessage, identity: IdentityFile): v
 
 function t(): string { return new Date().toISOString() }
 
-async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg, eventAesKey?: string, stopAesKey?: string): Promise<void> {
+async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg, eventAesKey?: string, stopAesKey?: string, approvalAesKey?: string): Promise<void> {
   if (msg.agent !== 'mock' && msg.agent !== 'claude-code') {
     sendMsg(ws, {
       version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
@@ -101,7 +101,8 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     ...(promptFile && { prompt_file: promptFile }),
     ...(msg.permission_mode && { permission_mode: msg.permission_mode }),
     ...(msg.metadata && { metadata: msg.metadata }),
-    ...(stopAesKey && { stop_aes_key: stopAesKey }),  // MVP 4D: stored for handleRunStop
+    ...(stopAesKey && { stop_aes_key: stopAesKey }),        // MVP 4D: stored for handleRunStop
+    ...(approvalAesKey && { approval_aes_key: approvalAesKey }), // MVP 4F: stored for handleEncryptedApprovalResponse
     created_at: now,
     updated_at: now,
   }
@@ -162,8 +163,9 @@ async function handleEncryptedRunStart(
   }
 
   // Derive per-run keys from ECDH shared secret with domain-separated HKDF contexts.
-  const eventAesKey = deriveRunEventKey(identity.encryption.private_key, enc.ephemeral_public_key)  // MVP 4C
-  const stopAesKey  = deriveRunStopKey(identity.encryption.private_key, enc.ephemeral_public_key)   // MVP 4D
+  const eventAesKey    = deriveRunEventKey(identity.encryption.private_key, enc.ephemeral_public_key)  // MVP 4C
+  const stopAesKey     = deriveRunStopKey(identity.encryption.private_key, enc.ephemeral_public_key)   // MVP 4D
+  const approvalAesKey = deriveApprovalKey(identity.encryption.private_key, enc.ephemeral_public_key)  // MVP 4F
 
   // Reconstruct a synthetic RunStartMsg and call the existing handler
   const synthetic: RunStartMsg = {
@@ -183,7 +185,7 @@ async function handleEncryptedRunStart(
     ...(payload.metadata && { metadata: payload.metadata }),
   }
 
-  return handleRunStart(ws, nodeId, config, synthetic, eventAesKey, stopAesKey)
+  return handleRunStart(ws, nodeId, config, synthetic, eventAesKey, stopAesKey, approvalAesKey)
 }
 
 /**
@@ -363,6 +365,11 @@ export async function relayNodeDaemon(
               error: err.message, code: 'internal_error',
             })
           })
+        } else if (rawKind === 'encrypted' && (msg as { type?: string }).type === 'encrypted_approval_response') {
+          const enc = msg as EncryptedApprovalResponseMsg
+          handleEncryptedApprovalResponse(ws, nodeId, enc).catch((err: Error) => {
+            process.stderr.write(`[vibe-node] encrypted approval_response error: ${err.message}\n`)
+          })
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           ws.close()
@@ -482,6 +489,60 @@ async function handleEncryptedRunStop(ws: WebSocket, nodeId: string, enc: Encryp
     ...(_payload.reason && { reason: _payload.reason }),
   }
   return handleRunStop(ws, nodeId, synthetic, stopAesKey)
+}
+
+/**
+ * Handle an encrypted approval_response envelope (MVP 4F).
+ * Decrypts using the approval key stored in the RunRecord, appends approval_response
+ * event to the run log, and returns an encrypted_approval_response_ack.
+ */
+async function handleEncryptedApprovalResponse(
+  ws: WebSocket,
+  nodeId: string,
+  enc: EncryptedApprovalResponseMsg,
+): Promise<void> {
+  const record = tryReadRun(enc.run_id)
+  const approvalAesKey = record?.approval_aes_key
+
+  if (!approvalAesKey) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'relay_error', code: 'no_approval_key',
+      message: 'No approval key for this run — was it started with encryption?',
+    })
+    return
+  }
+
+  let payload: ApprovalResponsePayload
+  try {
+    payload = decryptEvent(approvalAesKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }) as unknown as ApprovalResponsePayload
+  } catch {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'relay_error', code: 'decrypt_failed',
+      message: 'Failed to decrypt approval_response — wrong key or tampered ciphertext',
+    })
+    return
+  }
+
+  // Append approval_response event to the run log so the event stream includes the decision.
+  appendEvent({
+    type: 'approval_response',
+    run_id: enc.run_id,
+    ts: t(),
+    approval_id: payload.approval_id,
+    decision: payload.decision,
+    ...(payload.message && { message: payload.message }),
+  })
+
+  const result: import('../relay/types.js').ApprovalResponseAckPayload = { ok: true }
+  const ackEnc = encryptEvent(approvalAesKey, result)
+  ws.send(JSON.stringify({
+    version: 1, kind: 'encrypted', from: nodeId, to: 'relay', ts: t(),
+    type: 'encrypted_approval_response_ack',
+    req_id: enc.req_id, run_id: enc.run_id,
+    nonce: ackEnc.nonce, ciphertext: ackEnc.ciphertext,
+  } satisfies EncryptedApprovalResponseAckMsg))
 }
 
 /** One-shot: connect to relay, request node list, return nodes, disconnect. */
@@ -624,9 +685,10 @@ export async function remoteRunStart(
             // MVP 4C/4D: derive and store event+stop AES keys locally for stream decryption and stop encryption.
             // Keys are NOT included in the returned record (not printed to stdout).
             if (capturedEphemeralPrivKey && opts.encryptionPublicKey) {
-              const eventAesKey = deriveRunEventKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
-              const stopAesKey  = deriveRunStopKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
-              writeRun({ ...msg.record, event_aes_key: eventAesKey, stop_aes_key: stopAesKey })
+              const eventAesKey    = deriveRunEventKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
+              const stopAesKey     = deriveRunStopKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
+              const approvalAesKey = deriveApprovalKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
+              writeRun({ ...msg.record, event_aes_key: eventAesKey, stop_aes_key: stopAesKey, approval_aes_key: approvalAesKey })
             }
             done(msg.record)
           } else {
@@ -883,5 +945,89 @@ export async function remoteStop(relay: string, token: string, runId: string): P
 
     ws.on('close', () => done(undefined, new Error('Relay connection closed before run_stop_ack')))
     ws.on('error', (err) => done(undefined, err))
+  })
+}
+
+/**
+ * One-shot: connect to relay, send an encrypted approval_response to the owning node.
+ * Reads the approval AES key from the local run record (written by remoteRunStart --encrypt).
+ * Resolves when the node confirms receipt via an encrypted approval_response_ack.
+ */
+export async function remoteApprovalRespond(
+  relay: string,
+  token: string,
+  runId: string,
+  approvalId: string,
+  decision: 'approve' | 'deny',
+  message?: string,
+): Promise<void> {
+  const localRecord = tryReadRun(runId)
+  const approvalAesKey = localRecord?.approval_aes_key
+
+  if (!approvalAesKey) {
+    throw new Error(`No approval key for run ${runId} — was it started with encryption?`)
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+
+    let settled = false
+    const done = (err?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      err ? reject(err) : resolve()
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate()
+      done(new Error('Timeout waiting for approval_response_ack from relay'))
+    }, 10_000)
+
+    ws.on('open', () => {
+      const payload: ApprovalResponsePayload = {
+        approval_id: approvalId,
+        decision,
+        ...(message && { message }),
+      }
+      const enc = encryptEvent(approvalAesKey, payload)
+      ws.send(JSON.stringify({
+        version: 1, kind: 'encrypted', from: 'cli', to: 'relay', ts: t(),
+        type: 'encrypted_approval_response',
+        req_id: reqId, run_id: runId, key_id: runId,
+        nonce: enc.nonce, ciphertext: enc.ciphertext,
+      } satisfies EncryptedApprovalResponseMsg))
+    })
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        const msgType = (msg as { type?: string }).type
+
+        if (msgType === 'encrypted_approval_response_ack') {
+          const enc = msg as EncryptedApprovalResponseAckMsg
+          if (enc.req_id !== reqId) return
+          ws.close()
+          try {
+            const result = decryptEvent(approvalAesKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }) as unknown as ApprovalResponseAckPayload
+            if (result.ok) {
+              done()
+            } else {
+              done(new Error(`${result.code ?? 'approval_failed'}: ${result.error ?? 'unknown error'}`))
+            }
+          } catch (err) {
+            done(new Error(`Failed to decrypt approval ack: ${(err as Error).message}`))
+          }
+        } else if (msgType === 'relay_error') {
+          const errMsg = msg as import('./types.js').RelayErrorMsg
+          ws.terminate()
+          done(new Error(`${errMsg.code}: ${errMsg.message}`))
+        }
+      } catch {}
+    })
+
+    ws.on('close', () => done(new Error('Relay connection closed before approval_response_ack')))
+    ws.on('error', (err) => done(err))
   })
 }

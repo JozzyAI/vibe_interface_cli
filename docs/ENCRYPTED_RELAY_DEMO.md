@@ -162,16 +162,34 @@ external:
 
 ---
 
-## Remaining plaintext surfaces
+## Encrypted surfaces (MVP 4B–4F)
 
-| Surface | Status |
-|---|---|
-| `run_start` payload | ✅ encrypted (MVP 4B) |
-| `run_event` stream | ✅ encrypted (MVP 4C) |
-| `run_stop` request/ack | ✅ encrypted (MVP 4D) |
-| `approval_response` | planned (MVP 4E) — no approval response path implemented yet |
+| Surface | Status | HKDF context |
+|---|---|---|
+| `run_start` payload | ✅ encrypted (MVP 4B) | `vibe-run-start-v1` |
+| `run_event` stream | ✅ encrypted (MVP 4C) | `vibe-run-event-v1` |
+| `run_stop` request/ack | ✅ encrypted (MVP 4D) | `vibe-run-stop-v1` |
+| `approval_response` request/ack | ✅ encrypted (MVP 4F) | `vibe-approval-response-v1` |
 
 `approval_required` events are part of the `run_event` stream and are already encrypted by MVP 4C.
+All four keys are derived from the single ECDH shared secret established at `run_start` time —
+no additional key exchange is needed for stop or approval operations.
+
+### Sending an approval response (terminal 1 — controller)
+
+```bash
+# After seeing an approval_required event from vibe run stream:
+vibe approval respond \
+  --run-id run_abc123 \
+  --approval-id appr_xyz \
+  --decision approve \
+  --message "looks good" \
+  --relay ws://localhost:9876 \
+  --token dev
+# → {"ok":true,"run_id":"run_abc123","approval_id":"appr_xyz","decision":"approve"}
+```
+
+The relay forwards the opaque ciphertext to the node daemon by `run_id` ownership. The node decrypts, appends an `approval_response` event to the run log, and returns an encrypted ack. The relay never sees the approval ID, decision, or message.
 
 ---
 
@@ -181,9 +199,9 @@ external:
   All WebSocket traffic is unauthenticated at the transport layer (no TLS).
   `--require-pairing` + Ed25519 signatures verify node identity, but the relay
   itself is not authenticated to the CLI (planned for a future release).
-- **Key storage**: `event_aes_key` and `stop_aes_key` are stored in
-  `~/.vibe/runs/<run_id>.json` (mode 0600 directory). The node stores `stop_aes_key`
-  in its own RunRecord. Neither key is printed to stdout.
+- **Key storage**: `event_aes_key`, `stop_aes_key`, and `approval_aes_key` are stored in
+  `~/.vibe/runs/<run_id>.json` (mode 0600 directory). The node stores `stop_aes_key` and
+  `approval_aes_key` in its own RunRecord. None of these keys are printed to stdout.
 - **No forward secrecy today**: all session keys derive from a single ephemeral keypair.
   Compromise of the node's X25519 private key retroactively decrypts all runs.
   Per-message ephemeral keys (proper forward secrecy) are planned for a future milestone.

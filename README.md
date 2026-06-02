@@ -108,12 +108,7 @@ vibe run start --node <id> --relay ws://... --token dev --agent mock --encrypt
 | `run_start` payload | `EncryptedRunStartMsg` | `vibe-run-start-v1` |
 | `run_event` stream | `EncryptedRunEventMsg` | `vibe-run-event-v1` |
 | `run_stop` request/ack | `EncryptedRunStopRequestMsg/Ack` | `vibe-run-stop-v1` |
-
-### Not encrypted yet
-
-| Surface | Notes |
-|---|---|
-| `approval_response` | No approval response path implemented yet — planned as MVP 4E |
+| `approval_response` request/ack | `EncryptedApprovalResponseMsg/Ack` | `vibe-approval-response-v1` |
 
 ### What the relay still sees (metadata)
 
@@ -483,10 +478,15 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
   `encrypted_run_stop_request`. The relay routes by `run_id` ownership without reading the payload.
   The node decrypts, executes the stop, and returns an `encrypted_run_stop_ack`. The CLI decrypts
   and returns the same `RunRecord` JSON as the plaintext path. Uses HKDF context `vibe-run-stop-v1`.
-  Both `event_aes_key` and `stop_aes_key` are derived from the same ECDH shared secret at run_start
-  time and stored in the local RunRecord — no additional key exchange needed.
-- **Remaining plaintext surfaces**: Approval response relay (MVP 4E, if/when implemented).
+- **Encrypted approval_response (MVP 4F)**: `vibe approval respond` sends an encrypted approval
+  decision. The relay routes by `run_id` without reading the payload. The node decrypts, appends
+  an `approval_response` event to the run log, and returns an `encrypted_approval_response_ack`.
+  Uses HKDF context `vibe-approval-response-v1`. All four keys (`run_start`, `run_event`,
+  `run_stop`, `approval_response`) are derived from the same ECDH shared secret at run_start time
+  and stored in the local RunRecord — no additional key exchange needed.
 - **Note**: `approval_required` VibeEvents are already encrypted by MVP 4C (they are run_events).
+  All approval surfaces are now end-to-end encrypted: the relay sees approval routing metadata but
+  never the approval ID, decision, or message.
 - **Prompt content over relay**: The controller reads the prompt file and sends text in the
   `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
   filesystem paths are never sent over the wire.
@@ -512,4 +512,5 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 | 4B | Encrypt `run_start` payload (X25519 + AES-256-GCM, relay-blind) | ✅ done |
 | 4C | Encrypt `run_event` stream (same ECDH key material, domain-separated context) | ✅ done |
 | 4D | Encrypt `run_stop` request/ack (`vibe-run-stop-v1` HKDF context) | ✅ done |
-| 4E | Encrypt approval response (if/when approval_response path is added) | planned |
+| 4E | E2E encryption docs + demo script | ✅ done |
+| 4F | Encrypt `approval_response` + `vibe approval respond` CLI (`vibe-approval-response-v1`) | ✅ done |

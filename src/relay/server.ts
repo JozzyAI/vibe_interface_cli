@@ -17,7 +17,7 @@
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
-import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, PublicIdentity } from './types.js'
+import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, PublicIdentity } from './types.js'
 import { verifyEnvelope } from '../crypto.js'
 
 interface NodeEntry {
@@ -67,6 +67,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const pendingReqs = new Map<string, WebSocket>()
     // req_id → requester ws, for routing run_stop_ack back to CLI
     const pendingStops = new Map<string, WebSocket>()
+    // req_id → requester ws, for routing approval_response_ack back to CLI
+    const pendingApprovals = new Map<string, WebSocket>()
     // run_id → node_id, populated on run_start_ack ok=true for routing stop requests
     const runOwnership = new Map<string, string>()
     // run_id → set of subscriber ws, for streaming run events to CLI clients
@@ -171,6 +173,39 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             if (requester) {
               sendMsg(requester, msg)
               pendingStops.delete(enc.req_id)
+            }
+          } else if (encType === 'encrypted_approval_response') {
+            // MVP 4F: route encrypted approval response to owning node — relay never decrypts.
+            const enc = msg as EncryptedApprovalResponseMsg
+            pendingApprovals.set(enc.req_id, ws)
+            const ownerId = runOwnership.get(enc.run_id)
+            if (!ownerId) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: enc.from, ts: now(),
+                type: 'relay_error', code: 'run_not_found',
+                message: `Run not found in relay: ${enc.run_id}`,
+              })
+              pendingApprovals.delete(enc.req_id)
+            } else {
+              const target = registry.get(ownerId)
+              if (!target) {
+                sendMsg(ws, {
+                  version: 1, kind: 'plaintext', from: 'relay', to: enc.from, ts: now(),
+                  type: 'relay_error', code: 'node_offline',
+                  message: `Owning node is offline: ${ownerId}`,
+                })
+                pendingApprovals.delete(enc.req_id)
+              } else {
+                sendMsg(target.ws, msg)
+              }
+            }
+          } else if (encType === 'encrypted_approval_response_ack') {
+            // MVP 4F: route encrypted approval ack back to the waiting CLI.
+            const enc = msg as EncryptedApprovalResponseAckMsg
+            const requester = pendingApprovals.get(enc.req_id)
+            if (requester) {
+              sendMsg(requester, msg)
+              pendingApprovals.delete(enc.req_id)
             }
           }
           return
@@ -350,6 +385,9 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         }
         for (const [reqId, reqWs] of pendingStops) {
           if (reqWs === ws) pendingStops.delete(reqId)
+        }
+        for (const [reqId, reqWs] of pendingApprovals) {
+          if (reqWs === ws) pendingApprovals.delete(reqId)
         }
         for (const [runId, subs] of subscribers) {
           subs.delete(ws)

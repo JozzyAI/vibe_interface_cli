@@ -28,7 +28,8 @@ export interface RunRecord {
   metadata?: Record<string, unknown>
   child_pid?: number       // PID of spawned agent process (for kill-on-stop)
   event_aes_key?: string   // base64 AES-256 key for run_event decryption (HKDF 'vibe-run-event-v1'); stored locally
-  stop_aes_key?: string    // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally
+  stop_aes_key?: string     // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally
+  approval_aes_key?: string // base64 AES-256 key for approval_response encryption (HKDF 'vibe-approval-response-v1')
   created_at: string
   updated_at: string
 }
@@ -102,6 +103,13 @@ export interface PrCreatedEvent extends BaseEvent {
   url: string
 }
 
+export interface ApprovalResponseEvent extends BaseEvent {
+  type: 'approval_response'
+  approval_id: string
+  decision: 'approve' | 'deny'
+  message?: string
+}
+
 export interface ErrorEvent extends BaseEvent {
   type: 'error'
   message: string
@@ -111,6 +119,7 @@ export type RunEvent =
   | StatusEvent
   | LogEvent
   | ApprovalRequiredEvent
+  | ApprovalResponseEvent
   | ToolCallEvent
   | PrCreatedEvent
   | ErrorEvent

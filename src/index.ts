@@ -4,6 +4,7 @@ import { registerRunCommand } from './commands/run.js'
 import { registerSymphonyCommand } from './commands/symphony.js'
 import { registerNodeCommand } from './commands/node.js'
 import { registerRelayCommand } from './commands/relay.js'
+import { registerApprovalCommand } from './commands/approval.js'
 import { runMockRunner } from './mock-runner.js'
 import { runClaudeRunner } from './claude-runner.js'
 
@@ -32,5 +33,6 @@ registerRunCommand(program)
 registerSymphonyCommand(program)
 registerNodeCommand(program)
 registerRelayCommand(program)
+registerApprovalCommand(program)
 
 program.parse()
