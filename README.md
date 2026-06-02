@@ -1,8 +1,39 @@
-# vibe-interface-cli
+# Vibe Interface CLI
 
-Universal worker-node runtime for coding-agent orchestrators.
+Vibe Interface CLI turns any paired machine into an orchestrator-ready worker node.
 
-Provides a stable, machine-readable CLI contract that any orchestrator (e.g. Symphony) can call to start, stream, inspect, and stop coding-agent runs — locally or on remote nodes over a relay.
+Most coding-agent orchestrators are tightly coupled to one execution model:
+
+```
+orchestrator → SSH host / local process / Codex app-server
+```
+
+Vibe introduces a different boundary:
+
+```
+orchestrator → Vibe Worker Contract → Vibe Node → coding agent backend
+```
+
+The orchestrator stays responsible for task planning, issue lifecycle, retries, and status
+tracking. Vibe handles where and how the work runs.
+
+This MVP proves the contract with [Symphony](https://github.com/JozzyAI/universe-symphony):
+Symphony can dispatch work through an `ExternalExecutor` seam instead of only talking to
+`codex app-server`. The worker runtime is Vibe. The coding agent is mock or Claude Code.
+The relay is E2E encrypted.
+
+**What is working:**
+
+- `vibe run start / stream / status / stop` — stable CLI contract any orchestrator can call
+- `vibe symphony start / stream / status / stop / approval respond` — Symphony-specific surface
+- `vibe node daemon` — long-lived worker node, local or relay-connected
+- `vibe relay dev` — dev relay with identity-based pairing and token auth
+- `mock` backend — no API key, no agent; proves the full event loop including `approval_required`
+- `claude-code` backend — spawns the Claude CLI, streams output back
+- E2E encrypted control loop — `run_start`, `run_event`, `run_stop`, `approval_response` are
+  AES-256-GCM encrypted; the relay routes ciphertext and never reads payload contents
+
+**CLI reference:**
 
 ```
 vibe run start  --agent <backend> --workspace-key <key> [--node auto|local|<id>] [options]
@@ -14,12 +45,14 @@ vibe symphony start  --issue-id <id> --agent <backend> [--node auto|local|<id>] 
 vibe symphony stream <run_id>
 vibe symphony status <run_id>
 vibe symphony stop   <run_id> [--reason <reason>]
+vibe approval respond --run-id <id> --approval-id <id> --decision approve|deny
 
 vibe node list   [--remote --relay <url> --token <token>]
 vibe node status <node_id>
-vibe node daemon --local [--relay <url> --token <token> --node-id <id>]
+vibe node pair   --relay <url> --token <token>
+vibe node daemon --local [--relay <url> --token <token>]
 
-vibe relay dev   --port <port> --token <token>
+vibe relay dev   --port <port> --token <token> [--require-pairing]
 ```
 
 ## 5-minute quickstart
@@ -519,3 +552,7 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 | 4D | Encrypt `run_stop` request/ack (`vibe-run-stop-v1` HKDF context) | ✅ done |
 | 4E | E2E encryption docs + demo script | ✅ done |
 | 4F | Encrypt `approval_response` + `vibe approval respond` CLI (`vibe-approval-response-v1`) | ✅ done |
+| 5A | Symphony UI status mapping — vibe fields in running + blocked payloads | ✅ done |
+| 5B | Symphony approval API — `POST /approve` routes to `vibe approval respond` | ✅ done |
+| 5C | Demo layer — `smoke_vibe_approval.sh` + `SYMPHONY_VIBE_APPROVAL_DEMO.md` | ✅ done |
+| 5D | Test stabilization, release README, milestone tags | ✅ done |
