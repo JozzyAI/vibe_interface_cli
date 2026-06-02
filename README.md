@@ -93,6 +93,48 @@ vibe run start --agent claude-code --permission-mode unsafe-skip --prompt-file t
 
 **Do not use `--permission-mode unsafe-skip` on untrusted workspaces, shared machines, or in production environments.** It is intended for local development and CI environments where the workspace is fully controlled.
 
+## End-to-end encryption (MVP 4B–4D)
+
+Add `--encrypt` to any remote `vibe run start` command to enable E2E encryption:
+
+```bash
+vibe run start --node <id> --relay ws://... --token dev --agent mock --encrypt
+```
+
+### Encrypted today
+
+| Surface | Wire type | HKDF context |
+|---|---|---|
+| `run_start` payload | `EncryptedRunStartMsg` | `vibe-run-start-v1` |
+| `run_event` stream | `EncryptedRunEventMsg` | `vibe-run-event-v1` |
+| `run_stop` request/ack | `EncryptedRunStopRequestMsg/Ack` | `vibe-run-stop-v1` |
+
+### Not encrypted yet
+
+| Surface | Notes |
+|---|---|
+| `approval_response` | No approval response path implemented yet — planned as MVP 4E |
+
+### What the relay still sees (metadata)
+
+- `from` / `to` (routing identifiers)
+- `run_id` / `req_id`
+- Timestamps, message type, ciphertext size / traffic timing
+
+### What the relay cannot see
+
+- Prompt content, workspace key, agent type
+- Agent stdout / stderr / tool calls
+- Event type, log messages, status transitions
+- Stop reason, run result
+
+All three keys (`run_start`, `run_event`, `run_stop`) are derived from the **same X25519 ECDH
+exchange** at run_start time — no additional round-trips. CLI stdout schema is unchanged.
+
+See [`docs/ENCRYPTED_RELAY_DEMO.md`](docs/ENCRYPTED_RELAY_DEMO.md) for the full walkthrough.
+
+---
+
 ## Architecture
 
 ### Local mode (default)
@@ -332,6 +374,8 @@ vibe symphony stream "$run_id" \
 ```
 
 See [`docs/VIBE_RELAY_DEMO.md`](docs/VIBE_RELAY_DEMO.md) for a step-by-step 3-terminal walkthrough (mock and Claude Code variants).
+
+See [`docs/ENCRYPTED_RELAY_DEMO.md`](docs/ENCRYPTED_RELAY_DEMO.md) for the end-to-end encrypted demo using `--encrypt` (MVP 4B–4D).
 
 ### Symphony Elixir (ExternalExecutor)
 
