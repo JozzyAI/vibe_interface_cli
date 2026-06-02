@@ -2,22 +2,24 @@
 
 Universal worker-node runtime for coding-agent orchestrators.
 
-Provides a stable, machine-readable CLI contract that any orchestrator (e.g. Symphony) can call to start, stream, inspect, and stop coding-agent runs.
+Provides a stable, machine-readable CLI contract that any orchestrator (e.g. Symphony) can call to start, stream, inspect, and stop coding-agent runs — locally or on remote nodes over a relay.
 
 ```
-vibe run start  --agent <backend> --workspace-key <key> [--node auto|local] [options]
+vibe run start  --agent <backend> --workspace-key <key> [--node auto|local|<id>] [options]
 vibe run stream <run_id>
 vibe run status <run_id>
 vibe run stop   <run_id>
 
-vibe symphony start  --issue-id <id> --agent <backend> [--node auto|local] [options]
+vibe symphony start  --issue-id <id> --agent <backend> [--node auto|local|<id>] [options]
 vibe symphony stream <run_id>
 vibe symphony status <run_id>
 vibe symphony stop   <run_id> [--reason <reason>]
 
-vibe node list
+vibe node list   [--remote --relay <url> --token <token>]
 vibe node status <node_id>
-vibe node daemon --local
+vibe node daemon --local [--relay <url> --token <token> --node-id <id>]
+
+vibe relay dev   --port <port> --token <token>
 ```
 
 ## 5-minute quickstart
@@ -41,27 +43,6 @@ vibe node list --json
 
 vibe node status local --json
 ```
-
-**Run the local node daemon (optional — enriches node state with live heartbeat):**
-
-```bash
-vibe node daemon --local
-# [vibe-node] daemon started — node_id=local pid=12345
-# [vibe-node] state: /home/user/.vibe/node-local.json
-# [vibe-node] heartbeat every 5000ms — Ctrl-C to stop
-
-# While daemon runs, node list shows live active_runs count and fresh heartbeat.
-# Without the daemon, vibe node list falls back to the built-in local node (always online).
-# Ctrl-C or SIGTERM removes the state file cleanly.
-```
-
-**Environment knobs (node daemon):**
-
-| Variable | Default | Description |
-|---|---|---|
-| `VIBE_NODE_HEARTBEAT_MS` | `5000` | Interval between heartbeat writes |
-| `VIBE_NODE_STALE_MS` | `15000` | Age after which a heartbeat is considered stale (marks node offline) |
-| `VIBE_NODE_STATE_FILE` | `~/.vibe/node-local.json` | Override state file path (useful for testing) |
 
 **Run a mock job (no API key, no agent needed):**
 
@@ -114,6 +95,8 @@ vibe run start --agent claude-code --permission-mode unsafe-skip --prompt-file t
 
 ## Architecture
 
+### Local mode (default)
+
 ```
 Orchestrator (Symphony or any CLI caller)
   ↓
@@ -128,6 +111,87 @@ vibe run stop   / vibe symphony stop     → kills runner, writes stopped
 ```
 
 All state is local files. No network required for mock or claude-code backends.
+
+### Remote mode (relay)
+
+```
+CLI / Symphony
+  │  vibe run start --node <id> --relay ws://localhost:7433 --token dev
+  │  vibe run stream <run_id>   --relay ws://localhost:7433 --token dev
+  │  vibe run stop   <run_id>   --relay ws://localhost:7433 --token dev
+  ▼
+vibe relay dev  (plaintext WS relay, 127.0.0.1 only)
+  │  run_start  →  run_start_ack
+  │  run_stream_subscribe  →  run_event fanout
+  │  run_stop_request  →  run_stop_ack
+  ▼
+vibe node daemon --local --relay ...  (worker node, any machine)
+  ↓
+Background runner (mock / claude-code)
+  ↓ writes JSONL events locally, tails and forwards to relay as run_event
+```
+
+Run ownership is tracked by the relay (`run_id → node_id`) so stop requests route to the correct node. The daemon is a long-lived process — remote stop kills only the runner, never the daemon.
+
+## Relay (MVP 3D — dev mode)
+
+> ⚠️ **Plaintext localhost relay — development only.**
+> All WebSocket traffic is unencrypted and the server binds to `127.0.0.1` only.
+> Do not expose to the internet. E2E encryption is planned for a future release.
+
+### 3-terminal demo
+
+```bash
+# Terminal 1 — start relay
+vibe relay dev --port 7433 --token dev
+# [vibe-relay] listening on ws://127.0.0.1:7433
+
+# Terminal 2 — register this machine as a remote node
+vibe node daemon --local --relay ws://localhost:7433 --token dev --node-id my-node
+# [vibe-node] daemon started — node_id=my-node
+# [vibe-node] registered with relay ws://localhost:7433
+# [vibe-node] heartbeat every 5000ms
+
+# Terminal 3 — CLI: discover, start, stream, and stop a remote run
+vibe node list --remote --relay ws://localhost:7433 --token dev --json
+# → [{"node_id":"my-node","transport":"relay","status":"online",...}]
+
+result=$(vibe run start \
+  --agent mock \
+  --node my-node \
+  --relay ws://localhost:7433 \
+  --token dev \
+  --workspace-key demo-remote)
+run_id=$(echo "$result" | jq -r .run_id)
+
+# Stream all events until completed
+vibe run stream "$run_id" \
+  --relay ws://localhost:7433 \
+  --token dev
+# → {"type":"status","status":"running",...}
+# → {"type":"log","message":"Cloning repository...",...}
+# → ...
+# → {"type":"approval_required","message":"Proceed with modifying tracked files?",...}
+# → {"type":"status","status":"completed",...}
+
+# Or stop mid-run instead
+vibe run stop "$run_id" \
+  --relay ws://localhost:7433 \
+  --token dev
+# → {"run_id":"...","status":"stopped",...}
+```
+
+Token auth is enforced at the HTTP upgrade level — wrong or missing token gets HTTP 401 before the WebSocket handshake completes.
+
+Remote nodes appear with `transport: "relay"` in the node list. Local node list (`vibe node list` without `--remote`) is unaffected by relay state.
+
+Env knobs:
+
+| Variable | Default | Description |
+|---|---|---|
+| `VIBE_NODE_HEARTBEAT_MS` | `5000` | Interval between heartbeat writes |
+| `VIBE_NODE_STALE_MS` | `15000` | Age after which a heartbeat is considered stale (marks node offline) |
+| `VIBE_NODE_STATE_FILE` | `~/.vibe/node-local.json` | Override state file path |
 
 ## State files
 
@@ -151,35 +215,42 @@ All events are JSONL with `{ type, run_id, ts, ... }`.
 | `tool_call` | `tool: string`, `input?: unknown` |
 | `error` | `message: string` |
 
+## Troubleshooting
+
+**Wrong or missing token → HTTP 401**
+```
+error: Unexpected server response: 401
+```
+Check that `--token` matches the value passed to `vibe relay dev --token`.
+
+**Relay not running → ECONNREFUSED**
+```
+error: connect ECONNREFUSED 127.0.0.1:7433
+```
+Start the relay first: `vibe relay dev --port 7433 --token dev`
+
+**Node offline → node_offline error**
+```
+error: node_offline: Owning node is offline: my-node
+```
+The node daemon registered but its WebSocket connection dropped. Restart `vibe node daemon --local --relay ...`.
+
+**Run not found in relay → run_not_found error**
+```
+error: run_not_found: Run not found in relay: run_abc123
+```
+The relay has no ownership record for this run_id. The run either was not started via relay, or the relay restarted (relay state is in-memory only).
+
+**Node daemon killed (not stale yet) → node shows online but run_start fails**
+If the daemon process exits ungracefully the registry entry remains until the WS connection closes (usually immediate). Wait a moment and try again; the node will disappear from the list.
+
 ## Development
 
 ```bash
 npm run build          # clean build to dist/
-npm test               # build + run 26 contract tests
+npm test               # build + run 74 tests
 npm run dev            # watch mode
 ```
-
-## Relay (MVP 3D — dev mode)
-
-`vibe relay dev` runs a **plaintext localhost-only WebSocket relay** for development.
-All traffic is unencrypted. Do not expose to the internet. E2E encryption is planned for MVP 4.
-
-```bash
-# Terminal 1 — start relay
-vibe relay dev --port 7433 --token dev
-
-# Terminal 2 — register a node (this machine)
-vibe node daemon --local --relay ws://localhost:7433 --token dev --node-id my-node
-
-# Terminal 3 — list registered remote nodes
-vibe node list --remote --relay ws://localhost:7433 --token dev --json
-```
-
-Token auth is enforced at the HTTP upgrade level — wrong or missing token gets HTTP 401 before the WebSocket handshake completes.
-
-Remote nodes appear with `transport: "relay"` in the node list. Local node list (`vibe node list`) is unaffected.
-
-Env knobs: `VIBE_NODE_HEARTBEAT_MS` (default 5000), `VIBE_NODE_STALE_MS` (default 15000).
 
 ## Symphony integration
 
