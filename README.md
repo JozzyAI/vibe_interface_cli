@@ -17,6 +17,7 @@ vibe symphony stop   <run_id> [--reason <reason>]
 
 vibe node list
 vibe node status <node_id>
+vibe node daemon --local
 ```
 
 ## 5-minute quickstart
@@ -40,6 +41,27 @@ vibe node list --json
 
 vibe node status local --json
 ```
+
+**Run the local node daemon (optional — enriches node state with live heartbeat):**
+
+```bash
+vibe node daemon --local
+# [vibe-node] daemon started — node_id=local pid=12345
+# [vibe-node] state: /home/user/.vibe/node-local.json
+# [vibe-node] heartbeat every 5000ms — Ctrl-C to stop
+
+# While daemon runs, node list shows live active_runs count and fresh heartbeat.
+# Without the daemon, vibe node list falls back to the built-in local node (always online).
+# Ctrl-C or SIGTERM removes the state file cleanly.
+```
+
+**Environment knobs (node daemon):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `VIBE_NODE_HEARTBEAT_MS` | `5000` | Interval between heartbeat writes |
+| `VIBE_NODE_STALE_MS` | `15000` | Age after which a heartbeat is considered stale (marks node offline) |
+| `VIBE_NODE_STATE_FILE` | `~/.vibe/node-local.json` | Override state file path (useful for testing) |
 
 **Run a mock job (no API key, no agent needed):**
 
@@ -112,6 +134,7 @@ All state is local files. No network required for mock or claude-code backends.
 ```
 ~/.vibe/
 ├── config.json
+├── node-local.json          # NodeDaemonState (written by `vibe node daemon --local`, removed on exit)
 ├── runs/<run_id>.json       # RunRecord (status, metadata, workspace_path, ...)
 └── events/<run_id>.jsonl    # append-only JSONL event log
 ```

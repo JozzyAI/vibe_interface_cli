@@ -29,4 +29,17 @@ export function registerNodeCommand(program: Command): void {
       }
       process.stdout.write(JSON.stringify(n) + '\n')
     })
+
+  node
+    .command('daemon')
+    .description('run the local Vibe Node daemon (writes heartbeat to ~/.vibe/node-local.json)')
+    .option('--local', 'run as the local machine node (required for MVP 3C)')
+    .action(async (opts) => {
+      if (!opts.local) {
+        process.stderr.write('error: --local flag is required (remote nodes not yet supported)\n')
+        process.exit(1)
+      }
+      const { runLocalDaemon } = await import('../node-daemon.js')
+      await runLocalDaemon()
+    })
 }

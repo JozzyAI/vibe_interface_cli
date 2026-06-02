@@ -1,7 +1,8 @@
 import { resolveConfig } from './config.js'
+import { readDaemonState, daemonStateToNode } from './node-state.js'
 import type { VibeNode, VibeError } from './types.js'
 
-function getLocalNode(): VibeNode {
+function getBuiltinLocalNode(): VibeNode {
   const config = resolveConfig()
   const now = new Date().toISOString()
   return {
@@ -17,6 +18,12 @@ function getLocalNode(): VibeNode {
     created_at: now,
     updated_at: now,
   }
+}
+
+function getLocalNode(): VibeNode {
+  const daemonState = readDaemonState()
+  if (daemonState) return daemonStateToNode(daemonState)
+  return getBuiltinLocalNode()
 }
 
 export function listNodes(): VibeNode[] {

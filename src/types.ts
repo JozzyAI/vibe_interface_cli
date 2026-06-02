@@ -47,6 +47,22 @@ export interface VibeNode {
   updated_at: string
 }
 
+// Written periodically by `vibe node daemon --local` to ~/.vibe/node-local.json
+export interface NodeDaemonState {
+  node_id: string
+  name: string
+  status: 'online' | 'offline'
+  transport: 'local'
+  capabilities: string[]
+  agents: string[]
+  active_runs: number
+  max_runs: number
+  workspace_roots: string[]
+  pid: number
+  started_at: string
+  last_heartbeat_at: string
+}
+
 // ── Stable JSONL event schema ──────────────────────────────────────────────
 
 interface BaseEvent {
