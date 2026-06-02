@@ -159,6 +159,28 @@ npm test               # build + run 26 contract tests
 npm run dev            # watch mode
 ```
 
+## Relay (MVP 3D — dev mode)
+
+`vibe relay dev` runs a **plaintext localhost-only WebSocket relay** for development.
+All traffic is unencrypted. Do not expose to the internet. E2E encryption is planned for MVP 4.
+
+```bash
+# Terminal 1 — start relay
+vibe relay dev --port 7433 --token dev
+
+# Terminal 2 — register a node (this machine)
+vibe node daemon --local --relay ws://localhost:7433 --token dev --node-id my-node
+
+# Terminal 3 — list registered remote nodes
+vibe node list --remote --relay ws://localhost:7433 --token dev --json
+```
+
+Token auth is enforced at the HTTP upgrade level — wrong or missing token gets HTTP 401 before the WebSocket handshake completes.
+
+Remote nodes appear with `transport: "relay"` in the node list. Local node list (`vibe node list`) is unaffected.
+
+Env knobs: `VIBE_NODE_HEARTBEAT_MS` (default 5000), `VIBE_NODE_STALE_MS` (default 15000).
+
 ## Symphony integration
 
 ```bash

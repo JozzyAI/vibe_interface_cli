@@ -37,7 +37,7 @@ export interface VibeNode {
   node_id: string
   name: string
   status: 'online' | 'offline'
-  transport: 'local'
+  transport: 'local' | 'relay'
   capabilities: string[]
   agents: string[]
   active_runs: number
@@ -52,7 +52,7 @@ export interface NodeDaemonState {
   node_id: string
   name: string
   status: 'online' | 'offline'
-  transport: 'local'
+  transport: 'local' | 'relay'
   capabilities: string[]
   agents: string[]
   active_runs: number
