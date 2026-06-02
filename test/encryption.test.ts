@@ -1,5 +1,5 @@
 /**
- * MVP 4B / 4C — encrypted run_start and run_event stream tests.
+ * MVP 4B / 4C / 4D — encrypted run_start, run_event stream, and run_stop tests.
  *
  * 4B key assertions:
  *   - encrypted run_start returns a valid RunRecord ack
@@ -15,6 +15,14 @@
  *   - relay wire bytes do NOT contain log message or event content
  *   - relay fans out encrypted_run_event to multiple subscribers
  *   - full E2E: daemon encrypts run_event stream; stream caller decrypts; output is VibeEvent JSONL
+ *
+ * 4D key assertions:
+ *   - deriveRunStopKey — different from event key (domain separation)
+ *   - encrypted stop sends encrypted_run_stop_request; relay wire has no stop reason
+ *   - node decrypts, stops run, returns encrypted_run_stop_ack
+ *   - CLI decrypts ack; same RunRecord returned as plaintext path
+ *   - tampered stop ciphertext and wrong key fail cleanly
+ *   - plaintext stop path still works (backward compat)
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -25,9 +33,9 @@ import path from 'path'
 import os from 'os'
 import { fileURLToPath } from 'url'
 import { startRelayServer } from '../src/relay/server.js'
-import { encryptPayload, decryptPayload, deriveRunEventKey, encryptEvent, decryptEvent, generateX25519, generateEd25519, deriveIdFromPublicKey, fingerprint as fp } from '../src/crypto.js'
+import { encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, encryptEvent, decryptEvent, generateX25519, generateEd25519, deriveIdFromPublicKey, fingerprint as fp } from '../src/crypto.js'
 import { createIdentity } from '../src/identity.js'
-import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, RunStartMsg, RunStartPayload } from '../src/relay/types.js'
+import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, RunStartMsg, RunStartPayload, RunStopAckPayload } from '../src/relay/types.js'
 import type { RunRecord } from '../src/types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -600,6 +608,241 @@ test('relay: encrypted run_event stream E2E — daemon encrypts events; stream d
       const decrypted = decryptEvent(saved!.event_aes_key!, { nonce: encEvent.nonce, ciphertext: encEvent.ciphertext })
       assert.ok(typeof (decrypted as { type?: unknown }).type === 'string', 'decrypted event must have type field')
     }
+  } finally {
+    delete process.env.VIBE_DIR
+    daemonProc.kill('SIGTERM')
+    await new Promise(r => daemonProc.on('exit', r))
+    await server.close()
+    fs.rmSync(ctrlVibeDir, { recursive: true, force: true })
+    fs.rmSync(daemonVibeDir, { recursive: true, force: true })
+  }
+})
+
+// ── MVP 4D: encrypted run_stop unit + integration tests ───────────────────
+
+test('encryption: deriveRunStopKey — different from event key (domain separation)', () => {
+  const nodeKp = generateX25519()
+  const ephemeralKp = generateX25519()
+
+  const eventKey = deriveRunEventKey(ephemeralKp.privateKey.toString('base64'), nodeKp.publicKey.toString('base64'))
+  const stopKey  = deriveRunStopKey(ephemeralKp.privateKey.toString('base64'), nodeKp.publicKey.toString('base64'))
+
+  assert.notEqual(eventKey, stopKey, 'event key and stop key must be different (domain separation)')
+  assert.equal(Buffer.from(stopKey, 'base64').length, 32, 'stop key must be 32 bytes')
+
+  // Both sides must compute the same stop key
+  const nodeStopKey = deriveRunStopKey(nodeKp.privateKey.toString('base64'), ephemeralKp.publicKey.toString('base64'))
+  assert.equal(stopKey, nodeStopKey, 'CLI and node must derive identical stop key')
+})
+
+test('relay: encrypted_run_stop_request — relay wire bytes do not contain stop reason', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const url = `ws://localhost:${server.port}?token=${TEST_TOKEN}`
+
+  const kp = generateX25519()
+  const stopKey = deriveRunStopKey(kp.privateKey.toString('base64'), kp.publicKey.toString('base64'))
+  const SECRET_REASON = 'TOPSECRET_STOP_REASON_' + Date.now()
+  const runId = `run_stop_spy_${Date.now().toString(36)}`
+  const nodeId = 'stop-spy-node'
+  const reqId = `req_stop_spy_${Date.now().toString(36)}`
+
+  // Register "node" with run ownership
+  const nodeWs = await connect(url)
+  sendWs(nodeWs, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: new Date().toISOString(), type: 'node_register', node: { node_id: nodeId, name: 'x', status: 'online', transport: 'relay', capabilities: [], agents: [], active_runs: 0, max_runs: 1, workspace_roots: [], created_at: '', updated_at: '' } })
+  await waitForMsg(nodeWs, m => m.type === 'node_register_ack')
+
+  // Register run ownership by faking a run_start_ack with ok=true
+  sendWs(nodeWs, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: new Date().toISOString(), type: 'run_start_ack', req_id: 'fake_req', ok: true, record: fakeRecord(runId, nodeId) })
+
+  // Wait briefly for relay to process the ack and register ownership
+  await new Promise(r => setTimeout(r, 50))
+
+  // Intercept what the node receives
+  const nodeReceived: string[] = []
+  nodeWs.on('message', (raw) => nodeReceived.push(raw.toString()))
+
+  // CLI sends encrypted stop request
+  const ctrlWs = await connect(url)
+  const payload = { reason: SECRET_REASON }
+  const enc = encryptEvent(stopKey, payload)
+  ctrlWs.send(JSON.stringify({
+    version: 1, kind: 'encrypted', from: 'cli', to: 'relay', ts: new Date().toISOString(),
+    type: 'encrypted_run_stop_request', req_id: reqId, run_id: runId, key_id: runId,
+    nonce: enc.nonce, ciphertext: enc.ciphertext,
+  } satisfies EncryptedRunStopRequestMsg))
+
+  // Wait for node to receive
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout waiting for node to receive stop request')), 5000)
+    const check = setInterval(() => {
+      const found = nodeReceived.some(m => {
+        try { return (JSON.parse(m) as { type?: string }).type === 'encrypted_run_stop_request' } catch { return false }
+      })
+      if (found) { clearInterval(check); clearTimeout(t); resolve() }
+    }, 50)
+  })
+
+  const stopMsgs = nodeReceived.filter(m => {
+    try { return (JSON.parse(m) as { type?: string }).type === 'encrypted_run_stop_request' } catch { return false }
+  })
+  assert.equal(stopMsgs.length, 1, 'node should receive exactly one encrypted stop request')
+
+  const wireBytes = stopMsgs[0]
+  assert.ok(!wireBytes.includes(SECRET_REASON), 'relay must not include stop reason in forwarded wire bytes')
+  assert.ok(!wireBytes.includes('"reason"'), 'relay must not expose reason field in wire bytes')
+  assert.ok(wireBytes.includes('"encrypted_run_stop_request"'), 'forwarded message must be encrypted type')
+  assert.ok(wireBytes.includes(runId), 'run_id must remain visible for routing')
+
+  nodeWs.close(); ctrlWs.close()
+  await server.close()
+})
+
+test('relay: encrypted stop E2E — daemon stops run, CLI decrypts ack, same RunRecord as plaintext', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const ctrlVibeDir = tmpDir()
+  const daemonVibeDir = tmpDir()
+
+  const daemonProc = await spawnDaemon(
+    `ws://localhost:${server.port}`,
+    TEST_TOKEN,
+    'enc-stop-node',
+    daemonVibeDir,
+  )
+
+  try {
+    const { fetchRemoteNodes, remoteRunStart, remoteStop } = await import('../src/relay/client.js')
+    const nodes = await fetchRemoteNodes(`ws://localhost:${server.port}`, TEST_TOKEN)
+    const target = nodes.find(n => n.node_id === 'enc-stop-node')
+    assert.ok(target?.encryption_public_key, 'daemon must expose encryption_public_key')
+
+    // Start encrypted run
+    process.env.VIBE_DIR = ctrlVibeDir
+    const record = await remoteRunStart(
+      `ws://localhost:${server.port}`,
+      TEST_TOKEN,
+      'enc-stop-node',
+      { agent: 'mock', workspaceKey: 'enc-stop-ws', encryptionPublicKey: target!.encryption_public_key! },
+    )
+    assert.equal(record.status, 'running')
+
+    // Verify stop key was saved locally
+    const { tryReadRun } = await import('../src/store.js')
+    const saved = tryReadRun(record.run_id)
+    assert.ok(saved?.stop_aes_key, 'stop_aes_key must be written to local run record after encrypted run_start')
+    assert.equal(Buffer.from(saved!.stop_aes_key!, 'base64').length, 32, 'stop_aes_key must be 32 bytes')
+
+    // Stop the run — should use encrypted path automatically
+    const stopped = await remoteStop(`ws://localhost:${server.port}`, TEST_TOKEN, record.run_id)
+    assert.equal(stopped.status, 'stopped', 'run should be stopped after encrypted stop')
+    assert.equal(stopped.run_id, record.run_id, 'returned record must have same run_id')
+  } finally {
+    delete process.env.VIBE_DIR
+    daemonProc.kill('SIGTERM')
+    await new Promise(r => daemonProc.on('exit', r))
+    await server.close()
+    fs.rmSync(ctrlVibeDir, { recursive: true, force: true })
+    fs.rmSync(daemonVibeDir, { recursive: true, force: true })
+  }
+})
+
+test('relay: tampered encrypted_run_stop_request ciphertext fails cleanly', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const ctrlVibeDir = tmpDir()
+  const daemonVibeDir = tmpDir()
+
+  const daemonProc = await spawnDaemon(
+    `ws://localhost:${server.port}`,
+    TEST_TOKEN,
+    'enc-stop-tamper-node',
+    daemonVibeDir,
+  )
+
+  try {
+    const { fetchRemoteNodes, remoteRunStart } = await import('../src/relay/client.js')
+    const nodes = await fetchRemoteNodes(`ws://localhost:${server.port}`, TEST_TOKEN)
+    const target = nodes.find(n => n.node_id === 'enc-stop-tamper-node')
+    assert.ok(target?.encryption_public_key)
+
+    process.env.VIBE_DIR = ctrlVibeDir
+    const record = await remoteRunStart(
+      `ws://localhost:${server.port}`,
+      TEST_TOKEN,
+      'enc-stop-tamper-node',
+      { agent: 'mock', workspaceKey: 'tamper-stop-ws', encryptionPublicKey: target!.encryption_public_key! },
+    )
+
+    // Send a tampered encrypted stop request directly
+    const stopKey = (await import('../src/store.js')).tryReadRun(record.run_id)?.stop_aes_key!
+    const payload = { reason: 'tampered' }
+    const enc = encryptEvent(stopKey, payload)
+    // Flip a byte in ciphertext
+    const rawCt = Buffer.from(enc.ciphertext, 'base64')
+    rawCt[0] ^= 0xff
+    const tampered = { ...enc, ciphertext: rawCt.toString('base64') }
+
+    const url = `ws://localhost:${server.port}?token=${TEST_TOKEN}`
+    const ctrlWs = await connect(url)
+    const reqId = `req_tamper_${Date.now().toString(36)}`
+    ctrlWs.send(JSON.stringify({
+      version: 1, kind: 'encrypted', from: 'cli', to: 'relay', ts: new Date().toISOString(),
+      type: 'encrypted_run_stop_request', req_id: reqId, run_id: record.run_id, key_id: record.run_id,
+      nonce: tampered.nonce, ciphertext: tampered.ciphertext,
+    } satisfies EncryptedRunStopRequestMsg))
+
+    // Node should respond with a plaintext error ack (decrypt_failed)
+    const ack = await waitForMsg(ctrlWs, m => (m as { req_id?: string }).req_id === reqId)
+    assert.equal((ack as { ok?: boolean }).ok, false, 'tampered stop must fail')
+    assert.equal((ack as { code?: string }).code, 'decrypt_failed', 'error code must be decrypt_failed')
+
+    ctrlWs.close()
+  } finally {
+    delete process.env.VIBE_DIR
+    daemonProc.kill('SIGTERM')
+    await new Promise(r => daemonProc.on('exit', r))
+    await server.close()
+    fs.rmSync(ctrlVibeDir, { recursive: true, force: true })
+    fs.rmSync(daemonVibeDir, { recursive: true, force: true })
+  }
+})
+
+test('relay: encrypted run start + stop + stream — full E2E control loop', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const ctrlVibeDir = tmpDir()
+  const daemonVibeDir = tmpDir()
+
+  const daemonProc = await spawnDaemon(
+    `ws://localhost:${server.port}`,
+    TEST_TOKEN,
+    'enc-full-loop-node',
+    daemonVibeDir,
+  )
+
+  try {
+    const { fetchRemoteNodes, remoteRunStart, remoteStop } = await import('../src/relay/client.js')
+    const nodes = await fetchRemoteNodes(`ws://localhost:${server.port}`, TEST_TOKEN)
+    const target = nodes.find(n => n.node_id === 'enc-full-loop-node')
+    assert.ok(target?.encryption_public_key)
+
+    process.env.VIBE_DIR = ctrlVibeDir
+
+    // Start encrypted run
+    const record = await remoteRunStart(
+      `ws://localhost:${server.port}`,
+      TEST_TOKEN,
+      'enc-full-loop-node',
+      { agent: 'mock', workspaceKey: 'full-loop-ws', encryptionPublicKey: target!.encryption_public_key! },
+    )
+    assert.equal(record.status, 'running')
+
+    const { tryReadRun } = await import('../src/store.js')
+    const saved = tryReadRun(record.run_id)
+    assert.ok(saved?.event_aes_key, 'event key must be saved')
+    assert.ok(saved?.stop_aes_key, 'stop key must be saved')
+    assert.notEqual(saved!.event_aes_key, saved!.stop_aes_key, 'event and stop keys must differ')
+
+    // Stop the run before it completes naturally — stop uses encrypted path
+    const stopped = await remoteStop(`ws://localhost:${server.port}`, TEST_TOKEN, record.run_id)
+    assert.equal(stopped.status, 'stopped')
   } finally {
     delete process.env.VIBE_DIR
     daemonProc.kill('SIGTERM')

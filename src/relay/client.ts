@@ -14,9 +14,9 @@ import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
-import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, RunStartPayload } from './types.js'
+import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
-import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
+import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -63,7 +63,7 @@ function sendSigned(ws: WebSocket, msg: RelayMessage, identity: IdentityFile): v
 
 function t(): string { return new Date().toISOString() }
 
-async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg, eventAesKey?: string): Promise<void> {
+async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg, eventAesKey?: string, stopAesKey?: string): Promise<void> {
   if (msg.agent !== 'mock' && msg.agent !== 'claude-code') {
     sendMsg(ws, {
       version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
@@ -101,6 +101,7 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     ...(promptFile && { prompt_file: promptFile }),
     ...(msg.permission_mode && { permission_mode: msg.permission_mode }),
     ...(msg.metadata && { metadata: msg.metadata }),
+    ...(stopAesKey && { stop_aes_key: stopAesKey }),  // MVP 4D: stored for handleRunStop
     created_at: now,
     updated_at: now,
   }
@@ -160,9 +161,9 @@ async function handleEncryptedRunStart(
     return
   }
 
-  // Derive the per-run event key: ECDH(node_enc_priv, cli_ephemeral_pub) + HKDF('vibe-run-event-v1').
-  // This is the symmetric key the node will use to encrypt run_event payloads (MVP 4C).
-  const eventAesKey = deriveRunEventKey(identity.encryption.private_key, enc.ephemeral_public_key)
+  // Derive per-run keys from ECDH shared secret with domain-separated HKDF contexts.
+  const eventAesKey = deriveRunEventKey(identity.encryption.private_key, enc.ephemeral_public_key)  // MVP 4C
+  const stopAesKey  = deriveRunStopKey(identity.encryption.private_key, enc.ephemeral_public_key)   // MVP 4D
 
   // Reconstruct a synthetic RunStartMsg and call the existing handler
   const synthetic: RunStartMsg = {
@@ -182,7 +183,7 @@ async function handleEncryptedRunStart(
     ...(payload.metadata && { metadata: payload.metadata }),
   }
 
-  return handleRunStart(ws, nodeId, config, synthetic, eventAesKey)
+  return handleRunStart(ws, nodeId, config, synthetic, eventAesKey, stopAesKey)
 }
 
 /**
@@ -341,6 +342,16 @@ export async function relayNodeDaemon(
               error: err.message, code: 'internal_error',
             })
           })
+        } else if (rawKind === 'encrypted' && (msg as { type?: string }).type === 'encrypted_run_stop_request') {
+          const enc = msg as EncryptedRunStopRequestMsg
+          handleEncryptedRunStop(ws, nodeId, enc).catch((err: Error) => {
+            process.stderr.write(`[vibe-node] encrypted run_stop error: ${err.message}\n`)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+              type: 'run_stop_ack', req_id: enc.req_id, run_id: enc.run_id, ok: false,
+              error: err.message, code: 'internal_error',
+            })
+          })
         } else if (msg.type === 'run_stop_request') {
           const reqId = msg.req_id
           const runId = msg.run_id
@@ -380,29 +391,16 @@ export async function relayNodeDaemon(
   })
 }
 
-/**
- * Stop a run on the node: kill the runner process, append stopped event, update RunRecord.
- * Uses tryReadRun (no process.exit) so it is safe to call from a long-running daemon.
- */
-async function handleRunStop(ws: WebSocket, nodeId: string, msg: RunStopRequestMsg): Promise<void> {
-  const record = tryReadRun(msg.run_id)
+/** Execute the stop logic for a run and return the result (no I/O). */
+async function runStopLogic(runId: string): Promise<RunStopAckPayload> {
+  const record = tryReadRun(runId)
   if (!record) {
-    sendMsg(ws, {
-      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
-      type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
-      error: `Run not found: ${msg.run_id}`, code: 'run_not_found',
-    })
-    return
+    return { ok: false, error: `Run not found: ${runId}`, code: 'run_not_found' }
   }
 
   const TERMINAL = ['completed', 'failed', 'stopped', 'cancelled']
   if (TERMINAL.includes(record.status)) {
-    sendMsg(ws, {
-      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
-      type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
-      error: `Run is already terminal: ${record.status}`, code: 'already_terminal',
-    })
-    return
+    return { ok: false, error: `Run is already terminal: ${record.status}`, code: 'already_terminal' }
   }
 
   // Kill the runner process (same logic as local stopRun in run-actions.ts)
@@ -417,13 +415,73 @@ async function handleRunStop(ws: WebSocket, nodeId: string, msg: RunStopRequestM
     try { process.kill(record.child_pid, 'SIGTERM') } catch {}
   }
 
-  appendEvent({ type: 'status', run_id: msg.run_id, session_id: record.session_id, status: 'stopped', ts: t() })
-  const updated = updateRun(msg.run_id, { status: 'stopped' })
+  appendEvent({ type: 'status', run_id: runId, session_id: record.session_id, status: 'stopped', ts: t() })
+  const updated = updateRun(runId, { status: 'stopped' })
+  return { ok: true, record: updated }
+}
 
-  sendMsg(ws, {
-    version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
-    type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ok: true, record: updated,
-  })
+/**
+ * Stop a run on the node: kill the runner process, append stopped event, update RunRecord.
+ * If stopAesKey is set (encrypted run), sends an encrypted_run_stop_ack instead of plaintext.
+ * Uses tryReadRun (no process.exit) so it is safe to call from a long-running daemon.
+ */
+async function handleRunStop(ws: WebSocket, nodeId: string, msg: RunStopRequestMsg, stopAesKey?: string): Promise<void> {
+  const result = await runStopLogic(msg.run_id)
+
+  if (stopAesKey) {
+    // MVP 4D: encrypt the ack — relay only sees run_id/req_id/nonce/ciphertext.
+    const enc = encryptEvent(stopAesKey, result)
+    ws.send(JSON.stringify({
+      version: 1, kind: 'encrypted', from: nodeId, to: 'relay', ts: t(),
+      type: 'encrypted_run_stop_ack',
+      req_id: msg.req_id, run_id: msg.run_id,
+      nonce: enc.nonce, ciphertext: enc.ciphertext,
+    } satisfies EncryptedRunStopAckMsg))
+  } else {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ...result,
+    })
+  }
+}
+
+/**
+ * Handle an encrypted run_stop_request envelope (MVP 4D).
+ * Decrypts using the stop key stored in the RunRecord, calls the stop logic,
+ * and returns an encrypted_run_stop_ack.
+ */
+async function handleEncryptedRunStop(ws: WebSocket, nodeId: string, enc: EncryptedRunStopRequestMsg): Promise<void> {
+  const record = tryReadRun(enc.run_id)
+  const stopAesKey = record?.stop_aes_key
+
+  if (!stopAesKey) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_stop_ack', req_id: enc.req_id, run_id: enc.run_id, ok: false,
+      error: 'No stop key for this run — was it started with --encrypt?', code: 'no_stop_key',
+    })
+    return
+  }
+
+  let _payload: RunStopPayload
+  try {
+    _payload = decryptEvent(stopAesKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }) as unknown as RunStopPayload
+  } catch {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_stop_ack', req_id: enc.req_id, run_id: enc.run_id, ok: false,
+      error: 'Failed to decrypt stop request — wrong key or tampered ciphertext', code: 'decrypt_failed',
+    })
+    return
+  }
+
+  // Reconstruct synthetic RunStopRequestMsg and call existing handler (encrypted ack path).
+  const synthetic: RunStopRequestMsg = {
+    version: 1, kind: 'plaintext', from: enc.from, to: enc.to, ts: enc.ts,
+    type: 'run_stop_request', req_id: enc.req_id, run_id: enc.run_id,
+    ...(_payload.reason && { reason: _payload.reason }),
+  }
+  return handleRunStop(ws, nodeId, synthetic, stopAesKey)
 }
 
 /** One-shot: connect to relay, request node list, return nodes, disconnect. */
@@ -563,11 +621,12 @@ export async function remoteRunStart(
         if (msg.type === 'run_start_ack' && msg.req_id === reqId) {
           ws.close()
           if (msg.ok && msg.record) {
-            // MVP 4C: derive and store event AES key locally so `vibe run stream` can decrypt.
-            // The key is not included in the returned record (not printed to stdout).
+            // MVP 4C/4D: derive and store event+stop AES keys locally for stream decryption and stop encryption.
+            // Keys are NOT included in the returned record (not printed to stdout).
             if (capturedEphemeralPrivKey && opts.encryptionPublicKey) {
               const eventAesKey = deriveRunEventKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
-              writeRun({ ...msg.record, event_aes_key: eventAesKey })
+              const stopAesKey  = deriveRunStopKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
+              writeRun({ ...msg.record, event_aes_key: eventAesKey, stop_aes_key: stopAesKey })
             }
             done(msg.record)
           } else {
@@ -739,8 +798,16 @@ export async function relayNodePair(relay: string, token: string): Promise<Paire
   })
 }
 
-/** One-shot: connect to relay, send run_stop_request to owning node, return updated RunRecord. */
+/**
+ * One-shot: connect to relay, send run_stop_request to owning node, return updated RunRecord.
+ * If the local run record has a stop_aes_key (set during encrypted run_start), sends an
+ * encrypted stop request and decrypts the ack. Otherwise uses the plaintext path.
+ */
 export async function remoteStop(relay: string, token: string, runId: string): Promise<RunRecord> {
+  // Read stop key from local run record (set during remoteRunStart --encrypt, if applicable).
+  const localRecord = tryReadRun(runId)
+  const stopAesKey = localRecord?.stop_aes_key
+
   return new Promise<RunRecord>((resolve, reject) => {
     const ws = new WebSocket(relayUrl(relay, token))
     const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
@@ -759,22 +826,57 @@ export async function remoteStop(relay: string, token: string, runId: string): P
     }, 10_000)
 
     ws.on('open', () => {
-      sendMsg(ws, {
-        version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
-        type: 'run_stop_request', req_id: reqId, run_id: runId, reason: 'requested_by_user',
-      })
+      if (stopAesKey) {
+        // MVP 4D: encrypt the stop request — relay only sees run_id/req_id/nonce/ciphertext.
+        const payload: RunStopPayload = { reason: 'requested_by_user' }
+        const enc = encryptEvent(stopAesKey, payload)
+        ws.send(JSON.stringify({
+          version: 1, kind: 'encrypted', from: 'cli', to: 'relay', ts: t(),
+          type: 'encrypted_run_stop_request',
+          req_id: reqId, run_id: runId, key_id: runId,
+          nonce: enc.nonce, ciphertext: enc.ciphertext,
+        } satisfies EncryptedRunStopRequestMsg))
+      } else {
+        sendMsg(ws, {
+          version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
+          type: 'run_stop_request', req_id: reqId, run_id: runId, reason: 'requested_by_user',
+        })
+      }
     })
 
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as RelayMessage
-        if (msg.type === 'run_stop_ack' && msg.req_id === reqId) {
+        const msgType = (msg as { type?: string }).type
+
+        if (stopAesKey && msgType === 'encrypted_run_stop_ack') {
+          // MVP 4D: decrypt the ack
+          const enc = msg as EncryptedRunStopAckMsg
+          if (enc.req_id !== reqId) return
           ws.close()
-          if (msg.ok && msg.record) {
-            done(msg.record)
-          } else {
-            done(undefined, new Error(`${msg.code ?? 'stop_failed'}: ${msg.error ?? 'unknown error'}`))
+          try {
+            const result = decryptEvent(stopAesKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }) as unknown as RunStopAckPayload
+            if (result.ok && result.record) {
+              done(result.record)
+            } else {
+              done(undefined, new Error(`${result.code ?? 'stop_failed'}: ${result.error ?? 'unknown error'}`))
+            }
+          } catch (err) {
+            done(undefined, new Error(`Failed to decrypt stop ack: ${(err as Error).message}`))
           }
+        } else if (msgType === 'run_stop_ack' && (msg as { req_id?: string }).req_id === reqId) {
+          // Plaintext ack (or error ack for encrypted stop when relay reports routing error)
+          const ack = msg as import('./types.js').RunStopAckMsg
+          ws.close()
+          if (ack.ok && ack.record) {
+            done(ack.record)
+          } else {
+            done(undefined, new Error(`${ack.code ?? 'stop_failed'}: ${ack.error ?? 'unknown error'}`))
+          }
+        } else if (msgType === 'relay_error') {
+          const errMsg = msg as import('./types.js').RelayErrorMsg
+          ws.terminate()
+          reject(new Error(`${errMsg.code}: ${errMsg.message}`))
         }
       } catch {}
     })

@@ -281,7 +281,7 @@ If the daemon process exits ungracefully the registry entry remains until the WS
 
 ```bash
 npm run build          # clean build to dist/
-npm test               # build + run 114 tests
+npm test               # build + run 119 tests
 npm run dev            # watch mode
 ```
 
@@ -435,8 +435,14 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
   JSONL schema — output is unchanged from the caller's perspective. Key derivation reuses the ECDH
   shared secret from `run_start` with a separate HKDF context (`vibe-run-event-v1`). Relay metadata
   still visible: `run_id`, `node_id`, timestamps, message sizes.
-- **Remaining plaintext surfaces**: `run_stop` request/ack and approval relay (MVP 4D).
-- **E2E encryption (MVP 4D+)**: Stop/approval encryption planned next.
+- **Encrypted run_stop (MVP 4D)**: `vibe run stop` on an encrypted run automatically sends an
+  `encrypted_run_stop_request`. The relay routes by `run_id` ownership without reading the payload.
+  The node decrypts, executes the stop, and returns an `encrypted_run_stop_ack`. The CLI decrypts
+  and returns the same `RunRecord` JSON as the plaintext path. Uses HKDF context `vibe-run-stop-v1`.
+  Both `event_aes_key` and `stop_aes_key` are derived from the same ECDH shared secret at run_start
+  time and stored in the local RunRecord — no additional key exchange needed.
+- **Remaining plaintext surfaces**: Approval response relay (MVP 4E, if/when implemented).
+- **Note**: `approval_required` VibeEvents are already encrypted by MVP 4C (they are run_events).
 - **Prompt content over relay**: The controller reads the prompt file and sends text in the
   `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
   filesystem paths are never sent over the wire.
@@ -461,4 +467,5 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 | 4A | Identity + pairing + signed plaintext envelope | ✅ done |
 | 4B | Encrypt `run_start` payload (X25519 + AES-256-GCM, relay-blind) | ✅ done |
 | 4C | Encrypt `run_event` stream (same ECDH key material, domain-separated context) | ✅ done |
-| 4D | Encrypt stop/approval | planned |
+| 4D | Encrypt `run_stop` request/ack (`vibe-run-stop-v1` HKDF context) | ✅ done |
+| 4E | Encrypt approval response (if/when approval_response path is added) | planned |

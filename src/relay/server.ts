@@ -17,7 +17,7 @@
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
-import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, PublicIdentity } from './types.js'
+import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, PublicIdentity } from './types.js'
 import { verifyEnvelope } from '../crypto.js'
 
 interface NodeEntry {
@@ -138,6 +138,39 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             const subs = subscribers.get(enc.run_id)
             if (subs) {
               for (const sub of subs) sendMsg(sub, msg)
+            }
+          } else if (encType === 'encrypted_run_stop_request') {
+            // MVP 4D: route encrypted stop request to owning node — relay never decrypts.
+            const enc = msg as EncryptedRunStopRequestMsg
+            pendingStops.set(enc.req_id, ws)
+            const ownerId = runOwnership.get(enc.run_id)
+            if (!ownerId) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: enc.from, ts: now(),
+                type: 'run_stop_ack', req_id: enc.req_id, run_id: enc.run_id, ok: false,
+                error: `Run not found in relay: ${enc.run_id}`, code: 'run_not_found',
+              })
+              pendingStops.delete(enc.req_id)
+            } else {
+              const target = registry.get(ownerId)
+              if (!target) {
+                sendMsg(ws, {
+                  version: 1, kind: 'plaintext', from: 'relay', to: enc.from, ts: now(),
+                  type: 'run_stop_ack', req_id: enc.req_id, run_id: enc.run_id, ok: false,
+                  error: `Owning node is offline: ${ownerId}`, code: 'node_offline',
+                })
+                pendingStops.delete(enc.req_id)
+              } else {
+                sendMsg(target.ws, msg)
+              }
+            }
+          } else if (encType === 'encrypted_run_stop_ack') {
+            // MVP 4D: route encrypted stop ack back to the waiting CLI — relay never decrypts.
+            const enc = msg as EncryptedRunStopAckMsg
+            const requester = pendingStops.get(enc.req_id)
+            if (requester) {
+              sendMsg(requester, msg)
+              pendingStops.delete(enc.req_id)
             }
           }
           return

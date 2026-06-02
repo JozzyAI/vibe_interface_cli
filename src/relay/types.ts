@@ -3,7 +3,8 @@
  *
  * MVP 4A: optional Ed25519 signature on plaintext envelopes.
  * MVP 4B: kind='encrypted' for run_start payload encryption (X25519 + AES-256-GCM).
- * MVP 4C: kind='encrypted' for run_event stream (same key material, 'vibe-run-event-v1' context).
+ * MVP 4C: kind='encrypted' for run_event stream ('vibe-run-event-v1' HKDF context).
+ * MVP 4D: kind='encrypted' for run_stop request/ack ('vibe-run-stop-v1' HKDF context).
  *
  * Relay can see routing metadata on encrypted envelopes (from/to/run_id/key_id/ts)
  * but cannot read any ciphertext payload.
@@ -78,6 +79,54 @@ export interface EncryptedRunEventMsg {
   key_id: string   // node_id (identifies which run-level key was used)
   nonce: string    // base64 12-byte AES-GCM nonce
   ciphertext: string // base64 AES-256-GCM(VibeEvent JSON ‖ auth_tag(16))
+}
+
+// ── MVP 4D: encrypted run_stop request/ack ─────────────────────────────────
+//
+// CLI encrypts stop request; relay routes by run_id ownership; node decrypts,
+// stops the run, and returns an encrypted ack. Relay never reads stop reason or result.
+//
+// Relay sees: version/kind/from/to/run_id/req_id/key_id/nonce/ciphertext/ts
+// Relay cannot see: reason, ok, error, RunRecord details
+
+export interface EncryptedRunStopRequestMsg {
+  version: 1
+  kind: 'encrypted'
+  from: string      // 'cli'
+  to: 'relay'
+  ts: string
+  type: 'encrypted_run_stop_request'
+  req_id: string    // correlation id for routing ack back to requester
+  run_id: string    // visible for relay routing via runOwnership map
+  key_id: string    // run_id (identifies which stop key to use)
+  nonce: string     // base64 12-byte AES-GCM nonce
+  ciphertext: string // base64 AES-256-GCM(RunStopPayload JSON ‖ auth_tag(16))
+}
+
+// Decrypted inner payload of EncryptedRunStopRequestMsg
+export interface RunStopPayload {
+  reason?: string
+}
+
+export interface EncryptedRunStopAckMsg {
+  version: 1
+  kind: 'encrypted'
+  from: string      // node_id
+  to: 'relay'
+  ts: string
+  type: 'encrypted_run_stop_ack'
+  req_id: string    // matches the request req_id
+  run_id: string
+  nonce: string
+  ciphertext: string // base64 AES-256-GCM(RunStopAckPayload JSON ‖ auth_tag(16))
+}
+
+// Decrypted inner payload of EncryptedRunStopAckMsg
+export interface RunStopAckPayload {
+  ok: boolean
+  record?: RunRecord
+  error?: string
+  code?: string
 }
 
 // ── node → relay: pairing (MVP 4A) ────────────────────────────────────────
@@ -203,6 +252,8 @@ export interface RelayErrorMsg extends RelayMsgBase {
 export type RelayMessage =
   | EncryptedRunStartMsg
   | EncryptedRunEventMsg
+  | EncryptedRunStopRequestMsg
+  | EncryptedRunStopAckMsg
   | NodePairRequestMsg
   | NodePairAckMsg
   | NodeRegisterMsg

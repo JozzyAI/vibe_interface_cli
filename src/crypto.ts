@@ -113,9 +113,10 @@ export interface EncryptedPayload {
   ciphertext: string            // base64 encrypted_data ‖ auth_tag(16)
 }
 
-// Separate HKDF contexts for domain separation between run_start and run_event keys.
+// Separate HKDF contexts for cryptographic domain separation.
 const HKDF_INFO       = Buffer.from('vibe-run-start-v1', 'utf8')
 const HKDF_INFO_EVENT = Buffer.from('vibe-run-event-v1', 'utf8')
+const HKDF_INFO_STOP  = Buffer.from('vibe-run-stop-v1',  'utf8')
 
 function deriveAesKeyWith(sharedSecret: Buffer, info: Buffer): Buffer {
   return Buffer.from(crypto.hkdfSync('sha256', sharedSecret, Buffer.alloc(0), info, 32))
@@ -160,19 +161,8 @@ export function encryptPayload(
 
 // ── Run-event stream encryption (MVP 4C) ──────────────────────────────────
 
-/**
- * Derive the per-run AES-256 event key from an ECDH exchange.
- *
- * Both sides call this with their own private key and the other party's public key:
- *   CLI:  deriveRunEventKey(ephemeral_private, node_enc_public)
- *   Node: deriveRunEventKey(node_enc_private, ephemeral_public_from_run_start)
- *
- * ECDH commutativity ensures both sides arrive at the same 32-byte key.
- * Uses HKDF context 'vibe-run-event-v1' — distinct from the run_start key.
- *
- * Returns base64-encoded 32-byte AES-256 key.
- */
-export function deriveRunEventKey(myPrivKeyBase64: string, theirPubKeyBase64: string): string {
+// Shared ECDH helper — computes X25519 shared secret from a private + public key pair.
+function ecdhSharedSecret(myPrivKeyBase64: string, theirPubKeyBase64: string): Buffer {
   const myPrivKey = crypto.createPrivateKey({
     key: Buffer.from(myPrivKeyBase64, 'base64'),
     format: 'der',
@@ -183,8 +173,36 @@ export function deriveRunEventKey(myPrivKeyBase64: string, theirPubKeyBase64: st
     format: 'der',
     type: 'spki',
   })
-  const sharedSecret = crypto.diffieHellman({ privateKey: myPrivKey, publicKey: theirPubKey })
-  return deriveAesKeyWith(sharedSecret, HKDF_INFO_EVENT).toString('base64')
+  return crypto.diffieHellman({ privateKey: myPrivKey, publicKey: theirPubKey })
+}
+
+/**
+ * Derive the per-run AES-256 event key from an ECDH exchange.
+ *
+ * Both sides call this with their own private key and the other party's public key:
+ *   CLI:  deriveRunEventKey(ephemeral_private, node_enc_public)
+ *   Node: deriveRunEventKey(node_enc_private, ephemeral_public_from_run_start)
+ *
+ * ECDH commutativity ensures both sides arrive at the same 32-byte key.
+ * Uses HKDF context 'vibe-run-event-v1' — distinct from the run_start and run_stop keys.
+ *
+ * Returns base64-encoded 32-byte AES-256 key.
+ */
+export function deriveRunEventKey(myPrivKeyBase64: string, theirPubKeyBase64: string): string {
+  return deriveAesKeyWith(ecdhSharedSecret(myPrivKeyBase64, theirPubKeyBase64), HKDF_INFO_EVENT).toString('base64')
+}
+
+/**
+ * Derive the per-run AES-256 stop key from the same ECDH exchange as the event key.
+ *
+ * Uses HKDF context 'vibe-run-stop-v1' — distinct from run_event and run_start keys.
+ *   CLI:  deriveRunStopKey(ephemeral_private, node_enc_public)
+ *   Node: deriveRunStopKey(node_enc_private, ephemeral_public_from_run_start)
+ *
+ * Returns base64-encoded 32-byte AES-256 key.
+ */
+export function deriveRunStopKey(myPrivKeyBase64: string, theirPubKeyBase64: string): string {
+  return deriveAesKeyWith(ecdhSharedSecret(myPrivKeyBase64, theirPubKeyBase64), HKDF_INFO_STOP).toString('base64')
 }
 
 /** Encrypt a VibeEvent (or any JSON-serialisable value) with a run-level AES-256 key. */

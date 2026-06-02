@@ -27,7 +27,8 @@ export interface RunRecord {
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
   child_pid?: number       // PID of spawned agent process (for kill-on-stop)
-  event_aes_key?: string   // base64 AES-256 key for run_event decryption; stored locally by CLI after encrypted run_start
+  event_aes_key?: string   // base64 AES-256 key for run_event decryption (HKDF 'vibe-run-event-v1'); stored locally
+  stop_aes_key?: string    // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally
   created_at: string
   updated_at: string
 }
