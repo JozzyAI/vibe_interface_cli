@@ -281,19 +281,19 @@ If the daemon process exits ungracefully the registry entry remains until the WS
 
 ```bash
 npm run build          # clean build to dist/
-npm test               # build + run 74 tests
+npm test               # build + run 82 tests
 npm run dev            # watch mode
 ```
 
 ## Symphony integration
+
+### Local dispatch
 
 ```bash
 result=$(vibe symphony start \
   --agent claude-code \
   --issue-id ISSUE-123 \
   --issue-title "Fix auth bug" \
-  --repo-url https://github.com/org/repo \
-  --branch main \
   --prompt-file task.txt \
   --permission-mode unsafe-skip)
 
@@ -308,3 +308,87 @@ done
 
 vibe symphony status "$run_id" --json
 ```
+
+### Remote dispatch over relay
+
+```bash
+result=$(vibe symphony start \
+  --agent claude-code \
+  --node my-node \
+  --relay ws://localhost:7433 \
+  --token dev \
+  --issue-id ISSUE-123 \
+  --issue-title "Fix auth bug" \
+  --workspace-key ISSUE-123 \
+  --prompt-file task.txt \
+  --json)
+
+run_id=$(echo "$result" | jq -r .run_id)
+
+vibe symphony stream "$run_id" \
+  --relay ws://localhost:7433 \
+  --token dev \
+  --jsonl
+```
+
+See [`docs/VIBE_RELAY_DEMO.md`](docs/VIBE_RELAY_DEMO.md) for a step-by-step 3-terminal walkthrough (mock and Claude Code variants).
+
+### Symphony Elixir (ExternalExecutor)
+
+The [universe-symphony](https://github.com/JozzyAI/universe-symphony) fork integrates via
+`SymphonyElixir.Codex.ExternalExecutor`, which calls `vibe symphony start/stream` under the hood.
+Symphony does **not** use the Codex `AppServer` / JSON-RPC path when `agent_kind: vibe` is set.
+
+WORKFLOW.md (remote node example):
+```yaml
+agent_kind: vibe
+external:
+  command: vibe
+  agent: claude-code
+  node: my-node
+  relay: ws://localhost:7433
+  token: dev
+  permission_mode: unsafe-skip   # optional
+```
+
+Smoke tests (from `symphony/elixir/`):
+```bash
+bash scripts/smoke_vibe_relay.sh            # mock agent — no API key needed
+bash scripts/smoke_vibe_relay_claude.sh     # Claude Code — skips if 'claude' not in PATH
+```
+
+---
+
+## Architecture notes
+
+- **Symphony dispatch path**: `AgentRunner` → `ExternalExecutor.run/4` → `vibe symphony start/stream`.
+  This bypasses `AppServer` (Codex JSON-RPC) entirely. `codex.command` and the Codex path are untouched.
+- **Plaintext relay**: `vibe relay dev` is for local development only. It binds to `127.0.0.1` and
+  sends all messages as unencrypted JSON over WebSocket. **Do not expose to the internet.**
+- **E2E encryption**: Planned for MVP 4 — per-session key exchange, encrypted payloads, signed messages.
+  Not implemented yet.
+- **Prompt content over relay**: The controller reads the prompt file and sends text in the
+  `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
+  filesystem paths are never sent over the wire.
+
+---
+
+## Milestones
+
+| MVP | Feature | Status |
+|-----|---------|--------|
+| 0 | `run start/stream/status/stop` — local mock | ✅ done |
+| 1A | Claude Code backend — local | ✅ done |
+| 1B | `run start` → terminal event loop | ✅ done |
+| 2A | `symphony start/stream/status/stop` | ✅ done |
+| 2B | Symphony Elixir ExternalExecutor | ✅ done |
+| 3A | `vibe relay dev` — WebSocket relay server | ✅ done |
+| 3B | `vibe node daemon --local` — heartbeat, register | ✅ done |
+| 3C | Remote `run start/stream` over relay | ✅ done |
+| 3D | Remote `run stop` over relay | ✅ done |
+| 3E | Claude Code backend over relay | ✅ done |
+| 3F | Symphony relay dispatch + ExternalExecutor relay pass-through | ✅ done |
+| 4A | Key identity + pairing (E2E prep) | planned |
+| 4B | Encrypt `run_start` payload | planned |
+| 4C | Encrypt `run_event` stream | planned |
+| 4D | Encrypt stop/approval | planned |
