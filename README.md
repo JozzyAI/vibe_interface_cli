@@ -281,7 +281,7 @@ If the daemon process exits ungracefully the registry entry remains until the WS
 
 ```bash
 npm run build          # clean build to dist/
-npm test               # build + run 82 tests
+npm test               # build + run 97 tests
 npm run dev            # watch mode
 ```
 
@@ -359,14 +359,74 @@ bash scripts/smoke_vibe_relay_claude.sh     # Claude Code — skips if 'claude' 
 
 ---
 
+## Identity and signing (MVP 4A)
+
+Each node has a stable cryptographic identity stored at `~/.vibe/identity.json`.
+
+```bash
+# Show (or create) this node's identity — never prints private keys
+vibe node identity --json
+# → {"version":1,"kind":"node","id":"node_a1b2c3d4...","display_name":"Zhaoyi-PC",
+#    "signing_alg":"Ed25519","signing_public_key":"...","encryption_alg":"X25519",
+#    "encryption_public_key":"...","fingerprint":"SHA256:..."}
+
+# Pair this node with a relay (sends public identity; relay stores it in memory)
+vibe node pair --relay ws://localhost:7433 --token dev
+# → {"relay_url":"ws://localhost:7433","paired_at":"...","node_id":"node_...","status":"paired"}
+```
+
+**Key design:**
+- **Ed25519** — signs `node_register` and `node_heartbeat` messages (message authenticity)
+- **X25519** — reserved for payload encryption in MVP 4B (not used yet)
+- Payloads are still **plaintext** in 4A — signing proves origin, not confidentiality
+
+**Relay modes:**
+```bash
+# Default: token-only dev mode (existing behavior, unchanged)
+vibe relay dev --port 7433 --token dev
+
+# Require-pairing: unpaired nodes and bad signatures are rejected
+vibe relay dev --port 7433 --token dev --require-pairing
+```
+
+**Demo (3 terminals):**
+```bash
+# Terminal 1
+vibe relay dev --port 7433 --token dev --require-pairing
+
+# Terminal 2
+vibe node identity --json
+vibe node pair --relay ws://localhost:7433 --token dev
+vibe node daemon --local --relay ws://localhost:7433 --token dev
+
+# Terminal 3
+vibe node list --remote --relay ws://localhost:7433 --token dev --json
+```
+
+**What require-pairing rejects:**
+- `node_register` from a node that has not called `node pair` first
+- `node_register` with no signature
+- `node_register` with an invalid Ed25519 signature
+
+**Identity file format:**
+```
+~/.vibe/identity.json   # chmod 0600 — contains private keys, never printed to stdout
+~/.vibe/paired_relays.json  # list of relays this node has paired with
+```
+
+---
+
 ## Architecture notes
 
 - **Symphony dispatch path**: `AgentRunner` → `ExternalExecutor.run/4` → `vibe symphony start/stream`.
   This bypasses `AppServer` (Codex JSON-RPC) entirely. `codex.command` and the Codex path are untouched.
 - **Plaintext relay**: `vibe relay dev` is for local development only. It binds to `127.0.0.1` and
   sends all messages as unencrypted JSON over WebSocket. **Do not expose to the internet.**
-- **E2E encryption**: Planned for MVP 4 — per-session key exchange, encrypted payloads, signed messages.
-  Not implemented yet.
+- **Signed plaintext (MVP 4A)**: Messages carry an optional `signature` field (Ed25519). In
+  `--require-pairing` mode, the relay verifies signatures against stored public identities.
+  Payloads are still plaintext — signing proves origin, not confidentiality.
+- **E2E encryption (MVP 4B+)**: X25519 keys are generated and stored alongside Ed25519 keys, but
+  not yet used. Session key agreement and payload encryption come in MVP 4B.
 - **Prompt content over relay**: The controller reads the prompt file and sends text in the
   `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
   filesystem paths are never sent over the wire.
@@ -388,7 +448,7 @@ bash scripts/smoke_vibe_relay_claude.sh     # Claude Code — skips if 'claude' 
 | 3D | Remote `run stop` over relay | ✅ done |
 | 3E | Claude Code backend over relay | ✅ done |
 | 3F | Symphony relay dispatch + ExternalExecutor relay pass-through | ✅ done |
-| 4A | Key identity + pairing (E2E prep) | planned |
-| 4B | Encrypt `run_start` payload | planned |
+| 4A | Identity + pairing + signed plaintext envelope | ✅ done |
+| 4B | Encrypt `run_start` payload (X25519 session key) | planned |
 | 4C | Encrypt `run_event` stream | planned |
 | 4D | Encrypt stop/approval | planned |

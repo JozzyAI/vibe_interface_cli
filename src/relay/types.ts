@@ -5,9 +5,19 @@
  * so they're structurally compatible with VibeEnvelope plaintext for future
  * unification. The `type` field is the discriminator.
  *
- * MVP 4 will add kind: 'encrypted' without changing this type union.
+ * MVP 4A adds optional `signature` to the base envelope (Ed25519 signed plaintext).
+ * MVP 4B will add kind: 'encrypted' for payload encryption (X25519).
  */
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
+import type { PublicIdentity } from '../identity.js'
+
+export type { PublicIdentity }
+
+export interface EnvelopeSignature {
+  alg: 'Ed25519'
+  key_id: string   // identity id (signer's node_id)
+  value: string    // base64 Ed25519 signature over canonical(envelope-without-signature)
+}
 
 export interface RelayMsgBase {
   version: 1
@@ -15,6 +25,22 @@ export interface RelayMsgBase {
   from: string      // node_id | 'cli' | 'relay'
   to: string        // node_id | 'cli' | 'relay' | '*'
   ts: string
+  signature?: EnvelopeSignature  // MVP 4A: optional; required in --require-pairing mode
+}
+
+// ── node → relay: pairing (MVP 4A) ────────────────────────────────────────
+
+export interface NodePairRequestMsg extends RelayMsgBase {
+  type: 'node_pair_request'
+  identity: PublicIdentity
+}
+
+export interface NodePairAckMsg extends RelayMsgBase {
+  type: 'node_pair_ack'
+  node_id: string
+  ok: boolean
+  error?: string
+  code?: string
 }
 
 // ── node daemon → relay ────────────────────────────────────────────────────
@@ -123,6 +149,8 @@ export interface RelayErrorMsg extends RelayMsgBase {
 }
 
 export type RelayMessage =
+  | NodePairRequestMsg
+  | NodePairAckMsg
   | NodeRegisterMsg
   | NodeHeartbeatMsg
   | NodeListRequestMsg

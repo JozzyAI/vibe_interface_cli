@@ -10,6 +10,7 @@ export function registerRelayCommand(program: Command): void {
     )
     .option('--port <port>', 'port to listen on', '7433')
     .option('--token <token>', 'auth token', 'dev')
+    .option('--require-pairing', 'reject node_register from unpaired nodes (MVP 4A)')
     .action(async (opts) => {
       const port = parseInt(opts.port, 10)
       if (isNaN(port) || port < 1 || port > 65535) {
@@ -18,12 +19,17 @@ export function registerRelayCommand(program: Command): void {
       }
 
       const { startRelayServer } = await import('../relay/server.js')
-      const server = await startRelayServer({ port, token: opts.token })
+      const server = await startRelayServer({
+        port,
+        token: opts.token,
+        requirePairing: Boolean(opts.requirePairing),
+      })
 
       process.stderr.write(
-        `[vibe-relay] dev relay started (plaintext — no E2E encryption)\n` +
+        `[vibe-relay] dev relay started (plaintext + signed — no payload encryption)\n` +
         `[vibe-relay] listening on ws://localhost:${server.port}\n` +
         `[vibe-relay] token: ${opts.token}\n` +
+        (opts.requirePairing ? `[vibe-relay] require-pairing: ON — unpaired nodes will be rejected\n` : '') +
         `[vibe-relay] Ctrl-C to stop\n`,
       )
 

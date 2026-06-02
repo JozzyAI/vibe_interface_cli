@@ -11,10 +11,14 @@
  *
  * Run ownership: relay records run_id → node_id when run_start_ack ok=true
  * arrives. This allows run_stop_request to be routed to the correct node.
+ *
+ * MVP 4A: --require-pairing mode enforces that nodes must pair before registering.
+ * Without --require-pairing the old token-only dev mode continues to work.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
-import type { RelayMessage } from './types.js'
+import type { RelayMessage, PublicIdentity } from './types.js'
+import { verifyEnvelope } from '../crypto.js'
 
 interface NodeEntry {
   node: VibeNode
@@ -26,6 +30,7 @@ interface NodeEntry {
 export interface RelayServer {
   port: number
   nodeCount(): number
+  pairedCount(): number
   close(): Promise<void>
 }
 
@@ -34,6 +39,12 @@ export interface RelayServerOpts {
   token: string
   /** Override stale threshold (ms). Defaults to VIBE_NODE_STALE_MS env or 15000. */
   staleMs?: number
+  /**
+   * When true, node_register is rejected unless the node has paired first and
+   * the message carries a valid Ed25519 signature.
+   * Default false — old token-only dev mode continues to work.
+   */
+  requirePairing?: boolean
 }
 
 function getStaleMs(override?: number): number {
@@ -60,6 +71,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const runOwnership = new Map<string, string>()
     // run_id → set of subscriber ws, for streaming run events to CLI clients
     const subscribers = new Map<string, Set<WebSocket>>()
+    // node_id → PublicIdentity (populated on node_pair_request)
+    const pairedIdentities = new Map<string, PublicIdentity>()
     const staleMs = getStaleMs(opts.staleMs)
 
     // Token auth at the HTTP upgrade level — rejected clients never reach the WS layer.
@@ -85,6 +98,7 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
       resolve({
         port,
         nodeCount: () => registry.size,
+        pairedCount: () => pairedIdentities.size,
         close: () =>
           new Promise<void>((res) => {
             for (const ws of allConns) ws.terminate()
@@ -102,8 +116,48 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         try { msg = JSON.parse(raw.toString()) as RelayMessage } catch { return }
 
         switch (msg.type) {
+          case 'node_pair_request': {
+            const pid = msg.identity.id
+            pairedIdentities.set(pid, msg.identity)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+              type: 'node_pair_ack', node_id: pid, ok: true,
+            })
+            break
+          }
+
           case 'node_register': {
             nodeId = msg.node.node_id
+
+            if (opts.requirePairing) {
+              const identity = pairedIdentities.get(nodeId)
+              if (!identity) {
+                sendMsg(ws, {
+                  version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                  type: 'node_register_ack', node_id: nodeId, ok: false,
+                })
+                nodeId = null
+                break
+              }
+              if (!msg.signature) {
+                sendMsg(ws, {
+                  version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                  type: 'node_register_ack', node_id: nodeId, ok: false,
+                })
+                nodeId = null
+                break
+              }
+              const rawEnvelope = JSON.parse(raw.toString()) as Record<string, unknown>
+              if (!verifyEnvelope(identity.signing_public_key, rawEnvelope)) {
+                sendMsg(ws, {
+                  version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                  type: 'node_register_ack', node_id: nodeId, ok: false,
+                })
+                nodeId = null
+                break
+              }
+            }
+
             registry.set(nodeId, {
               node: { ...msg.node, transport: 'relay' },
               ws,

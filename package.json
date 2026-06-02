@@ -9,7 +9,7 @@
   "scripts": {
     "build": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && tsc",
     "dev": "tsc --watch",
-    "test": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && tsc && node --test dist/test/contract.test.js dist/test/orchestrator.smoke.test.js dist/test/claude.test.js dist/test/symphony.smoke.test.js dist/test/node.test.js dist/test/daemon.test.js dist/test/relay.test.js"
+    "test": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && tsc && node --test dist/test/contract.test.js dist/test/orchestrator.smoke.test.js dist/test/claude.test.js dist/test/symphony.smoke.test.js dist/test/node.test.js dist/test/daemon.test.js dist/test/relay.test.js dist/test/identity.test.js"
   },
   "dependencies": {
     "commander": "^13.0.0",

@@ -1,5 +1,6 @@
 import type { Command } from 'commander'
 import { listNodes, getNode } from '../nodes.js'
+import { ensureIdentity, toPublicIdentity } from '../identity.js'
 
 export function registerNodeCommand(program: Command): void {
   const node = program.command('node').description('manage Vibe Nodes')
@@ -46,6 +47,33 @@ export function registerNodeCommand(program: Command): void {
         process.exit(3)
       }
       process.stdout.write(JSON.stringify(n) + '\n')
+    })
+
+  node
+    .command('identity')
+    .description('show (or create) this node\'s identity — auto-creates if missing')
+    .option('--json', 'output machine-readable JSON')
+    .action((_opts) => {
+      const identity = ensureIdentity()
+      const pub = toPublicIdentity(identity)
+      process.stdout.write(JSON.stringify(pub) + '\n')
+    })
+
+  node
+    .command('pair')
+    .description('pair this node with a relay (sends public identity to relay)')
+    .requiredOption('--relay <url>', 'relay WebSocket URL')
+    .requiredOption('--token <token>', 'auth token')
+    .option('--json', 'output machine-readable JSON')
+    .action(async (opts) => {
+      try {
+        const { relayNodePair } = await import('../relay/client.js')
+        const record = await relayNodePair(opts.relay as string, opts.token as string)
+        process.stdout.write(JSON.stringify(record) + '\n')
+      } catch (err) {
+        process.stderr.write(`error: ${(err as Error).message}\n`)
+        process.exit(1)
+      }
     })
 
   node

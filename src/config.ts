@@ -2,27 +2,33 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 
-const VIBE_DIR = path.join(os.homedir(), '.vibe')
-const CONFIG_PATH = path.join(VIBE_DIR, 'config.json')
+function resolveVibeDir(): string {
+  return process.env.VIBE_DIR ?? path.join(os.homedir(), '.vibe')
+}
+
+const CONFIG_PATH = path.join(resolveVibeDir(), 'config.json')
 
 interface VibeConfig {
   workspace_root: string
   node_id: string
 }
 
-function ensureVibeDir(): void {
-  fs.mkdirSync(VIBE_DIR, { recursive: true })
-  fs.mkdirSync(path.join(VIBE_DIR, 'runs'), { recursive: true })
-  fs.mkdirSync(path.join(VIBE_DIR, 'events'), { recursive: true })
+function ensureVibeDir(): string {
+  const dir = resolveVibeDir()
+  fs.mkdirSync(dir, { recursive: true })
+  fs.mkdirSync(path.join(dir, 'runs'), { recursive: true })
+  fs.mkdirSync(path.join(dir, 'events'), { recursive: true })
+  return dir
 }
 
 export function resolveConfig(): VibeConfig {
-  ensureVibeDir()
+  const dir = ensureVibeDir()
+  const configPath = path.join(dir, 'config.json')
 
   let stored: Partial<VibeConfig> = {}
-  if (fs.existsSync(CONFIG_PATH)) {
+  if (fs.existsSync(configPath)) {
     try {
-      stored = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+      stored = JSON.parse(fs.readFileSync(configPath, 'utf8'))
     } catch {
       // ignore malformed config
     }
@@ -31,12 +37,11 @@ export function resolveConfig(): VibeConfig {
   return {
     workspace_root: process.env.VIBE_WORKSPACE_ROOT
       ?? stored.workspace_root
-      ?? path.join(VIBE_DIR, 'workspaces'),
+      ?? path.join(dir, 'workspaces'),
     node_id: process.env.VIBE_NODE_ID ?? stored.node_id ?? 'local',
   }
 }
 
 export function vibeDir(): string {
-  ensureVibeDir()
-  return VIBE_DIR
+  return ensureVibeDir()
 }

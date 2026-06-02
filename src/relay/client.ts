@@ -15,6 +15,8 @@ import { claudeCodeBackend } from '../backends/claude-code.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { RelayMessage, RunStartMsg, RunStopRequestMsg } from './types.js'
+import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
+import { signEnvelope, type EnvelopeSignature } from '../crypto.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -46,6 +48,17 @@ function relayUrl(base: string, token: string): string {
 
 function sendMsg(ws: WebSocket, msg: RelayMessage): void {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
+}
+
+/**
+ * Build and send a signed relay message.
+ * The signature covers canonical(envelope-without-signature).
+ */
+function sendSigned(ws: WebSocket, msg: RelayMessage, identity: IdentityFile): void {
+  if (ws.readyState !== WebSocket.OPEN) return
+  const { signature: _drop, ...withoutSig } = msg as unknown as Record<string, unknown>
+  const sig: EnvelopeSignature = signEnvelope(identity.signing.private_key, identity.id, withoutSig)
+  ws.send(JSON.stringify({ ...msg, signature: sig }))
 }
 
 function t(): string { return new Date().toISOString() }
@@ -167,7 +180,11 @@ export async function relayNodeDaemon(
 ): Promise<void> {
   const config = resolveConfig()
   const heartbeatMs = getHeartbeatMs()
-  const nodeId = deriveNodeId(nodeIdOverride)
+
+  // Load identity; if available and no --node-id override, use identity id as node_id.
+  let identity: IdentityFile | null = null
+  try { identity = ensureIdentity() } catch { /* non-fatal — fall back to hostname-derived id */ }
+  const nodeId = nodeIdOverride ?? identity?.id ?? deriveNodeId()
 
   const node: VibeNode = {
     node_id: nodeId,
@@ -188,6 +205,8 @@ export async function relayNodeDaemon(
 
   let timer: ReturnType<typeof setInterval> | null = null
 
+  const send = (msg: RelayMessage) => identity ? sendSigned(ws, msg, identity) : sendMsg(ws, msg)
+
   return new Promise<void>((resolve, reject) => {
     let settled = false
     const done = (err?: Error) => {
@@ -199,10 +218,10 @@ export async function relayNodeDaemon(
 
     ws.on('open', () => {
       process.stderr.write(`[vibe-node] connected — registering node_id=${nodeId}\n`)
-      sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'node_register', node })
+      send({ version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'node_register', node })
 
       timer = setInterval(() => {
-        sendMsg(ws, {
+        send({
           version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
           type: 'node_heartbeat', node_id: nodeId,
           active_runs: countActiveRuns(), last_heartbeat_at: t(),
@@ -463,6 +482,96 @@ export async function remoteStream(relay: string, token: string, runId: string):
 
     ws.on('close', () => resolve())
     ws.on('error', (err) => reject(err))
+  })
+}
+
+export interface PairedRelayRecord {
+  relay_url: string
+  paired_at: string
+  node_id: string
+  relay_id: string | null
+  relay_signing_public_key: string | null
+  status: 'paired'
+}
+
+export interface PairedRelaysFile {
+  relays: PairedRelayRecord[]
+}
+
+function pairedRelaysPath(): string {
+  return path.join(vibeDir(), 'paired_relays.json')
+}
+
+function loadPairedRelays(): PairedRelaysFile {
+  try { return JSON.parse(fs.readFileSync(pairedRelaysPath(), 'utf8')) as PairedRelaysFile } catch {}
+  return { relays: [] }
+}
+
+function savePairedRelays(file: PairedRelaysFile): void {
+  const p = pairedRelaysPath()
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  fs.writeFileSync(p, JSON.stringify(file, null, 2))
+}
+
+/**
+ * Pair this node with a relay: send our public identity, relay stores it.
+ * Writes ~/.vibe/paired_relays.json on success.
+ */
+export async function relayNodePair(relay: string, token: string): Promise<PairedRelayRecord> {
+  const identity = ensureIdentity()
+  const pub = toPublicIdentity(identity)
+
+  return new Promise<PairedRelayRecord>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+
+    let settled = false
+    const done = (record?: PairedRelayRecord, err?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      record ? resolve(record) : reject(err!)
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate()
+      done(undefined, new Error('Timeout waiting for node_pair_ack from relay'))
+    }, 10_000)
+
+    ws.on('open', () => {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: pub.id, to: 'relay', ts: t(),
+        type: 'node_pair_request', identity: pub,
+      })
+    })
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'node_pair_ack') {
+          ws.close()
+          if (msg.ok) {
+            const record: PairedRelayRecord = {
+              relay_url: relay,
+              paired_at: new Date().toISOString(),
+              node_id: pub.id,
+              relay_id: null,
+              relay_signing_public_key: null,
+              status: 'paired',
+            }
+            const stored = loadPairedRelays()
+            stored.relays = stored.relays.filter(r => r.relay_url !== relay)
+            stored.relays.push(record)
+            savePairedRelays(stored)
+            done(record)
+          } else {
+            done(undefined, new Error(`${msg.code ?? 'pair_failed'}: ${msg.error ?? 'unknown error'}`))
+          }
+        }
+      } catch {}
+    })
+
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before node_pair_ack')))
+    ws.on('error', (err) => done(undefined, err))
   })
 }
 
