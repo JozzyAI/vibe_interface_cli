@@ -11,6 +11,7 @@ import { getHeartbeatMs } from '../node-state.js'
 import { generateRunId, tryReadRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
 import { mockBackend } from '../backends/mock.js'
+import { claudeCodeBackend } from '../backends/claude-code.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { RelayMessage, RunStartMsg, RunStopRequestMsg } from './types.js'
@@ -50,12 +51,11 @@ function sendMsg(ws: WebSocket, msg: RelayMessage): void {
 function t(): string { return new Date().toISOString() }
 
 async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg): Promise<void> {
-  // Only mock is supported for remote execution. claude-code and others require 3D-2C+.
-  if (msg.agent !== 'mock') {
+  if (msg.agent !== 'mock' && msg.agent !== 'claude-code') {
     sendMsg(ws, {
       version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
       type: 'run_start_ack', req_id: msg.req_id, ok: false,
-      error: `Remote agent not supported: ${msg.agent}. Only mock is available in relay mode.`,
+      error: `Remote agent not supported: ${msg.agent}. Supported: mock, claude-code.`,
       code: 'agent_not_supported',
     })
     return
@@ -65,6 +65,14 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   const workspaceKey = msg.workspace_key ?? runId
   const workspacePath = path.join(config.workspace_root, workspaceKey)
   fs.mkdirSync(workspacePath, { recursive: true })
+
+  // Write prompt content to a node-local temp file. The controller sends the
+  // file's text content over the relay so the node never needs the controller's path.
+  let promptFile: string | undefined
+  if (msg.prompt_content !== undefined) {
+    promptFile = path.join(os.tmpdir(), `vibe-prompt-${runId}.md`)
+    fs.writeFileSync(promptFile, msg.prompt_content, 'utf8')
+  }
 
   const now = t()
   const record: RunRecord = {
@@ -77,7 +85,7 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     workspace_path: workspacePath,
     ...(msg.repo_url && { repo_url: msg.repo_url }),
     ...(msg.branch && { branch: msg.branch }),
-    ...(msg.prompt_file && { prompt_file: msg.prompt_file }),
+    ...(promptFile && { prompt_file: promptFile }),
     ...(msg.permission_mode && { permission_mode: msg.permission_mode }),
     ...(msg.metadata && { metadata: msg.metadata }),
     created_at: now,
@@ -85,8 +93,8 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   }
   writeRun(record)
 
-  // Reuse the same local mock backend — spawns _mock-runner as a detached process.
-  const result = await mockBackend.start(record, {})
+  const backend = msg.agent === 'claude-code' ? claudeCodeBackend : mockBackend
+  const result = await backend.start(record, {})
   const runningRecord = updateRun(runId, { session_id: result.session_id, status: 'running' })
 
   sendMsg(ws, {
@@ -348,7 +356,7 @@ export interface RemoteRunStartOpts {
   workspaceKey?: string
   repoUrl?: string
   branch?: string
-  promptFile?: string
+  promptFile?: string     // controller-local path; content is read here and sent as prompt_content
   permissionMode?: PermissionMode
   metadata?: Record<string, unknown>
 }
@@ -378,6 +386,13 @@ export async function remoteRunStart(
     }, 10_000)
 
     ws.on('open', () => {
+      // Read prompt file locally — send content, not path, so the remote node
+      // doesn't need access to the controller's filesystem.
+      let promptContent: string | undefined
+      if (opts.promptFile) {
+        try { promptContent = fs.readFileSync(opts.promptFile, 'utf8') } catch {}
+      }
+
       sendMsg(ws, {
         version: 1, kind: 'plaintext', from: 'cli', to: nodeId, ts: t(),
         type: 'run_start',
@@ -386,7 +401,7 @@ export async function remoteRunStart(
         ...(opts.workspaceKey && { workspace_key: opts.workspaceKey }),
         ...(opts.repoUrl && { repo_url: opts.repoUrl }),
         ...(opts.branch && { branch: opts.branch }),
-        ...(opts.promptFile && { prompt_file: opts.promptFile }),
+        ...(promptContent !== undefined && { prompt_content: promptContent }),
         ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
         ...(opts.metadata && { metadata: opts.metadata }),
       })
@@ -400,7 +415,7 @@ export async function remoteRunStart(
           if (msg.ok && msg.record) {
             done(msg.record)
           } else {
-            done(undefined, new Error(msg.error ?? 'run_start failed (ok=false)'))
+            done(undefined, new Error(`${msg.code ?? 'run_start_failed'}: ${msg.error ?? 'unknown error'}`))
           }
         }
       } catch {}

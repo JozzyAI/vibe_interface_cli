@@ -185,6 +185,39 @@ Token auth is enforced at the HTTP upgrade level — wrong or missing token gets
 
 Remote nodes appear with `transport: "relay"` in the node list. Local node list (`vibe node list` without `--remote`) is unaffected by relay state.
 
+### Remote Claude Code
+
+To run Claude Code on the remote node, add `--agent claude-code` to `run start` and optionally `--permission-mode unsafe-skip`. The CLI reads the prompt file locally and transmits its **text content** over the relay — the remote node never needs access to the controller's filesystem.
+
+```bash
+# Terminal 3 (continued from 3-terminal demo above)
+result=$(vibe run start \
+  --agent claude-code \
+  --node my-node \
+  --relay ws://localhost:7433 \
+  --token dev \
+  --workspace-key issue-123 \
+  --prompt-file /tmp/task.md \
+  --permission-mode unsafe-skip \
+  --json)
+
+run_id=$(echo "$result" | jq -r .run_id)
+
+# Stream Claude's output back through relay
+vibe run stream "$run_id" \
+  --relay ws://localhost:7433 \
+  --token dev
+
+# Or stop if needed
+vibe run stop "$run_id" \
+  --relay ws://localhost:7433 \
+  --token dev
+```
+
+> ⚠️ `--permission-mode unsafe-skip` allows Claude to execute code and modify files without prompting. Only use it in workspaces you fully control.
+
+**How prompt content is handled**: `vibe run start` reads the prompt file on the controller side and sends the text in the relay message. The node daemon writes it to a local temp file and passes that to the Claude runner. This design means the controller path is never required on the remote node, making the relay work across different machines.
+
 Env knobs:
 
 | Variable | Default | Description |

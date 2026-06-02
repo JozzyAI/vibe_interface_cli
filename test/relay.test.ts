@@ -21,6 +21,8 @@ import { remoteRunStart, remoteStop, remoteStream } from '../src/relay/client.js
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
+// test/fixtures/ contains fake claude binary for claude-code tests
+const FIXTURES = path.resolve(__dirname, '..', '..', 'test', 'fixtures')
 
 const TEST_TOKEN = `tok-${Date.now()}`
 
@@ -536,6 +538,7 @@ test('vibe run start --node remote-node --relay ...: returns queued RunRecord JS
 async function spawnAndWaitForDaemon(
   serverPort: number,
   nodeId: string,
+  extraEnv?: NodeJS.ProcessEnv,
 ): Promise<ReturnType<typeof spawn>> {
   const daemonProc = spawn(NODE, [
     CLI, 'node', 'daemon', '--local',
@@ -543,7 +546,7 @@ async function spawnAndWaitForDaemon(
     '--token', TEST_TOKEN,
     '--node-id', nodeId,
   ], {
-    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250' },
+    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250', ...extraEnv },
     stdio: 'pipe',
   })
 
@@ -610,24 +613,6 @@ test('relay daemon: remote mock run spawns runner — running → completed, eve
   }
 })
 
-test('relay daemon: remote run_start with claude-code returns agent_not_supported error', async () => {
-  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
-  const daemonProc = await spawnAndWaitForDaemon(server.port, 'no-claude-remote')
-
-  try {
-    await assert.rejects(
-      remoteRunStart(
-        `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'no-claude-remote',
-        { agent: 'claude-code' },
-      ),
-      /agent_not_supported|not supported/i,
-    )
-  } finally {
-    daemonProc.kill('SIGTERM')
-    await new Promise((r) => setTimeout(r, 400))
-    await server.close()
-  }
-})
 
 test('vibe run start --node remote --relay: CLI returns running RunRecord (3D-2B)', async () => {
   const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
@@ -951,6 +936,241 @@ test('vibe run stop --relay: CLI returns stopped RunRecord JSON', async () => {
     const stopped = JSON.parse(stopR.stdout.trim()) as RunRecord
     assert.equal(stopped.status, 'stopped', 'CLI stop output has status=stopped')
     assert.equal(stopped.run_id, record.run_id, 'run_id matches')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+// ── MVP 3E: Claude Code over relay ────────────────────────────────────────
+
+test('relay: prompt_content transmitted over relay (not controller file path)', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    // Fake daemon — captures the run_start message, acks without running anything.
+    const nodeWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    await registerNode(nodeWs, 'prompt-inspect-node')
+
+    let capturedMsg: RelayMessage | null = null
+    nodeWs.on('message', (raw: Buffer) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_start') {
+          capturedMsg = msg
+          send(nodeWs, {
+            version: 1, kind: 'plaintext', from: 'prompt-inspect-node', to: 'relay', ts: now(),
+            type: 'run_start_ack', req_id: msg.req_id, ok: true,
+            record: {
+              run_id: 'run_prompt_test', session_id: '0', node_id: 'prompt-inspect-node',
+              node_selector: 'prompt-inspect-node', agent: msg.agent, status: 'running',
+              workspace_path: '/tmp', created_at: now(), updated_at: now(),
+            },
+          })
+        }
+      } catch {}
+    })
+
+    const pf = path.join(os.tmpdir(), `relay-prompt-test-${Date.now()}.md`)
+    const content = 'write a hello world script'
+    fs.writeFileSync(pf, content)
+
+    await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'prompt-inspect-node',
+      { agent: 'mock', workspaceKey: 'prompt-inspect-ws', promptFile: pf },
+    )
+
+    assert.ok(capturedMsg, 'run_start received by node')
+    assert.equal((capturedMsg as any).prompt_content, content, 'prompt_content contains file text')
+    assert.ok(!(capturedMsg as any).prompt_file, 'controller path not sent in relay message')
+
+    nodeWs.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay: permission_mode unsafe-skip preserved in relay message', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    const nodeWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    await registerNode(nodeWs, 'perm-inspect-node')
+
+    let capturedPermMode: string | undefined
+    nodeWs.on('message', (raw: Buffer) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_start') {
+          capturedPermMode = (msg as any).permission_mode
+          send(nodeWs, {
+            version: 1, kind: 'plaintext', from: 'perm-inspect-node', to: 'relay', ts: now(),
+            type: 'run_start_ack', req_id: msg.req_id, ok: true,
+            record: {
+              run_id: 'run_perm_test', session_id: '0', node_id: 'perm-inspect-node',
+              agent: msg.agent, status: 'running',
+              workspace_path: '/tmp', created_at: now(), updated_at: now(),
+            },
+          })
+        }
+      } catch {}
+    })
+
+    await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'perm-inspect-node',
+      { agent: 'mock', workspaceKey: 'perm-inspect-ws', permissionMode: 'unsafe-skip' },
+    )
+
+    assert.equal(capturedPermMode, 'unsafe-skip', 'permission_mode preserved in relay message')
+    nodeWs.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay daemon: remote claude-code with fake claude exits 0 → completed', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'cc-success-node', {
+    PATH: FIXTURES + path.delimiter + process.env.PATH,
+  })
+
+  try {
+    const pf = path.join(os.tmpdir(), `cc-relay-test-${Date.now()}.md`)
+    fs.writeFileSync(pf, 'write hello world')
+
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'cc-success-node',
+      { agent: 'claude-code', workspaceKey: 'cc-remote-success', promptFile: pf },
+    )
+    assert.equal(record.status, 'running', 'status is running')
+    assert.equal(record.agent, 'claude-code', 'agent is claude-code')
+
+    // Capture stream output
+    const lines: string[] = []
+    const origW = process.stdout.write.bind(process.stdout)
+    ;(process.stdout as any).write = (chunk: string | Buffer, ...args: any[]) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString()
+      lines.push(...s.split('\n').filter(Boolean))
+      return origW(chunk, ...args)
+    }
+
+    await remoteStream(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, record.run_id)
+
+    ;(process.stdout as any).write = origW
+
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(events.some((e: any) => e.type === 'log'), 'received log events from claude')
+    assert.ok(
+      events.some((e: any) => e.type === 'status' && e.status === 'completed'),
+      'received completed event',
+    )
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('relay daemon: remote claude-code with fake claude exits nonzero → failed', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'cc-fail-node', {
+    PATH: FIXTURES + path.delimiter + process.env.PATH,
+    FAKE_CLAUDE_EXIT_CODE: '1',
+  })
+
+  try {
+    const pf = path.join(os.tmpdir(), `cc-relay-fail-${Date.now()}.md`)
+    fs.writeFileSync(pf, 'this will fail')
+
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'cc-fail-node',
+      { agent: 'claude-code', workspaceKey: 'cc-remote-fail', promptFile: pf },
+    )
+    assert.equal(record.status, 'running')
+
+    const lines: string[] = []
+    const origW = process.stdout.write.bind(process.stdout)
+    ;(process.stdout as any).write = (chunk: string | Buffer, ...args: any[]) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString()
+      lines.push(...s.split('\n').filter(Boolean))
+      return origW(chunk, ...args)
+    }
+
+    await remoteStream(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, record.run_id)
+
+    ;(process.stdout as any).write = origW
+
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(
+      events.some((e: any) => e.type === 'status' && e.status === 'failed'),
+      'received failed event',
+    )
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('relay daemon: remote claude-code hangs → remote stop → stream sees stopped', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'cc-hang-node', {
+    PATH: FIXTURES + path.delimiter + process.env.PATH,
+    FAKE_CLAUDE_HANG: '1',
+  })
+
+  try {
+    const pf = path.join(os.tmpdir(), `cc-relay-hang-${Date.now()}.md`)
+    fs.writeFileSync(pf, 'long running task')
+
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'cc-hang-node',
+      { agent: 'claude-code', workspaceKey: 'cc-remote-hang', promptFile: pf },
+    )
+    assert.equal(record.status, 'running')
+
+    // Start stream (resolves on terminal event)
+    const lines: string[] = []
+    const origW = process.stdout.write.bind(process.stdout)
+    ;(process.stdout as any).write = (chunk: string | Buffer, ...args: any[]) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString()
+      lines.push(...s.split('\n').filter(Boolean))
+      return origW(chunk, ...args)
+    }
+    const streamP = remoteStream(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, record.run_id)
+
+    // Wait for _claude-runner to write child_pid to RunRecord
+    await new Promise((r) => setTimeout(r, 1500))
+
+    const stopped = await remoteStop(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, record.run_id)
+    assert.equal(stopped.status, 'stopped', 'stop ack returns stopped record')
+
+    await streamP
+    ;(process.stdout as any).write = origW
+
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(
+      events.some((e: any) => e.type === 'status' && (e.status === 'stopped' || e.status === 'failed')),
+      'stream received terminal event after stop',
+    )
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('relay daemon: unsupported agent (codex) returns agent_not_supported', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'unsupported-agent-node')
+
+  try {
+    await assert.rejects(
+      remoteRunStart(
+        `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'unsupported-agent-node',
+        { agent: 'codex' as any },
+      ),
+      /agent_not_supported/i,
+    )
   } finally {
     daemonProc.kill('SIGTERM')
     await new Promise((r) => setTimeout(r, 400))

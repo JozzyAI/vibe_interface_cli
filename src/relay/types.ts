@@ -51,7 +51,7 @@ export interface RunStartMsg extends RelayMsgBase {
   workspace_key?: string
   repo_url?: string
   branch?: string
-  prompt_file?: string
+  prompt_content?: string  // prompt text (controller reads file, sends content — node writes local temp file)
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
 }
