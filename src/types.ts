@@ -45,6 +45,7 @@ export interface VibeNode {
   workspace_roots: string[]
   created_at: string
   updated_at: string
+  encryption_public_key?: string  // X25519 SPKI DER base64; present when node has identity
 }
 
 // Written periodically by `vibe node daemon --local` to ~/.vibe/node-local.json

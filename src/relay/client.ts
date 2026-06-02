@@ -14,9 +14,9 @@ import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
-import type { RelayMessage, RunStartMsg, RunStopRequestMsg } from './types.js'
+import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, RunStartPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
-import { signEnvelope, type EnvelopeSignature } from '../crypto.js'
+import { signEnvelope, encryptPayload, decryptPayload, type EnvelopeSignature } from '../crypto.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -122,6 +122,66 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
 }
 
 /**
+ * Handle an encrypted run_start envelope (MVP 4B).
+ * Decrypts the payload using the node's X25519 private key, then
+ * calls the existing handleRunStart with a synthetic RunStartMsg.
+ */
+async function handleEncryptedRunStart(
+  ws: WebSocket,
+  nodeId: string,
+  config: ReturnType<typeof resolveConfig>,
+  identity: IdentityFile | null,
+  enc: EncryptedRunStartMsg,
+): Promise<void> {
+  if (!identity) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_start_ack', req_id: enc.req_id, ok: false,
+      error: 'Node has no identity — cannot decrypt run_start payload',
+      code: 'no_identity',
+    })
+    return
+  }
+
+  let payload: RunStartPayload
+  try {
+    payload = decryptPayload(identity.encryption.private_key, {
+      ephemeralPublicKey: enc.ephemeral_public_key,
+      nonce: enc.nonce,
+      ciphertext: enc.ciphertext,
+    }) as unknown as RunStartPayload
+  } catch {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_start_ack', req_id: enc.req_id, ok: false,
+      error: 'Failed to decrypt run_start payload — wrong key or tampered ciphertext',
+      code: 'decrypt_failed',
+    })
+    return
+  }
+
+  // Reconstruct a synthetic RunStartMsg and call the existing handler
+  const synthetic: RunStartMsg = {
+    version: 1,
+    kind: 'plaintext',
+    from: enc.from,
+    to: enc.to,
+    ts: enc.ts,
+    type: 'run_start',
+    req_id: enc.req_id,
+    agent: payload.agent,
+    ...(payload.workspace_key && { workspace_key: payload.workspace_key }),
+    ...(payload.repo_url && { repo_url: payload.repo_url }),
+    ...(payload.branch && { branch: payload.branch }),
+    ...(payload.prompt_content !== undefined && { prompt_content: payload.prompt_content }),
+    ...(payload.permission_mode && { permission_mode: payload.permission_mode }),
+    ...(payload.metadata && { metadata: payload.metadata }),
+  }
+
+  return handleRunStart(ws, nodeId, config, synthetic)
+}
+
+/**
  * Poll the run's JSONL event log and forward each new event to the relay as run_event.
  * Mirrors the `streamEvents` polling approach from events.ts.
  * Resolves after a terminal event or a 2-minute safety timeout.
@@ -198,6 +258,7 @@ export async function relayNodeDaemon(
     workspace_roots: [config.workspace_root],
     created_at: t(),
     updated_at: t(),
+    ...(identity && { encryption_public_key: identity.encryption.public_key }),
   }
 
   process.stderr.write(`[vibe-node] connecting to relay: ${relay}\n`)
@@ -232,12 +293,25 @@ export async function relayNodeDaemon(
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as RelayMessage
+        const rawKind = (msg as { kind?: string }).kind
+
         if (msg.type === 'node_register_ack') {
           process.stderr.write(`[vibe-node] registered ✓ node_id=${msg.node_id}\n`)
           process.stderr.write(`[vibe-node] heartbeat every ${heartbeatMs}ms — Ctrl-C to stop\n`)
-        } else if (msg.type === 'run_start') {
-          const reqId = msg.req_id
-          handleRunStart(ws, nodeId, config, msg).catch((err: Error) => {
+        } else if (rawKind === 'encrypted' && (msg as { type?: string }).type === 'run_start') {
+          const enc = msg as EncryptedRunStartMsg
+          const reqId = enc.req_id
+          handleEncryptedRunStart(ws, nodeId, config, identity, enc).catch((err: Error) => {
+            process.stderr.write(`[vibe-node] encrypted run_start error: ${err.message}\n`)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+              type: 'run_start_ack', req_id: reqId, ok: false,
+              error: err.message, code: 'internal_error',
+            })
+          })
+        } else if (msg.type === 'run_start' && (msg as { kind?: string }).kind === 'plaintext') {
+          const reqId = (msg as RunStartMsg).req_id
+          handleRunStart(ws, nodeId, config, msg as RunStartMsg).catch((err: Error) => {
             process.stderr.write(`[vibe-node] run_start error: ${err.message}\n`)
             sendMsg(ws, {
               version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
@@ -378,6 +452,8 @@ export interface RemoteRunStartOpts {
   promptFile?: string     // controller-local path; content is read here and sent as prompt_content
   permissionMode?: PermissionMode
   metadata?: Record<string, unknown>
+  /** When set, encrypt the run_start payload for the target node. */
+  encryptionPublicKey?: string  // target node's X25519 encryption_public_key (base64)
 }
 
 /** One-shot: connect to relay, send run_start to a remote node, return RunRecord (status: queued). */
@@ -412,18 +488,47 @@ export async function remoteRunStart(
         try { promptContent = fs.readFileSync(opts.promptFile, 'utf8') } catch {}
       }
 
-      sendMsg(ws, {
-        version: 1, kind: 'plaintext', from: 'cli', to: nodeId, ts: t(),
-        type: 'run_start',
-        req_id: reqId,
-        agent: opts.agent,
-        ...(opts.workspaceKey && { workspace_key: opts.workspaceKey }),
-        ...(opts.repoUrl && { repo_url: opts.repoUrl }),
-        ...(opts.branch && { branch: opts.branch }),
-        ...(promptContent !== undefined && { prompt_content: promptContent }),
-        ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
-        ...(opts.metadata && { metadata: opts.metadata }),
-      })
+      if (opts.encryptionPublicKey) {
+        // MVP 4B: encrypt the sensitive payload; relay only sees routing metadata.
+        const payload = {
+          agent: opts.agent,
+          ...(opts.workspaceKey && { workspace_key: opts.workspaceKey }),
+          ...(opts.repoUrl && { repo_url: opts.repoUrl }),
+          ...(opts.branch && { branch: opts.branch }),
+          ...(promptContent !== undefined && { prompt_content: promptContent }),
+          ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
+          ...(opts.metadata && { metadata: opts.metadata }),
+        }
+        const enc = encryptPayload(opts.encryptionPublicKey, payload)
+        // TODO(4E): sign outer envelope with controller identity once client identity is implemented.
+        // Payload integrity is guaranteed by AES-256-GCM auth tag; outer fields are currently unsigned.
+        ws.send(JSON.stringify({
+          version: 1,
+          kind: 'encrypted',
+          from: 'cli',
+          to: nodeId,
+          ts: t(),
+          req_id: reqId,
+          type: 'run_start',
+          key_id: nodeId,
+          ephemeral_public_key: enc.ephemeralPublicKey,
+          nonce: enc.nonce,
+          ciphertext: enc.ciphertext,
+        } satisfies EncryptedRunStartMsg))
+      } else {
+        sendMsg(ws, {
+          version: 1, kind: 'plaintext', from: 'cli', to: nodeId, ts: t(),
+          type: 'run_start',
+          req_id: reqId,
+          agent: opts.agent,
+          ...(opts.workspaceKey && { workspace_key: opts.workspaceKey }),
+          ...(opts.repoUrl && { repo_url: opts.repoUrl }),
+          ...(opts.branch && { branch: opts.branch }),
+          ...(promptContent !== undefined && { prompt_content: promptContent }),
+          ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
+          ...(opts.metadata && { metadata: opts.metadata }),
+        })
+      }
     })
 
     ws.on('message', (raw) => {

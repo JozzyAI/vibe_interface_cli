@@ -1,12 +1,11 @@
 /**
- * Relay wire protocol — plaintext dev mode.
+ * Relay wire protocol.
  *
- * All messages share the same base envelope shape (version/kind/from/to/ts)
- * so they're structurally compatible with VibeEnvelope plaintext for future
- * unification. The `type` field is the discriminator.
+ * MVP 4A: optional Ed25519 signature on plaintext envelopes.
+ * MVP 4B: kind='encrypted' for run_start payload encryption (X25519 + AES-256-GCM).
  *
- * MVP 4A adds optional `signature` to the base envelope (Ed25519 signed plaintext).
- * MVP 4B will add kind: 'encrypted' for payload encryption (X25519).
+ * Relay can see routing metadata on encrypted envelopes (from/to/req_id/type)
+ * but cannot read the ciphertext payload.
  */
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { PublicIdentity } from '../identity.js'
@@ -25,7 +24,38 @@ export interface RelayMsgBase {
   from: string      // node_id | 'cli' | 'relay'
   to: string        // node_id | 'cli' | 'relay' | '*'
   ts: string
-  signature?: EnvelopeSignature  // MVP 4A: optional; required in --require-pairing mode
+  signature?: EnvelopeSignature  // optional; required in --require-pairing mode
+}
+
+// ── MVP 4B: encrypted run_start ─────────────────────────────────────────────
+//
+// Relay sees: version/kind/from/to/ts/req_id/type/key_id/ephemeral_public_key/nonce/ciphertext
+// Relay cannot see: prompt_content/workspace_key/agent/metadata/permission_mode/repo_url/branch
+
+export interface EncryptedRunStartMsg {
+  version: 1
+  kind: 'encrypted'
+  from: string           // cli node_id or 'cli'
+  to: string             // target node_id
+  ts: string
+  req_id: string         // correlation id — relay routes run_start_ack back to requester
+  type: 'run_start'
+  key_id: string         // target node_id (identifies which key to decrypt with)
+  ephemeral_public_key: string  // base64 ephemeral X25519 SPKI DER
+  nonce: string          // base64 12-byte AES-GCM nonce
+  ciphertext: string     // base64 AES-256-GCM(plaintext_payload ‖ auth_tag)
+  signature?: EnvelopeSignature  // optional Ed25519 sig over canonical outer envelope
+}
+
+// Decrypted inner payload (not sent over wire; reconstructed from ciphertext on node)
+export interface RunStartPayload {
+  workspace_key?: string
+  agent: AgentBackend
+  permission_mode?: PermissionMode
+  prompt_content?: string
+  metadata?: Record<string, unknown>
+  repo_url?: string
+  branch?: string
 }
 
 // ── node → relay: pairing (MVP 4A) ────────────────────────────────────────
@@ -149,6 +179,7 @@ export interface RelayErrorMsg extends RelayMsgBase {
 }
 
 export type RelayMessage =
+  | EncryptedRunStartMsg
   | NodePairRequestMsg
   | NodePairAckMsg
   | NodeRegisterMsg

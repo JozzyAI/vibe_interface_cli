@@ -17,7 +17,7 @@
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
-import type { RelayMessage, PublicIdentity } from './types.js'
+import type { RelayMessage, EncryptedRunStartMsg, PublicIdentity } from './types.js'
 import { verifyEnvelope } from '../crypto.js'
 
 interface NodeEntry {
@@ -114,6 +114,26 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
       ws.on('message', (raw) => {
         let msg: RelayMessage
         try { msg = JSON.parse(raw.toString()) as RelayMessage } catch { return }
+
+        // MVP 4B: route encrypted run_start envelopes without reading the payload.
+        if ((msg as { kind?: string }).kind === 'encrypted') {
+          const enc = msg as EncryptedRunStartMsg
+          if (enc.type === 'run_start') {
+            pendingReqs.set(enc.req_id, ws)
+            const target = registry.get(enc.to)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: enc.from, ts: now(),
+                type: 'run_start_ack', req_id: enc.req_id, ok: false,
+                error: `Node not found: ${enc.to}`, code: 'node_not_found',
+              })
+              pendingReqs.delete(enc.req_id)
+            } else {
+              sendMsg(target.ws, msg)
+            }
+          }
+          return
+        }
 
         switch (msg.type) {
           case 'node_pair_request': {

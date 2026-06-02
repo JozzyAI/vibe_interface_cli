@@ -20,6 +20,7 @@ export function registerRunCommand(program: Command): void {
     .option('--node <id>', 'node to run on: auto | local | <node_id> (default: auto)')
     .option('--relay <url>', 'relay WebSocket URL (required for remote nodes)')
     .option('--token <token>', 'auth token for relay')
+    .option('--encrypt', 'encrypt the run_start payload for the target node (requires node to have identity)')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
       const nodeSelector: string = opts.node ?? 'auto'
@@ -31,7 +32,20 @@ export function registerRunCommand(program: Command): void {
           process.exit(1)
         }
         try {
-          const { remoteRunStart } = await import('../relay/client.js')
+          const { remoteRunStart, fetchRemoteNodes } = await import('../relay/client.js')
+
+          let encryptionPublicKey: string | undefined
+          if (opts.encrypt) {
+            const nodes = await fetchRemoteNodes(opts.relay as string, opts.token as string)
+            const target = nodes.find(n => n.node_id === nodeSelector)
+            if (!target?.encryption_public_key) {
+              process.stderr.write(`error: --encrypt requires the target node to have an identity (node ${nodeSelector} has no encryption_public_key)\n`)
+              process.stderr.write('       Pair the node first: vibe node pair --relay ... --token ...\n')
+              process.exit(1)
+            }
+            encryptionPublicKey = target.encryption_public_key
+          }
+
           const record = await remoteRunStart(opts.relay as string, opts.token as string, nodeSelector, {
             agent: opts.agent as AgentBackend,
             workspaceKey: opts.workspaceKey,
@@ -39,6 +53,7 @@ export function registerRunCommand(program: Command): void {
             branch: opts.branch,
             promptFile: opts.promptFile,
             permissionMode: opts.permissionMode as PermissionMode | undefined,
+            encryptionPublicKey,
           })
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {

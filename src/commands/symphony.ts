@@ -33,6 +33,7 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--node <id>', 'node to run on: auto | local | <node_id> (default: auto)')
     .option('--relay <url>', 'relay WebSocket URL (required for remote nodes)')
     .option('--token <token>', 'auth token for relay')
+    .option('--encrypt', 'encrypt the run_start payload for the target node (requires node to have identity)')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
       const nodeSelector: string = opts.node ?? 'auto'
@@ -44,7 +45,20 @@ export function registerSymphonyCommand(program: Command): void {
           process.exit(1)
         }
         try {
-          const { remoteRunStart } = await import('../relay/client.js')
+          const { remoteRunStart, fetchRemoteNodes } = await import('../relay/client.js')
+
+          let encryptionPublicKey: string | undefined
+          if (opts.encrypt) {
+            const nodes = await fetchRemoteNodes(opts.relay as string, opts.token as string)
+            const target = nodes.find(n => n.node_id === nodeSelector)
+            if (!target?.encryption_public_key) {
+              process.stderr.write(`error: --encrypt requires the target node to have an identity (node ${nodeSelector} has no encryption_public_key)\n`)
+              process.stderr.write('       Pair the node first: vibe node pair --relay ... --token ...\n')
+              process.exit(1)
+            }
+            encryptionPublicKey = target.encryption_public_key
+          }
+
           const extraMetadata: Record<string, unknown> = { source: 'symphony' }
           if (opts.issueId) extraMetadata.issue_id = opts.issueId
           if (opts.issueTitle) extraMetadata.issue_title = opts.issueTitle
@@ -56,6 +70,7 @@ export function registerSymphonyCommand(program: Command): void {
             promptFile: opts.promptFile,
             permissionMode: opts.permissionMode as PermissionMode | undefined,
             metadata: extraMetadata,
+            encryptionPublicKey,
           })
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {

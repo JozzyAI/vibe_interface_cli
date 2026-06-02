@@ -437,7 +437,7 @@ test('relay: run_start routed to node, mock node returns run_start_ack', async (
             session_id: '',
             node_id: 'mock-daemon',
             node_selector: 'mock-daemon',
-            agent: msg.agent,
+            agent: (msg as import('../src/relay/types.js').RunStartMsg).agent,
             status: 'queued',
             workspace_path: '/tmp/test-ws',
             created_at: now(),
@@ -963,7 +963,7 @@ test('relay: prompt_content transmitted over relay (not controller file path)', 
             type: 'run_start_ack', req_id: msg.req_id, ok: true,
             record: {
               run_id: 'run_prompt_test', session_id: '0', node_id: 'prompt-inspect-node',
-              node_selector: 'prompt-inspect-node', agent: msg.agent, status: 'running',
+              node_selector: 'prompt-inspect-node', agent: (msg as import('../src/relay/types.js').RunStartMsg).agent, status: 'running',
               workspace_path: '/tmp', created_at: now(), updated_at: now(),
             },
           })
@@ -1007,7 +1007,7 @@ test('relay: permission_mode unsafe-skip preserved in relay message', async () =
             type: 'run_start_ack', req_id: msg.req_id, ok: true,
             record: {
               run_id: 'run_perm_test', session_id: '0', node_id: 'perm-inspect-node',
-              agent: msg.agent, status: 'running',
+              agent: (msg as import('../src/relay/types.js').RunStartMsg).agent, status: 'running',
               workspace_path: '/tmp', created_at: now(), updated_at: now(),
             },
           })

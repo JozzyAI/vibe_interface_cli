@@ -281,7 +281,7 @@ If the daemon process exits ungracefully the registry entry remains until the WS
 
 ```bash
 npm run build          # clean build to dist/
-npm test               # build + run 97 tests
+npm test               # build + run 106 tests
 npm run dev            # watch mode
 ```
 
@@ -425,8 +425,11 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 - **Signed plaintext (MVP 4A)**: Messages carry an optional `signature` field (Ed25519). In
   `--require-pairing` mode, the relay verifies signatures against stored public identities.
   Payloads are still plaintext — signing proves origin, not confidentiality.
-- **E2E encryption (MVP 4B+)**: X25519 keys are generated and stored alongside Ed25519 keys, but
-  not yet used. Session key agreement and payload encryption come in MVP 4B.
+- **Encrypted run_start (MVP 4B)**: `--encrypt` on `vibe run start` / `vibe symphony start` encrypts
+  the sensitive payload (prompt, workspace_key, agent, metadata, permission_mode, repo_url, branch)
+  using ephemeral X25519 + AES-256-GCM. The relay sees only routing metadata — it cannot read the
+  payload. `run_event` stream is still plaintext (MVP 4C will cover it).
+- **E2E encryption (MVP 4C+)**: `run_event` stream and stop/approval encryption come next.
 - **Prompt content over relay**: The controller reads the prompt file and sends text in the
   `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
   filesystem paths are never sent over the wire.
@@ -449,6 +452,6 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 | 3E | Claude Code backend over relay | ✅ done |
 | 3F | Symphony relay dispatch + ExternalExecutor relay pass-through | ✅ done |
 | 4A | Identity + pairing + signed plaintext envelope | ✅ done |
-| 4B | Encrypt `run_start` payload (X25519 session key) | planned |
+| 4B | Encrypt `run_start` payload (X25519 + AES-256-GCM, relay-blind) | ✅ done |
 | 4C | Encrypt `run_event` stream | planned |
 | 4D | Encrypt stop/approval | planned |
