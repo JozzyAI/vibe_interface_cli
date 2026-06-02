@@ -17,7 +17,7 @@
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
-import type { RelayMessage, EncryptedRunStartMsg, PublicIdentity } from './types.js'
+import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, PublicIdentity } from './types.js'
 import { verifyEnvelope } from '../crypto.js'
 
 interface NodeEntry {
@@ -115,10 +115,11 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         let msg: RelayMessage
         try { msg = JSON.parse(raw.toString()) as RelayMessage } catch { return }
 
-        // MVP 4B: route encrypted run_start envelopes without reading the payload.
+        // MVP 4B/4C: route encrypted envelopes without reading the payload.
         if ((msg as { kind?: string }).kind === 'encrypted') {
-          const enc = msg as EncryptedRunStartMsg
-          if (enc.type === 'run_start') {
+          const encType = (msg as { type?: string }).type
+          if (encType === 'run_start') {
+            const enc = msg as EncryptedRunStartMsg
             pendingReqs.set(enc.req_id, ws)
             const target = registry.get(enc.to)
             if (!target) {
@@ -130,6 +131,13 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
               pendingReqs.delete(enc.req_id)
             } else {
               sendMsg(target.ws, msg)
+            }
+          } else if (encType === 'encrypted_run_event') {
+            // MVP 4C: fan out encrypted event to all run subscribers — relay never decrypts.
+            const enc = msg as EncryptedRunEventMsg
+            const subs = subscribers.get(enc.run_id)
+            if (subs) {
+              for (const sub of subs) sendMsg(sub, msg)
             }
           }
           return

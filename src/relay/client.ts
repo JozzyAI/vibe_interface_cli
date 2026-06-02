@@ -14,9 +14,9 @@ import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
-import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, RunStartPayload } from './types.js'
+import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, RunStartPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
-import { signEnvelope, encryptPayload, decryptPayload, type EnvelopeSignature } from '../crypto.js'
+import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -63,7 +63,7 @@ function sendSigned(ws: WebSocket, msg: RelayMessage, identity: IdentityFile): v
 
 function t(): string { return new Date().toISOString() }
 
-async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg): Promise<void> {
+async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg, eventAesKey?: string): Promise<void> {
   if (msg.agent !== 'mock' && msg.agent !== 'claude-code') {
     sendMsg(ws, {
       version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
@@ -115,8 +115,8 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     type: 'run_start_ack', req_id: msg.req_id, ok: true, record: runningRecord,
   })
 
-  // Tail the event log and forward each event to relay as run_event (background).
-  tailRunEvents(ws, nodeId, runId).catch((err) => {
+  // Tail the event log and forward each event to relay (encrypted if eventAesKey is set).
+  tailRunEvents(ws, nodeId, runId, eventAesKey).catch((err) => {
     process.stderr.write(`[vibe-node] event tail error for ${runId}: ${err.message}\n`)
   })
 }
@@ -160,6 +160,10 @@ async function handleEncryptedRunStart(
     return
   }
 
+  // Derive the per-run event key: ECDH(node_enc_priv, cli_ephemeral_pub) + HKDF('vibe-run-event-v1').
+  // This is the symmetric key the node will use to encrypt run_event payloads (MVP 4C).
+  const eventAesKey = deriveRunEventKey(identity.encryption.private_key, enc.ephemeral_public_key)
+
   // Reconstruct a synthetic RunStartMsg and call the existing handler
   const synthetic: RunStartMsg = {
     version: 1,
@@ -178,15 +182,16 @@ async function handleEncryptedRunStart(
     ...(payload.metadata && { metadata: payload.metadata }),
   }
 
-  return handleRunStart(ws, nodeId, config, synthetic)
+  return handleRunStart(ws, nodeId, config, synthetic, eventAesKey)
 }
 
 /**
- * Poll the run's JSONL event log and forward each new event to the relay as run_event.
- * Mirrors the `streamEvents` polling approach from events.ts.
+ * Poll the run's JSONL event log and forward each new event to the relay.
+ * If eventAesKey is provided (encrypted run), encrypts each event before sending
+ * as encrypted_run_event. Otherwise sends plaintext run_event (backward-compatible).
  * Resolves after a terminal event or a 2-minute safety timeout.
  */
-function tailRunEvents(ws: WebSocket, nodeId: string, runId: string): Promise<void> {
+function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey?: string): Promise<void> {
   const eventsFile = path.join(vibeDir(), 'events', `${runId}.jsonl`)
   let offset = 0
 
@@ -209,10 +214,27 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string): Promise<vo
         for (const line of lines) {
           try {
             const event = JSON.parse(line) as RunEvent
-            sendMsg(ws, {
-              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
-              type: 'run_event', run_id: runId, event,
-            })
+            if (eventAesKey) {
+              // MVP 4C: encrypt event payload — relay sees only routing metadata.
+              const enc = encryptEvent(eventAesKey, event)
+              ws.send(JSON.stringify({
+                version: 1,
+                kind: 'encrypted',
+                from: nodeId,
+                to: 'relay',
+                ts: t(),
+                type: 'encrypted_run_event',
+                run_id: runId,
+                key_id: nodeId,
+                nonce: enc.nonce,
+                ciphertext: enc.ciphertext,
+              } satisfies EncryptedRunEventMsg))
+            } else {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+                type: 'run_event', run_id: runId, event,
+              })
+            }
             if (isTerminal(event)) {
               clearInterval(timer)
               clearTimeout(safetyTimer)
@@ -480,6 +502,9 @@ export async function remoteRunStart(
       done(undefined, new Error('Timeout waiting for run_start_ack from relay'))
     }, 10_000)
 
+    // Captured during open, used to derive event key after ack.
+    let capturedEphemeralPrivKey: string | undefined
+
     ws.on('open', () => {
       // Read prompt file locally — send content, not path, so the remote node
       // doesn't need access to the controller's filesystem.
@@ -500,6 +525,7 @@ export async function remoteRunStart(
           ...(opts.metadata && { metadata: opts.metadata }),
         }
         const enc = encryptPayload(opts.encryptionPublicKey, payload)
+        capturedEphemeralPrivKey = enc.ephemeralPrivateKey
         // TODO(4E): sign outer envelope with controller identity once client identity is implemented.
         // Payload integrity is guaranteed by AES-256-GCM auth tag; outer fields are currently unsigned.
         ws.send(JSON.stringify({
@@ -537,6 +563,12 @@ export async function remoteRunStart(
         if (msg.type === 'run_start_ack' && msg.req_id === reqId) {
           ws.close()
           if (msg.ok && msg.record) {
+            // MVP 4C: derive and store event AES key locally so `vibe run stream` can decrypt.
+            // The key is not included in the returned record (not printed to stdout).
+            if (capturedEphemeralPrivKey && opts.encryptionPublicKey) {
+              const eventAesKey = deriveRunEventKey(capturedEphemeralPrivKey, opts.encryptionPublicKey)
+              writeRun({ ...msg.record, event_aes_key: eventAesKey })
+            }
             done(msg.record)
           } else {
             done(undefined, new Error(`${msg.code ?? 'run_start_failed'}: ${msg.error ?? 'unknown error'}`))
@@ -554,10 +586,18 @@ export async function remoteRunStart(
  * Connect to relay, subscribe to a run's event stream, print each event as JSONL to stdout.
  * Exits when a terminal event is received or the relay closes the connection.
  *
+ * For encrypted runs (started with --encrypt), reads the event AES key from the local
+ * run record (written by remoteRunStart), decrypts each encrypted_run_event, and prints
+ * the same VibeEvent JSONL schema as plaintext runs.
+ *
  * Note: the relay does not buffer past events. Subscribing after some events have already
  * been forwarded will miss those events. Callers should subscribe immediately after run_start.
  */
 export async function remoteStream(relay: string, token: string, runId: string): Promise<void> {
+  // Read event AES key from local run record (set during run_start --encrypt, if applicable).
+  const localRecord = tryReadRun(runId)
+  const eventAesKey = localRecord?.event_aes_key
+
   return new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(relayUrl(relay, token))
 
@@ -572,10 +612,29 @@ export async function remoteStream(relay: string, token: string, runId: string):
       try {
         const msg = JSON.parse(raw.toString()) as RelayMessage
         if (msg.type === 'run_event' && msg.run_id === runId) {
+          // Plaintext event (unencrypted run)
           process.stdout.write(JSON.stringify(msg.event) + '\n')
           if (isTerminal(msg.event)) {
             ws.close()
             resolve()
+          }
+        } else if ((msg as { type?: string }).type === 'encrypted_run_event'
+                   && (msg as { run_id?: string }).run_id === runId) {
+          // MVP 4C: encrypted event — decrypt and print the same VibeEvent schema
+          const enc = msg as EncryptedRunEventMsg
+          if (!eventAesKey) {
+            process.stderr.write('[vibe] received encrypted_run_event but run has no local event key\n')
+            return
+          }
+          try {
+            const event = decryptEvent(eventAesKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }) as RunEvent
+            process.stdout.write(JSON.stringify(event) + '\n')
+            if (isTerminal(event)) {
+              ws.close()
+              resolve()
+            }
+          } catch (err) {
+            process.stderr.write(`[vibe] failed to decrypt event: ${(err as Error).message}\n`)
           }
         } else if (msg.type === 'relay_error') {
           ws.terminate()

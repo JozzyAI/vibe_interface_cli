@@ -1,13 +1,20 @@
 /**
- * MVP 4B — encrypted run_start payload tests.
+ * MVP 4B / 4C — encrypted run_start and run_event stream tests.
  *
- * Key assertions:
+ * 4B key assertions:
  *   - encrypted run_start returns a valid RunRecord ack
- *   - the serialized relay message does NOT contain prompt_content or workspace_key
+ *   - relay wire bytes do NOT contain prompt_content or workspace_key
  *   - wrong private key fails decryption
  *   - tampered ciphertext fails auth tag check
  *   - plaintext run_start still works (backward compat)
- *   - existing 97 tests unaffected
+ *
+ * 4C key assertions:
+ *   - deriveRunEventKey — both sides (CLI, node) derive the same AES key from ECDH
+ *   - encryptEvent / decryptEvent round-trip
+ *   - wrong event key and tampered ciphertext fail cleanly
+ *   - relay wire bytes do NOT contain log message or event content
+ *   - relay fans out encrypted_run_event to multiple subscribers
+ *   - full E2E: daemon encrypts run_event stream; stream caller decrypts; output is VibeEvent JSONL
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -18,9 +25,9 @@ import path from 'path'
 import os from 'os'
 import { fileURLToPath } from 'url'
 import { startRelayServer } from '../src/relay/server.js'
-import { encryptPayload, decryptPayload, generateX25519, generateEd25519, deriveIdFromPublicKey, fingerprint as fp } from '../src/crypto.js'
+import { encryptPayload, decryptPayload, deriveRunEventKey, encryptEvent, decryptEvent, generateX25519, generateEd25519, deriveIdFromPublicKey, fingerprint as fp } from '../src/crypto.js'
 import { createIdentity } from '../src/identity.js'
-import type { RelayMessage, EncryptedRunStartMsg, RunStartMsg, RunStartPayload } from '../src/relay/types.js'
+import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, RunStartMsg, RunStartPayload } from '../src/relay/types.js'
 import type { RunRecord } from '../src/types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -352,6 +359,255 @@ test('relay: node with no identity rejects encrypted run_start', async () => {
   nodeWs.close()
   ctrlWs.close()
   await server.close()
+})
+
+// ── MVP 4C: run_event stream encryption unit tests ────────────────────────
+
+test('encryption: deriveRunEventKey — CLI and node sides compute the same AES key', () => {
+  // CLI side: has ephemeral private key + node enc public key
+  // Node side: has node enc private key + ephemeral public key
+  // Both must arrive at the same 32-byte AES key.
+  const nodeKp = generateX25519()
+  const ephemeralKp = generateX25519()
+
+  const cliKey  = deriveRunEventKey(ephemeralKp.privateKey.toString('base64'), nodeKp.publicKey.toString('base64'))
+  const nodeKey = deriveRunEventKey(nodeKp.privateKey.toString('base64'), ephemeralKp.publicKey.toString('base64'))
+
+  assert.equal(cliKey, nodeKey, 'both sides must derive identical AES key')
+  assert.equal(Buffer.from(cliKey, 'base64').length, 32, 'key must be 32 bytes (AES-256)')
+})
+
+test('encryption: run_start key and run_event key are different (domain separation)', () => {
+  const nodeKp = generateX25519()
+  const ephemeralKp = generateX25519()
+
+  // run_start key is derived via encryptPayload internally; simulate it
+  const enc = encryptPayload(nodeKp.publicKey.toString('base64'), { agent: 'mock' })
+  const eventKey = deriveRunEventKey(enc.ephemeralPrivateKey!, nodeKp.publicKey.toString('base64'))
+
+  // The AES key used to encrypt the payload (run_start) must differ from the event key
+  // We can verify indirectly: decryptPayload uses run_start key; decryptEvent must use event key
+  const eventPayload = { type: 'log', run_id: 'r1', ts: new Date().toISOString(), stream: 'stdout', message: 'hello' }
+  const encEvent = encryptEvent(eventKey, eventPayload)
+
+  // Decrypting the event with the node's side event key should succeed
+  const nodeEventKey = deriveRunEventKey(nodeKp.privateKey.toString('base64'), enc.ephemeralPublicKey)
+  const decrypted = decryptEvent(nodeEventKey, encEvent)
+  assert.deepEqual(decrypted, eventPayload)
+
+  // Trying to decrypt run_start ciphertext with event key should fail (different AES keys)
+  assert.throws(
+    () => decryptEvent(eventKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }),
+    /decryption failure|bad decrypt|Unsupported state|ERR_OSSL/,
+  )
+})
+
+test('encryption: encryptEvent + decryptEvent round-trip', () => {
+  const kp = generateX25519()
+  const key = deriveRunEventKey(kp.privateKey.toString('base64'), kp.publicKey.toString('base64'))
+
+  const event = { type: 'log', run_id: 'run_abc', ts: new Date().toISOString(), stream: 'stdout', message: 'Cloning repository...' }
+  const enc = encryptEvent(key, event)
+
+  assert.ok(enc.nonce, 'should have nonce')
+  assert.ok(enc.ciphertext, 'should have ciphertext')
+  assert.ok(!enc.ciphertext.includes('Cloning'), 'ciphertext must not contain plaintext')
+
+  const decrypted = decryptEvent(key, enc)
+  assert.deepEqual(decrypted, event)
+})
+
+test('encryption: wrong event key fails decryptEvent', () => {
+  const kp1 = generateX25519()
+  const kp2 = generateX25519()
+  const key1 = deriveRunEventKey(kp1.privateKey.toString('base64'), kp1.publicKey.toString('base64'))
+  const key2 = deriveRunEventKey(kp2.privateKey.toString('base64'), kp2.publicKey.toString('base64'))
+
+  const enc = encryptEvent(key1, { type: 'log', run_id: 'x', ts: '', stream: 'stdout', message: 'secret' })
+
+  assert.throws(
+    () => decryptEvent(key2, enc),
+    /decryption failure|bad decrypt|Unsupported state|ERR_OSSL/,
+  )
+})
+
+test('encryption: tampered encrypted_run_event ciphertext fails', () => {
+  const kp = generateX25519()
+  const key = deriveRunEventKey(kp.privateKey.toString('base64'), kp.publicKey.toString('base64'))
+  const enc = encryptEvent(key, { type: 'status', run_id: 'r', ts: '', status: 'completed' })
+
+  const raw = Buffer.from(enc.ciphertext, 'base64')
+  raw[0] ^= 0xff
+  const tampered = { ...enc, ciphertext: raw.toString('base64') }
+
+  assert.throws(
+    () => decryptEvent(key, tampered),
+    /decryption failure|bad decrypt|Unsupported state|ERR_OSSL/,
+  )
+})
+
+// ── MVP 4C: relay protocol tests ──────────────────────────────────────────
+
+test('relay: encrypted_run_event — relay wire bytes do not contain event content', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const url = `ws://localhost:${server.port}?token=${TEST_TOKEN}`
+
+  const nodeKp = generateX25519()
+  const ephemeralKp = generateX25519()
+  const eventKey = deriveRunEventKey(ephemeralKp.privateKey.toString('base64'), nodeKp.publicKey.toString('base64'))
+  const SECRET_MESSAGE = 'TOPSECRET_LOG_LINE_' + Date.now()
+  const runId = `run_event_spy_${Date.now().toString(36)}`
+
+  // "Subscriber" connects and subscribes
+  const subWs = await connect(url)
+  sendWs(subWs, { version: 1, kind: 'plaintext', from: 'sub', to: 'relay', ts: new Date().toISOString(), type: 'run_stream_subscribe', run_id: runId })
+  await waitForMsg(subWs, m => m.type === 'run_stream_subscribe_ack')
+
+  // "Node" sends an encrypted_run_event
+  const nodeWs = await connect(url)
+  const event = { type: 'log', run_id: runId, ts: new Date().toISOString(), stream: 'stdout', message: SECRET_MESSAGE }
+  const enc = encryptEvent(eventKey, event)
+  const encEventMsg: EncryptedRunEventMsg = {
+    version: 1, kind: 'encrypted', from: 'spy-node', to: 'relay', ts: new Date().toISOString(),
+    type: 'encrypted_run_event', run_id: runId, key_id: 'spy-node',
+    nonce: enc.nonce, ciphertext: enc.ciphertext,
+  }
+  nodeWs.send(JSON.stringify(encEventMsg))
+
+  // Subscriber receives the fanned-out message
+  const received = await waitForMsg(subWs, m => (m as { type?: string }).type === 'encrypted_run_event')
+  const receivedRaw = JSON.stringify(received)
+
+  assert.ok(!receivedRaw.includes(SECRET_MESSAGE), 'relay must not include log message in forwarded wire bytes')
+  assert.ok(!receivedRaw.includes('"log"'), 'relay must not expose event type in forwarded wire bytes')
+  assert.ok(receivedRaw.includes('"encrypted_run_event"'), 'forwarded message must have encrypted_run_event type')
+  assert.ok(receivedRaw.includes(runId), 'run_id must remain visible for routing')
+
+  nodeWs.close()
+  subWs.close()
+  await server.close()
+})
+
+test('relay: encrypted_run_event fanout to multiple subscribers', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const url = `ws://localhost:${server.port}?token=${TEST_TOKEN}`
+
+  const kp = generateX25519()
+  const eventKey = deriveRunEventKey(kp.privateKey.toString('base64'), kp.publicKey.toString('base64'))
+  const runId = `run_multi_sub_${Date.now().toString(36)}`
+
+  // Two subscribers
+  const sub1 = await connect(url)
+  const sub2 = await connect(url)
+  sendWs(sub1, { version: 1, kind: 'plaintext', from: 's1', to: 'relay', ts: new Date().toISOString(), type: 'run_stream_subscribe', run_id: runId })
+  sendWs(sub2, { version: 1, kind: 'plaintext', from: 's2', to: 'relay', ts: new Date().toISOString(), type: 'run_stream_subscribe', run_id: runId })
+  await Promise.all([
+    waitForMsg(sub1, m => m.type === 'run_stream_subscribe_ack'),
+    waitForMsg(sub2, m => m.type === 'run_stream_subscribe_ack'),
+  ])
+
+  const nodeWs = await connect(url)
+  const event = { type: 'log', run_id: runId, ts: new Date().toISOString(), stream: 'stdout', message: 'broadcast' }
+  const enc = encryptEvent(eventKey, event)
+  nodeWs.send(JSON.stringify({
+    version: 1, kind: 'encrypted', from: 'multi-node', to: 'relay', ts: new Date().toISOString(),
+    type: 'encrypted_run_event', run_id: runId, key_id: 'multi-node',
+    nonce: enc.nonce, ciphertext: enc.ciphertext,
+  } satisfies EncryptedRunEventMsg))
+
+  // Both subscribers must receive the encrypted event and be able to decrypt it
+  const [msg1, msg2] = await Promise.all([
+    waitForMsg(sub1, m => (m as { type?: string }).type === 'encrypted_run_event'),
+    waitForMsg(sub2, m => (m as { type?: string }).type === 'encrypted_run_event'),
+  ])
+
+  for (const msg of [msg1, msg2]) {
+    const e = msg as EncryptedRunEventMsg
+    const decrypted = decryptEvent(eventKey, { nonce: e.nonce, ciphertext: e.ciphertext })
+    assert.deepEqual(decrypted, event, 'both subscribers should decrypt to the same event')
+  }
+
+  sub1.close(); sub2.close(); nodeWs.close()
+  await server.close()
+})
+
+test('relay: encrypted run_event stream E2E — daemon encrypts events; stream decrypts to VibeEvent JSONL', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const ctrlVibeDir = tmpDir()  // isolated controller-side run records
+
+  const daemonVibeDir = tmpDir()
+  const daemonProc = await spawnDaemon(
+    `ws://localhost:${server.port}`,
+    TEST_TOKEN,
+    'enc-event-node',
+    daemonVibeDir,
+  )
+
+  try {
+    const { fetchRemoteNodes, remoteRunStart, remoteStream } = await import('../src/relay/client.js')
+    const nodes = await fetchRemoteNodes(`ws://localhost:${server.port}`, TEST_TOKEN)
+    const target = nodes.find(n => n.node_id === 'enc-event-node')
+    assert.ok(target?.encryption_public_key, 'daemon must expose encryption_public_key')
+
+    // Start encrypted run (controller side uses ctrlVibeDir for local run record)
+    process.env.VIBE_DIR = ctrlVibeDir
+    const record = await remoteRunStart(
+      `ws://localhost:${server.port}`,
+      TEST_TOKEN,
+      'enc-event-node',
+      {
+        agent: 'mock',
+        workspaceKey: 'enc-event-ws',
+        encryptionPublicKey: target!.encryption_public_key!,
+      },
+    )
+    assert.equal(record.status, 'running')
+
+    // Verify event AES key was stored in controller-side run record
+    const { tryReadRun } = await import('../src/store.js')
+    const saved = tryReadRun(record.run_id)
+    assert.ok(saved?.event_aes_key, 'event_aes_key must be written to local run record after encrypted run_start')
+    assert.equal(Buffer.from(saved!.event_aes_key!, 'base64').length, 32, 'event_aes_key must be 32 bytes')
+
+    // Also verify via raw spy subscriber that relay wire contains encrypted_run_event (not plaintext)
+    const url = `ws://localhost:${server.port}?token=${TEST_TOKEN}`
+    const spyWs = await connect(url)
+    sendWs(spyWs, { version: 1, kind: 'plaintext', from: 'spy', to: 'relay', ts: new Date().toISOString(), type: 'run_stream_subscribe', run_id: record.run_id })
+    await waitForMsg(spyWs, m => m.type === 'run_stream_subscribe_ack')
+
+    const spyMessages: string[] = []
+    spyWs.on('message', (raw) => spyMessages.push(raw.toString()))
+
+    // Stream events through the decrypting client — should complete successfully
+    await remoteStream(`ws://localhost:${server.port}`, TEST_TOKEN, record.run_id)
+
+    spyWs.close()
+
+    // Spy must have seen encrypted_run_event, not plaintext run_event
+    const eventMsgs = spyMessages.filter(m => {
+      try { return (JSON.parse(m) as { type?: string }).type === 'encrypted_run_event' } catch { return false }
+    })
+    assert.ok(eventMsgs.length > 0, 'relay wire must contain encrypted_run_event messages')
+
+    const plainMsgs = spyMessages.filter(m => {
+      try { return (JSON.parse(m) as { type?: string }).type === 'run_event' } catch { return false }
+    })
+    assert.equal(plainMsgs.length, 0, 'relay wire must NOT contain plaintext run_event for encrypted runs')
+
+    // Verify each encrypted event decrypts to valid VibeEvent
+    for (const raw of eventMsgs) {
+      const encEvent = JSON.parse(raw) as EncryptedRunEventMsg
+      const decrypted = decryptEvent(saved!.event_aes_key!, { nonce: encEvent.nonce, ciphertext: encEvent.ciphertext })
+      assert.ok(typeof (decrypted as { type?: unknown }).type === 'string', 'decrypted event must have type field')
+    }
+  } finally {
+    delete process.env.VIBE_DIR
+    daemonProc.kill('SIGTERM')
+    await new Promise(r => daemonProc.on('exit', r))
+    await server.close()
+    fs.rmSync(ctrlVibeDir, { recursive: true, force: true })
+    fs.rmSync(daemonVibeDir, { recursive: true, force: true })
+  }
 })
 
 test('relay: plaintext run_start still works (backward compat)', async () => {

@@ -281,7 +281,7 @@ If the daemon process exits ungracefully the registry entry remains until the WS
 
 ```bash
 npm run build          # clean build to dist/
-npm test               # build + run 106 tests
+npm test               # build + run 114 tests
 npm run dev            # watch mode
 ```
 
@@ -428,8 +428,15 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 - **Encrypted run_start (MVP 4B)**: `--encrypt` on `vibe run start` / `vibe symphony start` encrypts
   the sensitive payload (prompt, workspace_key, agent, metadata, permission_mode, repo_url, branch)
   using ephemeral X25519 + AES-256-GCM. The relay sees only routing metadata — it cannot read the
-  payload. `run_event` stream is still plaintext (MVP 4C will cover it).
-- **E2E encryption (MVP 4C+)**: `run_event` stream and stop/approval encryption come next.
+  payload.
+- **Encrypted run_event stream (MVP 4C)**: When a run is started with `--encrypt`, each `run_event`
+  payload is also encrypted by the node before forwarding. The relay fans out opaque
+  `encrypted_run_event` envelopes. `vibe run stream` decrypts locally and prints the same VibeEvent
+  JSONL schema — output is unchanged from the caller's perspective. Key derivation reuses the ECDH
+  shared secret from `run_start` with a separate HKDF context (`vibe-run-event-v1`). Relay metadata
+  still visible: `run_id`, `node_id`, timestamps, message sizes.
+- **Remaining plaintext surfaces**: `run_stop` request/ack and approval relay (MVP 4D).
+- **E2E encryption (MVP 4D+)**: Stop/approval encryption planned next.
 - **Prompt content over relay**: The controller reads the prompt file and sends text in the
   `run_start` message (`prompt_content`). The worker node writes a local temp file. Controller
   filesystem paths are never sent over the wire.
@@ -453,5 +460,5 @@ vibe node list --remote --relay ws://localhost:7433 --token dev --json
 | 3F | Symphony relay dispatch + ExternalExecutor relay pass-through | ✅ done |
 | 4A | Identity + pairing + signed plaintext envelope | ✅ done |
 | 4B | Encrypt `run_start` payload (X25519 + AES-256-GCM, relay-blind) | ✅ done |
-| 4C | Encrypt `run_event` stream | planned |
+| 4C | Encrypt `run_event` stream (same ECDH key material, domain-separated context) | ✅ done |
 | 4D | Encrypt stop/approval | planned |

@@ -3,9 +3,10 @@
  *
  * MVP 4A: optional Ed25519 signature on plaintext envelopes.
  * MVP 4B: kind='encrypted' for run_start payload encryption (X25519 + AES-256-GCM).
+ * MVP 4C: kind='encrypted' for run_event stream (same key material, 'vibe-run-event-v1' context).
  *
- * Relay can see routing metadata on encrypted envelopes (from/to/req_id/type)
- * but cannot read the ciphertext payload.
+ * Relay can see routing metadata on encrypted envelopes (from/to/run_id/key_id/ts)
+ * but cannot read any ciphertext payload.
  */
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { PublicIdentity } from '../identity.js'
@@ -56,6 +57,27 @@ export interface RunStartPayload {
   metadata?: Record<string, unknown>
   repo_url?: string
   branch?: string
+}
+
+// ── MVP 4C: encrypted run_event stream ─────────────────────────────────────
+//
+// Node encrypts each VibeEvent; relay fans out opaque ciphertext to subscribers.
+// CLI stream decrypts and prints the same VibeEvent JSONL schema as plaintext runs.
+//
+// Relay sees: version/kind/from/to/run_id/key_id/nonce/ciphertext/ts
+// Relay cannot see: event type/message/status/tool_call/etc.
+
+export interface EncryptedRunEventMsg {
+  version: 1
+  kind: 'encrypted'
+  from: string     // node_id that originated the event
+  to: 'relay'
+  ts: string
+  type: 'encrypted_run_event'
+  run_id: string
+  key_id: string   // node_id (identifies which run-level key was used)
+  nonce: string    // base64 12-byte AES-GCM nonce
+  ciphertext: string // base64 AES-256-GCM(VibeEvent JSON ‖ auth_tag(16))
 }
 
 // ── node → relay: pairing (MVP 4A) ────────────────────────────────────────
@@ -180,6 +202,7 @@ export interface RelayErrorMsg extends RelayMsgBase {
 
 export type RelayMessage =
   | EncryptedRunStartMsg
+  | EncryptedRunEventMsg
   | NodePairRequestMsg
   | NodePairAckMsg
   | NodeRegisterMsg

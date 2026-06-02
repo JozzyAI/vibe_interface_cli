@@ -2,7 +2,7 @@
  * Cryptographic helpers for Vibe identity, signed envelopes, and payload encryption.
  *
  * Ed25519 — signing / message authenticity (MVP 4A)
- * X25519  — ECDH key agreement + AES-256-GCM payload encryption (MVP 4B)
+ * X25519  — ECDH key agreement + AES-256-GCM payload encryption (MVP 4B/4C)
  *
  * Both use Node.js built-in `crypto` — no external dependencies.
  */
@@ -107,17 +107,22 @@ export function signEnvelope(
  * Returns base64-encoded fields suitable for the outer wire envelope.
  */
 export interface EncryptedPayload {
-  ephemeralPublicKey: string  // base64 SPKI DER
-  nonce: string               // base64 12 random bytes (GCM nonce)
-  ciphertext: string          // base64 encrypted_data ‖ auth_tag(16)
+  ephemeralPublicKey: string    // base64 SPKI DER
+  ephemeralPrivateKey?: string  // base64 PKCS8 DER — present in encryptPayload output; used to derive event key
+  nonce: string                 // base64 12 random bytes (GCM nonce)
+  ciphertext: string            // base64 encrypted_data ‖ auth_tag(16)
 }
 
-const HKDF_INFO = Buffer.from('vibe-run-start-v1', 'utf8')
+// Separate HKDF contexts for domain separation between run_start and run_event keys.
+const HKDF_INFO       = Buffer.from('vibe-run-start-v1', 'utf8')
+const HKDF_INFO_EVENT = Buffer.from('vibe-run-event-v1', 'utf8')
+
+function deriveAesKeyWith(sharedSecret: Buffer, info: Buffer): Buffer {
+  return Buffer.from(crypto.hkdfSync('sha256', sharedSecret, Buffer.alloc(0), info, 32))
+}
 
 function deriveAesKey(sharedSecret: Buffer): Buffer {
-  return Buffer.from(
-    crypto.hkdfSync('sha256', sharedSecret, Buffer.alloc(0), HKDF_INFO, 32),
-  )
+  return deriveAesKeyWith(sharedSecret, HKDF_INFO)
 }
 
 export function encryptPayload(
@@ -147,9 +152,72 @@ export function encryptPayload(
 
   return {
     ephemeralPublicKey: ephemeral.publicKey.toString('base64'),
+    ephemeralPrivateKey: ephemeral.privateKey.toString('base64'),
     nonce: nonce.toString('base64'),
     ciphertext: Buffer.concat([encrypted, tag]).toString('base64'),
   }
+}
+
+// ── Run-event stream encryption (MVP 4C) ──────────────────────────────────
+
+/**
+ * Derive the per-run AES-256 event key from an ECDH exchange.
+ *
+ * Both sides call this with their own private key and the other party's public key:
+ *   CLI:  deriveRunEventKey(ephemeral_private, node_enc_public)
+ *   Node: deriveRunEventKey(node_enc_private, ephemeral_public_from_run_start)
+ *
+ * ECDH commutativity ensures both sides arrive at the same 32-byte key.
+ * Uses HKDF context 'vibe-run-event-v1' — distinct from the run_start key.
+ *
+ * Returns base64-encoded 32-byte AES-256 key.
+ */
+export function deriveRunEventKey(myPrivKeyBase64: string, theirPubKeyBase64: string): string {
+  const myPrivKey = crypto.createPrivateKey({
+    key: Buffer.from(myPrivKeyBase64, 'base64'),
+    format: 'der',
+    type: 'pkcs8',
+  })
+  const theirPubKey = crypto.createPublicKey({
+    key: Buffer.from(theirPubKeyBase64, 'base64'),
+    format: 'der',
+    type: 'spki',
+  })
+  const sharedSecret = crypto.diffieHellman({ privateKey: myPrivKey, publicKey: theirPubKey })
+  return deriveAesKeyWith(sharedSecret, HKDF_INFO_EVENT).toString('base64')
+}
+
+/** Encrypt a VibeEvent (or any JSON-serialisable value) with a run-level AES-256 key. */
+export function encryptEvent(
+  aesKeyBase64: string,
+  payload: unknown,
+): { nonce: string; ciphertext: string } {
+  const aesKey = Buffer.from(aesKeyBase64, 'base64')
+  const nonce = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, nonce)
+  const plaintext = Buffer.from(JSON.stringify(payload), 'utf8')
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return {
+    nonce: nonce.toString('base64'),
+    ciphertext: Buffer.concat([encrypted, tag]).toString('base64'),
+  }
+}
+
+/** Decrypt an event encrypted with encryptEvent. Throws on auth failure or bad key. */
+export function decryptEvent(
+  aesKeyBase64: string,
+  enc: { nonce: string; ciphertext: string },
+): unknown {
+  const aesKey = Buffer.from(aesKeyBase64, 'base64')
+  const nonce = Buffer.from(enc.nonce, 'base64')
+  const raw = Buffer.from(enc.ciphertext, 'base64')
+  const tag = raw.subarray(raw.length - 16)
+  const ciphertext = raw.subarray(0, raw.length - 16)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, nonce)
+  decipher.setAuthTag(tag)
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+  return JSON.parse(decrypted.toString('utf8'))
 }
 
 /**
