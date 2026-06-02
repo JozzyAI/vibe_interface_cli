@@ -16,7 +16,7 @@ import { fileURLToPath } from 'url'
 import type { RunRecord, VibeNode } from '../src/types.js'
 import type { RelayMessage } from '../src/relay/types.js'
 import { startRelayServer } from '../src/relay/server.js'
-import { remoteRunStart } from '../src/relay/client.js'
+import { remoteRunStart, remoteStream } from '../src/relay/client.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -27,7 +27,7 @@ const TEST_TOKEN = `tok-${Date.now()}`
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /** Async CLI invocation — does NOT block the event loop, so in-process relay stays live. */
-async function vibeAsync(args: string[], env?: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
+async function vibeAsync(args: string[], env?: Record<string, string>, timeoutMs?: number): Promise<{ status: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const proc = spawn(NODE, [CLI, ...args], {
       env: { ...process.env, ...env },
@@ -37,6 +37,9 @@ async function vibeAsync(args: string[], env?: Record<string, string>): Promise<
     proc.stdout!.on('data', (d: Buffer) => { stdout += d.toString() })
     proc.stderr!.on('data', (d: Buffer) => { stderr += d.toString() })
     proc.on('close', (code) => resolve({ status: code ?? 1, stdout, stderr }))
+    if (timeoutMs) {
+      setTimeout(() => { proc.kill('SIGTERM'); resolve({ status: 124, stdout, stderr: stderr + '\n[timeout]' }) }, timeoutMs)
+    }
   })
 }
 
@@ -644,6 +647,162 @@ test('vibe run start --node remote --relay: CLI returns running RunRecord (3D-2B
     assert.equal(record.status, 'running', 'CLI returns running record after daemon spawns runner')
     assert.equal(record.node_id, 'cli-2b-node', 'node_id matches remote node')
     assert.ok(record.session_id, 'session_id set')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+// ── MVP 3D-3A: remote stream fanout ───────────────────────────────────────
+
+test('relay: run_stream_subscribe receives run_stream_subscribe_ack', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    const ws = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    const ackP = waitForMsg(ws, (m) => m.type === 'run_stream_subscribe_ack')
+    send(ws, { version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: now(), type: 'run_stream_subscribe', run_id: 'run_abc' })
+    const ack = await ackP
+    assert.equal((ack as any).run_id, 'run_abc')
+    assert.equal((ack as any).ok, true)
+    ws.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay: run_event fans out to subscriber', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    const runId = 'run_fanout_test'
+
+    // CLI subscriber
+    const cliWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    const eventAckP = waitForMsg(cliWs, (m) => m.type === 'run_stream_subscribe_ack')
+    send(cliWs, { version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: now(), type: 'run_stream_subscribe', run_id: runId })
+    await eventAckP
+
+    // Node ws sends a run_event
+    const nodeWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    const receivedP = waitForMsg(cliWs, (m) => m.type === 'run_event')
+    const fakeEvent = { type: 'log' as const, run_id: runId, session_id: '', stream: 'stdout' as const, message: 'hello', ts: now() }
+    send(nodeWs, { version: 1, kind: 'plaintext', from: 'test-node', to: 'relay', ts: now(), type: 'run_event', run_id: runId, event: fakeEvent })
+
+    const received = await receivedP
+    assert.equal((received as any).run_id, runId)
+    assert.equal((received as any).event.message, 'hello')
+
+    cliWs.terminate()
+    nodeWs.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay: multiple subscribers all receive run_event', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    const runId = 'run_multi_sub'
+
+    // Subscribe two CLI clients
+    const ws1 = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    const ws2 = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    await Promise.all([
+      (async () => {
+        const p = waitForMsg(ws1, (m) => m.type === 'run_stream_subscribe_ack')
+        send(ws1, { version: 1, kind: 'plaintext', from: 'cli1', to: 'relay', ts: now(), type: 'run_stream_subscribe', run_id: runId })
+        await p
+      })(),
+      (async () => {
+        const p = waitForMsg(ws2, (m) => m.type === 'run_stream_subscribe_ack')
+        send(ws2, { version: 1, kind: 'plaintext', from: 'cli2', to: 'relay', ts: now(), type: 'run_stream_subscribe', run_id: runId })
+        await p
+      })(),
+    ])
+
+    // Node sends one event
+    const nodeWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    const recv1P = waitForMsg(ws1, (m) => m.type === 'run_event')
+    const recv2P = waitForMsg(ws2, (m) => m.type === 'run_event')
+    const fakeEvent = { type: 'log' as const, run_id: runId, session_id: '', stream: 'stdout' as const, message: 'broadcast', ts: now() }
+    send(nodeWs, { version: 1, kind: 'plaintext', from: 'test-node', to: 'relay', ts: now(), type: 'run_event', run_id: runId, event: fakeEvent })
+
+    const [r1, r2] = await Promise.all([recv1P, recv2P])
+    assert.equal((r1 as any).event.message, 'broadcast', 'subscriber 1 received event')
+    assert.equal((r2 as any).event.message, 'broadcast', 'subscriber 2 received event')
+
+    ws1.terminate(); ws2.terminate(); nodeWs.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay: remote stream receives all events and resolves after completed', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'stream-daemon')
+
+  try {
+    // Start a remote mock run
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'stream-daemon',
+      { agent: 'mock', workspaceKey: 'relay-stream-test' },
+    )
+    assert.equal(record.status, 'running')
+
+    // Stream events — capture stdout to inspect JSONL lines
+    const lines: string[] = []
+    const origW = process.stdout.write.bind(process.stdout)
+    ;(process.stdout as any).write = (chunk: string | Buffer, ...args: any[]) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString()
+      lines.push(...s.split('\n').filter(Boolean))
+      return origW(chunk, ...args)
+    }
+
+    await remoteStream(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, record.run_id)
+
+    ;(process.stdout as any).write = origW
+
+    // remoteStream resolved → terminal event received
+    assert.ok(lines.length > 0, 'received at least one event')
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(events.some((e: any) => e.type === 'status' && e.status === 'completed'), 'received completed event')
+    assert.ok(events.some((e: any) => e.type === 'log'), 'received log events')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('vibe run stream --relay: CLI outputs JSONL events and exits 0', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'cli-stream-daemon')
+
+  try {
+    // Start remote run, get run_id
+    const startR = await vibeAsync([
+      'run', 'start',
+      '--node', 'cli-stream-daemon',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--workspace-key', 'cli-stream-run',
+    ])
+    assert.equal(startR.status, 0, `run start stderr: ${startR.stderr}`)
+    const record = JSON.parse(startR.stdout.trim()) as RunRecord
+
+    // Stream via CLI (waits until completed event received or 30s timeout)
+    const streamR = await vibeAsync([
+      'run', 'stream', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ], undefined, 30_000)
+    assert.equal(streamR.status, 0, `run stream stderr: ${streamR.stderr}`)
+
+    const lines = streamR.stdout.trim().split('\n').filter(Boolean)
+    assert.ok(lines.length > 0, 'CLI stream output has lines')
+    const events = lines.map((l) => JSON.parse(l))
+    assert.ok(events.some((e: any) => e.type === 'status' && e.status === 'completed'), 'CLI stream output has completed event')
   } finally {
     daemonProc.kill('SIGTERM')
     await new Promise((r) => setTimeout(r, 400))

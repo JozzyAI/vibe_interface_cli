@@ -6,11 +6,12 @@ import os from 'os'
 import fs from 'fs'
 import path from 'path'
 import { WebSocket } from 'ws'
-import { resolveConfig } from '../config.js'
+import { resolveConfig, vibeDir } from '../config.js'
 import { getHeartbeatMs } from '../node-state.js'
 import { generateRunId, updateRun, writeRun } from '../store.js'
 import { mockBackend } from '../backends/mock.js'
-import type { AgentBackend, PermissionMode, RunRecord, VibeNode } from '../types.js'
+import { isTerminal } from '../types.js'
+import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { RelayMessage, RunStartMsg } from './types.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
@@ -90,6 +91,62 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   sendMsg(ws, {
     version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
     type: 'run_start_ack', req_id: msg.req_id, ok: true, record: runningRecord,
+  })
+
+  // Tail the event log and forward each event to relay as run_event (background).
+  tailRunEvents(ws, nodeId, runId).catch((err) => {
+    process.stderr.write(`[vibe-node] event tail error for ${runId}: ${err.message}\n`)
+  })
+}
+
+/**
+ * Poll the run's JSONL event log and forward each new event to the relay as run_event.
+ * Mirrors the `streamEvents` polling approach from events.ts.
+ * Resolves after a terminal event or a 2-minute safety timeout.
+ */
+function tailRunEvents(ws: WebSocket, nodeId: string, runId: string): Promise<void> {
+  const eventsFile = path.join(vibeDir(), 'events', `${runId}.jsonl`)
+  let offset = 0
+
+  return new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setInterval>
+    let safetyTimer: ReturnType<typeof setTimeout>
+
+    const flush = (): boolean => {
+      try {
+        const stat = fs.statSync(eventsFile)
+        if (stat.size <= offset) return false
+
+        const fd = fs.openSync(eventsFile, 'r')
+        const buf = Buffer.alloc(stat.size - offset)
+        fs.readSync(fd, buf, 0, buf.length, offset)
+        fs.closeSync(fd)
+        offset = stat.size
+
+        const lines = buf.toString('utf8').split('\n').filter(Boolean)
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line) as RunEvent
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+              type: 'run_event', run_id: runId, event,
+            })
+            if (isTerminal(event)) {
+              clearInterval(timer)
+              clearTimeout(safetyTimer)
+              resolve()
+              return true
+            }
+          } catch {}
+        }
+      } catch {}
+      return false
+    }
+
+    if (flush()) return
+
+    timer = setInterval(() => { if (flush()) clearInterval(timer) }, 250)
+    safetyTimer = setTimeout(() => { clearInterval(timer); resolve() }, 120_000)
   })
 }
 
@@ -293,5 +350,45 @@ export async function remoteRunStart(
 
     ws.on('close', () => done(undefined, new Error('Relay connection closed before run_start_ack')))
     ws.on('error', (err) => done(undefined, err))
+  })
+}
+
+/**
+ * Connect to relay, subscribe to a run's event stream, print each event as JSONL to stdout.
+ * Exits when a terminal event is received or the relay closes the connection.
+ *
+ * Note: the relay does not buffer past events. Subscribing after some events have already
+ * been forwarded will miss those events. Callers should subscribe immediately after run_start.
+ */
+export async function remoteStream(relay: string, token: string, runId: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+
+    ws.on('open', () => {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
+        type: 'run_stream_subscribe', run_id: runId,
+      })
+    })
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_event' && msg.run_id === runId) {
+          process.stdout.write(JSON.stringify(msg.event) + '\n')
+          if (isTerminal(msg.event)) {
+            ws.close()
+            resolve()
+          }
+        } else if (msg.type === 'relay_error') {
+          ws.terminate()
+          reject(new Error(`${msg.code}: ${msg.message}`))
+        }
+        // run_stream_subscribe_ack is silently accepted — no action needed
+      } catch {}
+    })
+
+    ws.on('close', () => resolve())
+    ws.on('error', (err) => reject(err))
   })
 }

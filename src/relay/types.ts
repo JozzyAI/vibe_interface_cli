@@ -7,7 +7,7 @@
  *
  * MVP 4 will add kind: 'encrypted' without changing this type union.
  */
-import type { AgentBackend, PermissionMode, RunRecord, VibeNode } from '../types.js'
+import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 
 export interface RelayMsgBase {
   version: 1
@@ -31,11 +31,18 @@ export interface NodeHeartbeatMsg extends RelayMsgBase {
   last_heartbeat_at: string
 }
 
-// ── cli → relay → node daemon ──────────────────────────────────────────────
+// ── cli → relay ────────────────────────────────────────────────────────────
 
 export interface NodeListRequestMsg extends RelayMsgBase {
   type: 'node_list_request'
 }
+
+export interface RunStreamSubscribeMsg extends RelayMsgBase {
+  type: 'run_stream_subscribe'
+  run_id: string
+}
+
+// ── cli → relay → node daemon ──────────────────────────────────────────────
 
 export interface RunStartMsg extends RelayMsgBase {
   type: 'run_start'
@@ -47,6 +54,14 @@ export interface RunStartMsg extends RelayMsgBase {
   prompt_file?: string
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
+}
+
+// ── node daemon → relay → cli subscribers ─────────────────────────────────
+
+export interface RunEventMsg extends RelayMsgBase {
+  type: 'run_event'
+  run_id: string
+  event: RunEvent
 }
 
 // ── relay → client ─────────────────────────────────────────────────────────
@@ -76,6 +91,12 @@ export interface RunStartAckMsg extends RelayMsgBase {
   code?: string        // error code when ok=false
 }
 
+export interface RunStreamSubscribeAckMsg extends RelayMsgBase {
+  type: 'run_stream_subscribe_ack'
+  run_id: string
+  ok: boolean
+}
+
 export interface RelayErrorMsg extends RelayMsgBase {
   type: 'relay_error'
   code: string
@@ -86,9 +107,12 @@ export type RelayMessage =
   | NodeRegisterMsg
   | NodeHeartbeatMsg
   | NodeListRequestMsg
+  | RunStreamSubscribeMsg
   | RunStartMsg
+  | RunEventMsg
   | NodeRegisterAckMsg
   | NodeHeartbeatAckMsg
   | NodeListResponseMsg
   | RunStartAckMsg
+  | RunStreamSubscribeAckMsg
   | RelayErrorMsg

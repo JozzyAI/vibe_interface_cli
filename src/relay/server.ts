@@ -4,6 +4,10 @@
  * In-memory node registry backed by WebSocket connections.
  * Token auth via URL query string: ws://localhost:PORT?token=TOKEN
  * No persistence, no E2E encryption (planned for MVP 4).
+ *
+ * Event streaming: relay maintains a subscribers map (run_id → Set<ws>).
+ * run_event messages from node daemons are fanned out to all subscribers.
+ * No event buffering — late subscribers miss past events.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
@@ -47,6 +51,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const allConns = new Set<WebSocket>()
     // req_id → requester ws, for routing run_start_ack back to CLI
     const pendingReqs = new Map<string, WebSocket>()
+    // run_id → set of subscriber ws, for streaming run events to CLI clients
+    const subscribers = new Map<string, Set<WebSocket>>()
     const staleMs = getStaleMs(opts.staleMs)
 
     // Token auth at the HTTP upgrade level — rejected clients never reach the WS layer.
@@ -129,8 +135,27 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             break
           }
 
+          case 'run_stream_subscribe': {
+            const subs = subscribers.get(msg.run_id) ?? new Set<WebSocket>()
+            subs.add(ws)
+            subscribers.set(msg.run_id, subs)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+              type: 'run_stream_subscribe_ack', run_id: msg.run_id, ok: true,
+            })
+            break
+          }
+
+          case 'run_event': {
+            // Fan out to all subscribers for this run.
+            const subs = subscribers.get(msg.run_id)
+            if (subs) {
+              for (const sub of subs) sendMsg(sub, msg)
+            }
+            break
+          }
+
           case 'run_start': {
-            // Store requester ws keyed by req_id so we can route the ack back.
             pendingReqs.set(msg.req_id, ws)
             const target = registry.get(msg.to)
             if (!target) {
@@ -142,13 +167,11 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
               pendingReqs.delete(msg.req_id)
               break
             }
-            // Forward unchanged to the target node.
             sendMsg(target.ws, msg)
             break
           }
 
           case 'run_start_ack': {
-            // Node sent ack back — route to the original requester.
             const requester = pendingReqs.get(msg.req_id)
             if (requester) {
               sendMsg(requester, msg)
@@ -165,6 +188,11 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         // Clean up any in-flight requests from this connection.
         for (const [reqId, reqWs] of pendingReqs) {
           if (reqWs === ws) pendingReqs.delete(reqId)
+        }
+        // Remove from all subscriber sets.
+        for (const [runId, subs] of subscribers) {
+          subs.delete(ws)
+          if (subs.size === 0) subscribers.delete(runId)
         }
       })
     })
