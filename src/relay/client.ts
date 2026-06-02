@@ -8,7 +8,8 @@ import path from 'path'
 import { WebSocket } from 'ws'
 import { resolveConfig } from '../config.js'
 import { getHeartbeatMs } from '../node-state.js'
-import { generateRunId, writeRun } from '../store.js'
+import { generateRunId, updateRun, writeRun } from '../store.js'
+import { mockBackend } from '../backends/mock.js'
 import type { AgentBackend, PermissionMode, RunRecord, VibeNode } from '../types.js'
 import type { RelayMessage, RunStartMsg } from './types.js'
 
@@ -46,13 +47,14 @@ function sendMsg(ws: WebSocket, msg: RelayMessage): void {
 
 function t(): string { return new Date().toISOString() }
 
-function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg): void {
-  const supported: AgentBackend[] = ['mock', 'claude-code']
-  if (!supported.includes(msg.agent)) {
+async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg): Promise<void> {
+  // Only mock is supported for remote execution. claude-code and others require 3D-2C+.
+  if (msg.agent !== 'mock') {
     sendMsg(ws, {
       version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
       type: 'run_start_ack', req_id: msg.req_id, ok: false,
-      error: `Agent not supported: ${msg.agent}`, code: 'agent_not_supported',
+      error: `Remote agent not supported: ${msg.agent}. Only mock is available in relay mode.`,
+      code: 'agent_not_supported',
     })
     return
   }
@@ -81,9 +83,13 @@ function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof
   }
   writeRun(record)
 
+  // Reuse the same local mock backend — spawns _mock-runner as a detached process.
+  const result = await mockBackend.start(record, {})
+  const runningRecord = updateRun(runId, { session_id: result.session_id, status: 'running' })
+
   sendMsg(ws, {
     version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
-    type: 'run_start_ack', req_id: msg.req_id, ok: true, record,
+    type: 'run_start_ack', req_id: msg.req_id, ok: true, record: runningRecord,
   })
 }
 
@@ -145,7 +151,15 @@ export async function relayNodeDaemon(
           process.stderr.write(`[vibe-node] registered ✓ node_id=${msg.node_id}\n`)
           process.stderr.write(`[vibe-node] heartbeat every ${heartbeatMs}ms — Ctrl-C to stop\n`)
         } else if (msg.type === 'run_start') {
-          handleRunStart(ws, nodeId, config, msg)
+          const reqId = msg.req_id
+          handleRunStart(ws, nodeId, config, msg).catch((err: Error) => {
+            process.stderr.write(`[vibe-node] run_start error: ${err.message}\n`)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+              type: 'run_start_ack', req_id: reqId, ok: false,
+              error: err.message, code: 'internal_error',
+            })
+          })
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           ws.close()
