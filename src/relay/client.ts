@@ -1,6 +1,6 @@
 /**
  * Relay client helpers — used by `vibe node daemon --relay` and
- * `vibe node list --remote`.
+ * `vibe node list --remote` and `vibe run start --node <remote>`.
  */
 import os from 'os'
 import fs from 'fs'
@@ -8,8 +8,9 @@ import path from 'path'
 import { WebSocket } from 'ws'
 import { resolveConfig } from '../config.js'
 import { getHeartbeatMs } from '../node-state.js'
-import type { VibeNode } from '../types.js'
-import type { RelayMessage } from './types.js'
+import { generateRunId, writeRun } from '../store.js'
+import type { AgentBackend, PermissionMode, RunRecord, VibeNode } from '../types.js'
+import type { RelayMessage, RunStartMsg } from './types.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -45,7 +46,48 @@ function sendMsg(ws: WebSocket, msg: RelayMessage): void {
 
 function t(): string { return new Date().toISOString() }
 
-/** Connect to relay as a node daemon: register, send heartbeats, exit on signal/close. */
+function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg): void {
+  const supported: AgentBackend[] = ['mock', 'claude-code']
+  if (!supported.includes(msg.agent)) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_start_ack', req_id: msg.req_id, ok: false,
+      error: `Agent not supported: ${msg.agent}`, code: 'agent_not_supported',
+    })
+    return
+  }
+
+  const runId = generateRunId()
+  const workspaceKey = msg.workspace_key ?? runId
+  const workspacePath = path.join(config.workspace_root, workspaceKey)
+  fs.mkdirSync(workspacePath, { recursive: true })
+
+  const now = t()
+  const record: RunRecord = {
+    run_id: runId,
+    session_id: '',
+    node_id: nodeId,
+    node_selector: nodeId,
+    agent: msg.agent,
+    status: 'queued',
+    workspace_path: workspacePath,
+    ...(msg.repo_url && { repo_url: msg.repo_url }),
+    ...(msg.branch && { branch: msg.branch }),
+    ...(msg.prompt_file && { prompt_file: msg.prompt_file }),
+    ...(msg.permission_mode && { permission_mode: msg.permission_mode }),
+    ...(msg.metadata && { metadata: msg.metadata }),
+    created_at: now,
+    updated_at: now,
+  }
+  writeRun(record)
+
+  sendMsg(ws, {
+    version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+    type: 'run_start_ack', req_id: msg.req_id, ok: true, record,
+  })
+}
+
+/** Connect to relay as a node daemon: register, send heartbeats, handle run_start, exit on signal/close. */
 export async function relayNodeDaemon(
   relay: string,
   token: string,
@@ -100,12 +142,14 @@ export async function relayNodeDaemon(
       try {
         const msg = JSON.parse(raw.toString()) as RelayMessage
         if (msg.type === 'node_register_ack') {
-          process.stderr.write(`[vibe-node] registered ✓ node_id=${(msg as any).node_id}\n`)
+          process.stderr.write(`[vibe-node] registered ✓ node_id=${msg.node_id}\n`)
           process.stderr.write(`[vibe-node] heartbeat every ${heartbeatMs}ms — Ctrl-C to stop\n`)
+        } else if (msg.type === 'run_start') {
+          handleRunStart(ws, nodeId, config, msg)
         } else if (msg.type === 'relay_error') {
-          process.stderr.write(`[vibe-node] relay error: ${(msg as any).code} — ${(msg as any).message}\n`)
+          process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           ws.close()
-          done(new Error((msg as any).message))
+          done(new Error(msg.message))
         }
       } catch {}
     })
@@ -157,15 +201,83 @@ export async function fetchRemoteNodes(relay: string, token: string): Promise<Vi
         const msg = JSON.parse(raw.toString()) as RelayMessage
         if (msg.type === 'node_list_response') {
           ws.close()
-          done((msg as any).nodes)
+          done(msg.nodes)
         } else if (msg.type === 'relay_error') {
           ws.terminate()
-          done(undefined, new Error(`${(msg as any).code}: ${(msg as any).message}`))
+          done(undefined, new Error(`${msg.code}: ${msg.message}`))
         }
       } catch {}
     })
 
     ws.on('close', () => done(undefined, new Error('Relay connection closed before response')))
+    ws.on('error', (err) => done(undefined, err))
+  })
+}
+
+export interface RemoteRunStartOpts {
+  agent: AgentBackend
+  workspaceKey?: string
+  repoUrl?: string
+  branch?: string
+  promptFile?: string
+  permissionMode?: PermissionMode
+  metadata?: Record<string, unknown>
+}
+
+/** One-shot: connect to relay, send run_start to a remote node, return RunRecord (status: queued). */
+export async function remoteRunStart(
+  relay: string,
+  token: string,
+  nodeId: string,
+  opts: RemoteRunStartOpts,
+): Promise<RunRecord> {
+  return new Promise<RunRecord>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+
+    let settled = false
+    const done = (record?: RunRecord, err?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      record ? resolve(record) : reject(err!)
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate()
+      done(undefined, new Error('Timeout waiting for run_start_ack from relay'))
+    }, 10_000)
+
+    ws.on('open', () => {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: 'cli', to: nodeId, ts: t(),
+        type: 'run_start',
+        req_id: reqId,
+        agent: opts.agent,
+        ...(opts.workspaceKey && { workspace_key: opts.workspaceKey }),
+        ...(opts.repoUrl && { repo_url: opts.repoUrl }),
+        ...(opts.branch && { branch: opts.branch }),
+        ...(opts.promptFile && { prompt_file: opts.promptFile }),
+        ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
+        ...(opts.metadata && { metadata: opts.metadata }),
+      })
+    })
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_start_ack' && msg.req_id === reqId) {
+          ws.close()
+          if (msg.ok && msg.record) {
+            done(msg.record)
+          } else {
+            done(undefined, new Error(msg.error ?? 'run_start failed (ok=false)'))
+          }
+        }
+      } catch {}
+    })
+
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before run_start_ack')))
     ws.on('error', (err) => done(undefined, err))
   })
 }

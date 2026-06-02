@@ -45,6 +45,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
   return new Promise((resolve, reject) => {
     const registry = new Map<string, NodeEntry>()
     const allConns = new Set<WebSocket>()
+    // req_id → requester ws, for routing run_start_ack back to CLI
+    const pendingReqs = new Map<string, WebSocket>()
     const staleMs = getStaleMs(opts.staleMs)
 
     // Token auth at the HTTP upgrade level — rejected clients never reach the WS layer.
@@ -79,10 +81,7 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     })
 
     wss.on('connection', (ws: WebSocket) => {
-      // All connections here are authenticated (verifyClient already checked).
       allConns.add(ws)
-      ws.on('close', () => allConns.delete(ws))
-
       let nodeId: string | null = null
 
       ws.on('message', (raw) => {
@@ -129,11 +128,44 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             })
             break
           }
+
+          case 'run_start': {
+            // Store requester ws keyed by req_id so we can route the ack back.
+            pendingReqs.set(msg.req_id, ws)
+            const target = registry.get(msg.to)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'run_start_ack', req_id: msg.req_id, ok: false,
+                error: `Node not found: ${msg.to}`, code: 'node_not_found',
+              })
+              pendingReqs.delete(msg.req_id)
+              break
+            }
+            // Forward unchanged to the target node.
+            sendMsg(target.ws, msg)
+            break
+          }
+
+          case 'run_start_ack': {
+            // Node sent ack back — route to the original requester.
+            const requester = pendingReqs.get(msg.req_id)
+            if (requester) {
+              sendMsg(requester, msg)
+              pendingReqs.delete(msg.req_id)
+            }
+            break
+          }
         }
       })
 
       ws.on('close', () => {
+        allConns.delete(ws)
         if (nodeId) registry.delete(nodeId)
+        // Clean up any in-flight requests from this connection.
+        for (const [reqId, reqWs] of pendingReqs) {
+          if (reqWs === ws) pendingReqs.delete(reqId)
+        }
       })
     })
   })

@@ -11,9 +11,10 @@ import { spawn, spawnSync } from 'child_process'
 import { WebSocket } from 'ws'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import type { VibeNode } from '../src/types.js'
+import type { RunRecord, VibeNode } from '../src/types.js'
 import type { RelayMessage } from '../src/relay/types.js'
 import { startRelayServer } from '../src/relay/server.js'
+import { remoteRunStart } from '../src/relay/client.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -406,6 +407,119 @@ test('vibe node daemon --relay: node removed from relay after daemon exits', asy
   } finally {
     if (!daemonProc.killed) daemonProc.kill('SIGTERM')
     await new Promise((r) => setTimeout(r, 200))
+    await server.close()
+  }
+})
+
+// ── MVP 3D-2A: run_start routing (request/ack only — no runner spawned) ──────
+
+test('relay: run_start routed to node, mock node returns run_start_ack', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    // Simulate a daemon: connect, register, handle run_start manually
+    const nodeWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    await registerNode(nodeWs, 'mock-daemon')
+
+    // Set up mock daemon to respond to run_start
+    nodeWs.on('message', (raw: Buffer) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_start') {
+          const fakeRecord: RunRecord = {
+            run_id: `run_test_${Date.now().toString(36)}`,
+            session_id: '',
+            node_id: 'mock-daemon',
+            node_selector: 'mock-daemon',
+            agent: msg.agent,
+            status: 'queued',
+            workspace_path: '/tmp/test-ws',
+            created_at: now(),
+            updated_at: now(),
+          }
+          send(nodeWs, {
+            version: 1, kind: 'plaintext', from: 'mock-daemon', to: 'relay', ts: now(),
+            type: 'run_start_ack', req_id: msg.req_id, ok: true, record: fakeRecord,
+          })
+        }
+      } catch {}
+    })
+
+    // CLI side: use remoteRunStart directly
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'mock-daemon',
+      { agent: 'mock' },
+    )
+    assert.ok(record.run_id.startsWith('run_'), 'run_id has correct prefix')
+    assert.equal(record.status, 'queued', 'status is queued (no runner yet)')
+    assert.equal(record.node_id, 'mock-daemon', 'node_id matches target')
+
+    nodeWs.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
+test('relay: run_start to unknown node returns error', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    await assert.rejects(
+      remoteRunStart(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'no-such-node', { agent: 'mock' }),
+      /Node not found/,
+    )
+  } finally {
+    await server.close()
+  }
+})
+
+test('vibe run start --node remote-node --relay ...: returns queued RunRecord JSON', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = spawn(NODE, [
+    CLI, 'node', 'daemon', '--local',
+    '--relay', `ws://127.0.0.1:${server.port}`,
+    '--token', TEST_TOKEN,
+    '--node-id', 'run-start-node',
+  ], {
+    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250' },
+    stdio: 'pipe',
+  })
+
+  try {
+    // Wait for daemon to register
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300))
+      const r = await vibeAsync([
+        'node', 'list', '--remote',
+        '--relay', `ws://127.0.0.1:${server.port}`,
+        '--token', TEST_TOKEN,
+      ])
+      if (r.status === 0) {
+        try {
+          const nodes = JSON.parse(r.stdout.trim()) as VibeNode[]
+          if (nodes.some((n) => n.node_id === 'run-start-node')) break
+        } catch {}
+      }
+    }
+
+    // Now request a remote run start via CLI
+    const r = await vibeAsync([
+      'run', 'start',
+      '--node', 'run-start-node',
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+      '--agent', 'mock',
+      '--workspace-key', 'relay-test-run',
+    ])
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`)
+
+    const record = JSON.parse(r.stdout.trim()) as RunRecord
+    assert.ok(record.run_id.startsWith('run_'), 'run_id correct format')
+    assert.equal(record.status, 'queued', 'status is queued — no runner spawned yet')
+    assert.equal(record.node_id, 'run-start-node', 'node_id matches remote node')
+    assert.equal(record.agent, 'mock', 'agent echoed back')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
     await server.close()
   }
 })

@@ -18,11 +18,39 @@ export function registerRunCommand(program: Command): void {
     .option('--metadata-file <path>', 'path to JSON metadata file')
     .option('--permission-mode <mode>', 'permission mode: default | unsafe-skip (unsafe-skip enables --dangerously-skip-permissions)')
     .option('--node <id>', 'node to run on: auto | local | <node_id> (default: auto)')
+    .option('--relay <url>', 'relay WebSocket URL (required for remote nodes)')
+    .option('--token <token>', 'auth token for relay')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
+      const nodeSelector: string = opts.node ?? 'auto'
+      const isRemote = opts.relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
+
+      if (isRemote) {
+        if (!opts.token) {
+          process.stderr.write('error: --token is required with --relay for remote nodes\n')
+          process.exit(1)
+        }
+        try {
+          const { remoteRunStart } = await import('../relay/client.js')
+          const record = await remoteRunStart(opts.relay as string, opts.token as string, nodeSelector, {
+            agent: opts.agent as AgentBackend,
+            workspaceKey: opts.workspaceKey,
+            repoUrl: opts.repoUrl,
+            branch: opts.branch,
+            promptFile: opts.promptFile,
+            permissionMode: opts.permissionMode as PermissionMode | undefined,
+          })
+          process.stdout.write(JSON.stringify(record) + '\n')
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        return
+      }
+
       const record = await startRun({
         agent: opts.agent as AgentBackend,
-        node: opts.node as string | undefined,
+        node: nodeSelector,
         workspaceKey: opts.workspaceKey,
         repoUrl: opts.repoUrl,
         branch: opts.branch,
