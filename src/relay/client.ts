@@ -329,8 +329,14 @@ export async function relayNodeDaemon(
         const rawKind = (msg as { kind?: string }).kind
 
         if (msg.type === 'node_register_ack') {
-          process.stderr.write(`[vibe-node] registered ✓ node_id=${msg.node_id}\n`)
-          process.stderr.write(`[vibe-node] heartbeat every ${heartbeatMs}ms — Ctrl-C to stop\n`)
+          const ack = msg as { node_id: string; ok?: boolean; error?: string; code?: string }
+          if (ack.ok === false) {
+            process.stderr.write(`[vibe-node] registration REJECTED node_id=${ack.node_id} error=${ack.error ?? ack.code ?? 'unknown'}\n`)
+            done(new Error(`relay rejected registration: ${ack.error ?? ack.code ?? 'unknown'}`))
+          } else {
+            process.stderr.write(`[vibe-node] registered ✓ node_id=${msg.node_id}\n`)
+            process.stderr.write(`[vibe-node] heartbeat every ${heartbeatMs}ms — Ctrl-C to stop\n`)
+          }
         } else if (rawKind === 'encrypted' && (msg as { type?: string }).type === 'run_start') {
           const enc = msg as EncryptedRunStartMsg
           const reqId = enc.req_id
