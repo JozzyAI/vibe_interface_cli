@@ -37,6 +37,8 @@ export interface RelayServer {
 export interface RelayServerOpts {
   port: number
   token: string
+  /** Bind address. Defaults to '127.0.0.1'. Pass '0.0.0.0' to listen on all interfaces. */
+  host?: string
   /** Override stale threshold (ms). Defaults to VIBE_NODE_STALE_MS env or 15000. */
   staleMs?: number
   /**
@@ -89,7 +91,7 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
       cb(false, 401, 'Unauthorized')
     }
 
-    const wss = new WebSocketServer({ host: '127.0.0.1', port: opts.port, verifyClient } as ConstructorParameters<typeof WebSocketServer>[0])
+    const wss = new WebSocketServer({ host: opts.host ?? '127.0.0.1', port: opts.port, verifyClient } as ConstructorParameters<typeof WebSocketServer>[0])
 
     wss.on('error', reject)
 
