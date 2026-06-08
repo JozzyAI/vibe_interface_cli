@@ -3,6 +3,7 @@ import fs from 'fs'
 import { appendEvent } from './events.js'
 import { readRun, updateRun } from './store.js'
 import { redact } from './redact.js'
+import { cloneIfEmpty } from './workspace.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes
 
@@ -48,6 +49,17 @@ export async function runClaudeRunner(run_id: string): Promise<void> {
       return
     }
     prompt = fs.readFileSync(record.prompt_file, 'utf8').trim()
+  }
+
+  if (record.repo_url) {
+    try {
+      cloneIfEmpty(record.workspace_path, record.repo_url, record.branch)
+    } catch (err) {
+      appendEvent({ type: 'error', run_id, session_id, message: `clone failed: ${(err as Error).message}`, ts: ts() })
+      appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+      updateRun(run_id, { status: 'failed' })
+      return
+    }
   }
 
   const claudeArgs = ['-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence']
