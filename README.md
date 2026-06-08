@@ -302,6 +302,7 @@ Env knobs:
 ~/.vibe/
 ├── config.json
 ├── node-local.json          # NodeDaemonState (written by `vibe node daemon --local`, removed on exit)
+├── telegram-monitor-state.json  # last-seen snapshot for `vibe monitor telegram` (no secrets)
 ├── runs/<run_id>.json       # RunRecord (status, metadata, workspace_path, ...)
 └── events/<run_id>.jsonl    # append-only JSONL event log
 ```
@@ -428,6 +429,87 @@ Smoke tests (from `symphony/elixir/`):
 bash scripts/smoke_vibe_relay.sh            # mock agent — no API key needed
 bash scripts/smoke_vibe_relay_claude.sh     # Claude Code — skips if 'claude' not in PATH
 ```
+
+---
+
+## Telegram monitor (read-only)
+
+`vibe monitor telegram` runs a small bot that reports relay/node/run status to
+a Telegram chat — nothing more. It is purely observational: it cannot approve,
+deny, merge, start/stop runs, edit Linear issues, edit workflow files, or run
+shell commands. There is no code path from a Telegram message to any mutation
+anywhere in Vibe, Symphony, or Linear.
+
+It alerts on:
+- a node coming online / going offline, or being seen for the first time
+- a node's active-run count or agent list changing
+- a local run starting, finishing (completed/failed/stopped), or needing approval
+- the relay becoming unreachable / failing auth, and recovering
+
+…and answers six status-query commands on request: `/status`, `/nodes`, `/runs`,
+`/symphony`, `/linear`, `/help`.
+
+### 1. Create a bot with BotFather
+
+1. Open a chat with [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot`.
+2. Follow the prompts to name it; BotFather replies with a token that looks like
+   `123456789:ABCdefGhIJKlmNoPQRsTUVwxyz`. This is `TELEGRAM_BOT_TOKEN` — keep it secret.
+
+### 2. Find your TELEGRAM_CHAT_ID
+
+Send any message to your new bot, then call `getUpdates` with your token:
+```bash
+curl -s "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates" | grep -o '"chat":{"id":[0-9-]*'
+```
+The number after `"id":` is your `TELEGRAM_CHAT_ID` (negative for group chats).
+
+### 3. Configure environment variables
+
+| variable | required | purpose |
+|---|---|---|
+| `VIBE_RELAY_URL` | yes | relay WebSocket URL to poll for node status |
+| `VIBE_RELAY_TOKEN` | yes | relay auth token |
+| `TELEGRAM_BOT_TOKEN` | yes | bot token from BotFather |
+| `TELEGRAM_CHAT_ID` | yes | chat to post alerts to and accept commands from |
+| `SYMPHONY_WORKDIR` | no | enables `/symphony` — local tmux/log/WORKFLOW.md status |
+| `LINEAR_API_KEY` | no | enables `/linear` — issue counts and Human Review/Merging summaries |
+
+### 4. Run it
+
+```bash
+export VIBE_RELAY_URL=ws://localhost:7433
+export VIBE_RELAY_TOKEN=dev
+export TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyz
+export TELEGRAM_CHAT_ID=123456789
+
+vibe monitor telegram                  # polls + answers commands every 60s
+vibe monitor telegram --poll-interval 30
+```
+
+**Locally / in tmux** — it's a long-running foreground process, so run it the
+same way you'd run `vibe relay dev` or `vibe node daemon`:
+```bash
+tmux new -s vibe-monitor 'vibe monitor telegram'
+```
+
+**As a systemd unit** — set the env vars in the unit's `Environment=`/`EnvironmentFile=`
+(not in the command line, where they'd be visible via `ps`), and let systemd
+restart it on failure:
+```ini
+[Service]
+EnvironmentFile=/etc/vibe-monitor.env
+ExecStart=/usr/bin/vibe monitor telegram
+Restart=on-failure
+```
+
+### Notes
+
+- State (the last-seen snapshot used to detect changes) is stored at
+  `~/.vibe/telegram-monitor-state.json` — node/run summaries and timestamps
+  only, never secrets.
+- All four secrets (`VIBE_RELAY_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
+  `LINEAR_API_KEY`) are redacted from every error message and log line before
+  it can be written or sent anywhere.
 
 ---
 
