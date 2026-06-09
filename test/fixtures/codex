@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+// Fake codex CLI for contract tests.
+// FAKE_CODEX_EXIT_CODE — exit code to use (default 0)
+// FAKE_CODEX_HANG     — if set, hang after init (for stop tests)
+
+const exitCode = parseInt(process.env.FAKE_CODEX_EXIT_CODE ?? '0', 10)
+const hang = !!process.env.FAKE_CODEX_HANG
+
+let prompt = ''
+process.stdin.on('data', (d) => { prompt += d })
+process.stdin.on('end', () => {
+  if (hang) {
+    setInterval(() => {}, 60000)
+    return
+  }
+
+  setTimeout(() => {
+    if (exitCode === 0) {
+      process.stdout.write(`Completed task: ${prompt.substring(0, 80).trim()}\n`)
+    } else {
+      process.stderr.write('codex: task failed\n')
+    }
+    process.exit(exitCode)
+  }, 100)
+})

@@ -1,5 +1,6 @@
 import { resolveConfig } from './config.js'
 import { readDaemonState, daemonStateToNode } from './node-state.js'
+import { resolveAgents } from './agent-registry.js'
 import type { VibeNode, VibeError } from './types.js'
 
 function getBuiltinLocalNode(): VibeNode {
@@ -11,7 +12,7 @@ function getBuiltinLocalNode(): VibeNode {
     status: 'online',
     transport: 'local',
     capabilities: ['run', 'stream', 'stop', 'workspace'],
-    agents: ['mock', 'claude-code'],
+    agents: resolveAgents(),
     active_runs: 0,
     max_runs: 4,
     workspace_roots: [config.workspace_root],

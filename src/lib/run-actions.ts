@@ -9,6 +9,7 @@ import { appendEvent } from '../events.js'
 import { resolveWorkspacePath, ensureWorkspace, cloneIfEmpty } from '../workspace.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
+import { codexBackend } from '../backends/codex.js'
 import { resolveNode } from '../nodes.js'
 import type { AgentBackend, PermissionMode, RunRecord } from '../types.js'
 import type { Backend } from '../backends/types.js'
@@ -30,6 +31,7 @@ function getBackend(agent: AgentBackend): Backend {
   switch (agent) {
     case 'mock': return mockBackend
     case 'claude-code': return claudeCodeBackend
+    case 'codex': return codexBackend
     default:
       process.stderr.write(`error: unknown agent backend "${agent}"\n`)
       process.exit(1)

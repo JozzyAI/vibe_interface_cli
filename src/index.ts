@@ -8,6 +8,7 @@ import { registerApprovalCommand } from './commands/approval.js'
 import { registerMonitorCommand } from './commands/monitor.js'
 import { runMockRunner } from './mock-runner.js'
 import { runClaudeRunner } from './claude-runner.js'
+import { runCodexRunner } from './codex-runner.js'
 
 const program = new Command()
 program.name('vibe').description('Vibe Interface CLI — universal worker-node runtime').version('0.1.0')
@@ -25,6 +26,15 @@ program
   .command('_claude-runner <run_id>', { hidden: true })
   .action((run_id: string) => {
     runClaudeRunner(run_id).catch((err) => {
+      process.stderr.write(String(err) + '\n')
+      process.exit(1)
+    })
+  })
+
+program
+  .command('_codex-runner <run_id>', { hidden: true })
+  .action((run_id: string) => {
+    runCodexRunner(run_id).catch((err) => {
       process.stderr.write(String(err) + '\n')
       process.exit(1)
     })

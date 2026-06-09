@@ -113,6 +113,58 @@ external:
 |---|---|
 | `mock` | Internal fake runner. Emits synthetic events including `approval_required`. No network. |
 | `claude-code` | Spawns `claude` CLI in stream-json mode. Requires Claude Code installed. |
+| `codex` | Spawns `codex exec` non-interactively. Requires OpenAI Codex CLI + `VIBE_ENABLE_CODEX=1`. |
+
+### Codex CLI setup
+
+**Install:**
+
+```bash
+npm install -g @openai/codex
+which codex
+codex --help
+codex exec --help
+```
+
+**Authenticate** (run once interactively before Vibe uses it):
+
+```bash
+codex   # follow the auth flow, then exit
+```
+
+**Start node with Codex enabled:**
+
+```bash
+VIBE_ENABLE_CODEX=1 vibe node daemon \
+  --local \
+  --relay "$VIBE_RELAY_URL" \
+  --token "$VIBE_RELAY_TOKEN"
+```
+
+Codex is only advertised when `VIBE_ENABLE_CODEX=1` **and** `codex` is found in `PATH`. If the
+binary is missing, a warning is emitted to stderr and the node continues without advertising
+the `codex` agent.
+
+**Run a task with Codex:**
+
+```bash
+vibe run start --agent codex --workspace-key demo --prompt-file task.txt
+```
+
+**Symphony / Linear usage:**
+
+Add the label `agent:codex` to a Linear issue. Symphony will dispatch to a node that advertises
+the `codex` agent. The node binding must allow `codex` in its agent list.
+
+**Permission mode:**
+
+By default Codex runs with its own sandbox (`workspace-write`). Use `--permission-mode unsafe-skip`
+to pass `--dangerously-bypass-approvals-and-sandbox` to `codex exec` — same semantics as
+`claude-code` unsafe-skip:
+
+```bash
+vibe run start --agent codex --permission-mode unsafe-skip --prompt-file task.txt
+```
 
 ## ⚠️ Safety: claude-code and `--dangerously-skip-permissions`
 

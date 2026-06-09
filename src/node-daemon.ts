@@ -17,6 +17,7 @@ import {
   writeDaemonState,
   removeDaemonState,
 } from './node-state.js'
+import { resolveAgents } from './agent-registry.js'
 import type { NodeDaemonState } from './types.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
@@ -66,7 +67,7 @@ async function runFileModeDaemon(nodeIdOverride?: string): Promise<void> {
     status: 'online',
     transport: 'local',
     capabilities: ['run', 'stream', 'stop', 'workspace'],
-    agents: ['mock', 'claude-code'],
+    agents: resolveAgents(),
     active_runs: countActiveRuns(),
     max_runs: 4,
     workspace_roots: [config.workspace_root],
