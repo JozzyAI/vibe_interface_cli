@@ -34,7 +34,7 @@ export interface RelayPollResult {
  * so we distinguish them by inspecting the (redacted) error message.
  */
 export async function pollRelay(relayUrl: string, relayToken: string, now: () => string = () => new Date().toISOString()): Promise<RelayPollResult> {
-  const hostname = relayHostname(relayUrl)
+  const hostname = process.env.VIBE_RELAY_NAME || relayHostname(relayUrl)
 
   try {
     const { fetchRemoteNodes } = await import('../../relay/client.js')
