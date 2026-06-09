@@ -161,7 +161,7 @@ export async function runTelegramMonitor(opts: MonitorOptions): Promise<void> {
   process.once('SIGTERM', stop)
 
   process.stderr.write(
-    `[telegram-monitor] starting — relay=${relayHostname(opts.relayUrl)} interval=${pollIntervalSeconds}s` +
+    `[telegram-monitor] starting — relay=${process.env.VIBE_RELAY_NAME || relayHostname(opts.relayUrl)} interval=${pollIntervalSeconds}s` +
       `${opts.symphonyWorkdir ? ' symphony=on' : ''}${opts.linearApiKey ? ' linear=on' : ''}\n`,
   )
 
