@@ -12,6 +12,8 @@ import { generateRunId, tryReadRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
+import { codexBackend } from '../backends/codex.js'
+import { resolveAgents } from '../agent-registry.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
@@ -64,11 +66,12 @@ function sendSigned(ws: WebSocket, msg: RelayMessage, identity: IdentityFile): v
 function t(): string { return new Date().toISOString() }
 
 async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<typeof resolveConfig>, msg: RunStartMsg, eventAesKey?: string, stopAesKey?: string, approvalAesKey?: string): Promise<void> {
-  if (msg.agent !== 'mock' && msg.agent !== 'claude-code') {
+  const supportedAgents = resolveAgents()
+  if (!supportedAgents.includes(msg.agent)) {
     sendMsg(ws, {
       version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
       type: 'run_start_ack', req_id: msg.req_id, ok: false,
-      error: `Remote agent not supported: ${msg.agent}. Supported: mock, claude-code.`,
+      error: `Agent not supported: ${msg.agent}. Supported: ${supportedAgents.join(', ')}.`,
       code: 'agent_not_supported',
     })
     return
@@ -108,7 +111,12 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   }
   writeRun(record)
 
-  const backend = msg.agent === 'claude-code' ? claudeCodeBackend : mockBackend
+  const backendMap: Record<string, import('../backends/types.js').Backend> = {
+    'claude-code': claudeCodeBackend,
+    'codex': codexBackend,
+    'mock': mockBackend,
+  }
+  const backend = backendMap[msg.agent] ?? mockBackend
   const result = await backend.start(record, {})
   const runningRecord = updateRun(runId, { session_id: result.session_id, status: 'running' })
 
@@ -277,7 +285,7 @@ export async function relayNodeDaemon(
     status: 'online',
     transport: 'relay',
     capabilities: ['run', 'stream', 'stop', 'workspace'],
-    agents: ['mock', 'claude-code'],
+    agents: resolveAgents(),
     active_runs: 0,
     max_runs: 4,
     workspace_roots: [config.workspace_root],
