@@ -114,18 +114,31 @@ mkdir -p "$VIBE_DIR"
 
 if [[ -f "$IDENTITY_FILE" ]]; then
   if command -v jq &>/dev/null; then
-    NODE_ID=$(jq -r '.id' "$IDENTITY_FILE")
+    NODE_ID=$(jq -r '.id' "$IDENTITY_FILE" 2>/dev/null || true)
   else
-    NODE_ID=$(grep -o '"id":"[^"]*"' "$IDENTITY_FILE" | cut -d'"' -f4)
+    NODE_ID=$(grep -o '"id":"[^"]*"' "$IDENTITY_FILE" | cut -d'"' -f4 || true)
   fi
-  ok "Identity exists  (node_id=$NODE_ID)"
-else
-  echo "  Creating identity..."
-  IDENTITY_JSON=$(vibe node identity 2>/dev/null)
-  if command -v jq &>/dev/null; then
-    NODE_ID=$(echo "$IDENTITY_JSON" | jq -r '.id')
+  if [[ -z "$NODE_ID" || "$NODE_ID" == "null" ]]; then
+    warn "Could not parse id from $IDENTITY_FILE — recreating..."
+    rm -f "$IDENTITY_FILE"
   else
-    NODE_ID=$(echo "$IDENTITY_JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+    ok "Identity exists  (node_id=$NODE_ID)"
+  fi
+fi
+
+if [[ ! -f "$IDENTITY_FILE" ]]; then
+  echo "  Creating identity..."
+  IDENTITY_JSON=$(vibe node identity 2>&1) || true
+  if [[ -z "$IDENTITY_JSON" ]]; then
+    fail "vibe node identity returned no output — is vibe installed correctly?"
+  fi
+  if command -v jq &>/dev/null; then
+    NODE_ID=$(echo "$IDENTITY_JSON" | jq -r '.id' 2>/dev/null || true)
+  else
+    NODE_ID=$(echo "$IDENTITY_JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4 || true)
+  fi
+  if [[ -z "$NODE_ID" ]]; then
+    fail "Could not parse node_id from: $IDENTITY_JSON"
   fi
   ok "Created identity  (node_id=$NODE_ID)"
 fi
