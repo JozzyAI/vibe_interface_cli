@@ -4,7 +4,7 @@ import { appendEvent } from './events.js'
 import { readRun, updateRun } from './store.js'
 import { redact } from './redact.js'
 import { cloneIfEmpty } from './workspace.js'
-import { detectPrUrl } from './pr-detect.js'
+import { detectPrUrl, createPrUrlTracker } from './pr-detect.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes
 
@@ -21,13 +21,14 @@ function handleStreamEvent(
   run_id: string,
   session_id: string,
   ts: () => string,
+  isNewPrUrl: (url: string) => boolean,
 ): void {
   if (msg.type === 'assistant' && msg.message?.content) {
     for (const block of msg.message.content) {
       if (block.type === 'text' && block.text) {
         appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: redact(block.text), ts: ts() })
         const prUrl = detectPrUrl(block.text)
-        if (prUrl) {
+        if (prUrl && isNewPrUrl(prUrl)) {
           appendEvent({ type: 'pr_created', run_id, session_id, url: prUrl, ts: ts() })
         }
       } else if (block.type === 'tool_use' && block.name) {
@@ -42,6 +43,7 @@ export async function runClaudeRunner(run_id: string): Promise<void> {
   let session_id = record.session_id
   const ts = () => new Date().toISOString()
   const timeoutMs = parseInt(process.env.VIBE_RUN_TIMEOUT_MS ?? String(DEFAULT_TIMEOUT_MS), 10)
+  const isNewPrUrl = createPrUrlTracker()
 
   appendEvent({ type: 'status', run_id, session_id, status: 'running', ts: ts() })
 
@@ -115,11 +117,11 @@ export async function runClaudeRunner(run_id: string): Promise<void> {
       try {
         const msg = JSON.parse(line) as ClaudeStreamEvent
         if (msg.type === 'system' && msg.session_id) session_id = msg.session_id
-        handleStreamEvent(msg, run_id, session_id, ts)
+        handleStreamEvent(msg, run_id, session_id, ts, isNewPrUrl)
       } catch {
         appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: redact(line), ts: ts() })
         const prUrl = detectPrUrl(line)
-        if (prUrl) {
+        if (prUrl && isNewPrUrl(prUrl)) {
           appendEvent({ type: 'pr_created', run_id, session_id, url: prUrl, ts: ts() })
         }
       }

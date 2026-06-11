@@ -10,3 +10,17 @@ export function detectPrUrl(text: string): string | undefined {
   if (!matches || matches.length === 0) return undefined
   return matches[matches.length - 1]
 }
+
+/**
+ * Tracks PR URLs already reported for a single run, so an agent restating
+ * the same link across multiple lines/messages only emits one pr_created
+ * event per URL.
+ */
+export function createPrUrlTracker(): (url: string) => boolean {
+  const seen = new Set<string>()
+  return (url: string): boolean => {
+    if (seen.has(url)) return false
+    seen.add(url)
+    return true
+  }
+}

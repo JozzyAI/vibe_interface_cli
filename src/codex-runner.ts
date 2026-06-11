@@ -4,7 +4,7 @@ import { appendEvent } from './events.js'
 import { readRun, updateRun } from './store.js'
 import { redact } from './redact.js'
 import { cloneIfEmpty } from './workspace.js'
-import { detectPrUrl } from './pr-detect.js'
+import { detectPrUrl, createPrUrlTracker } from './pr-detect.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes
 
@@ -13,6 +13,7 @@ export async function runCodexRunner(run_id: string): Promise<void> {
   const session_id = record.session_id
   const ts = () => new Date().toISOString()
   const timeoutMs = parseInt(process.env.VIBE_RUN_TIMEOUT_MS ?? String(DEFAULT_TIMEOUT_MS), 10)
+  const isNewPrUrl = createPrUrlTracker()
 
   appendEvent({ type: 'status', run_id, session_id, status: 'running', ts: ts() })
 
@@ -85,7 +86,7 @@ export async function runCodexRunner(run_id: string): Promise<void> {
     for (const line of chunk.toString('utf8').split('\n').filter(Boolean)) {
       appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: redact(line), ts: ts() })
       const prUrl = detectPrUrl(line)
-      if (prUrl) {
+      if (prUrl && isNewPrUrl(prUrl)) {
         appendEvent({ type: 'pr_created', run_id, session_id, url: prUrl, ts: ts() })
       }
     }

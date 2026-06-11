@@ -174,6 +174,26 @@ test('claude-code: PR URL in non-JSON stdout line emits pr_created event', () =>
   assert.equal(prEvent!.url, 'https://github.com/JozzyAI/fin_bot/pull/5')
 })
 
+test('claude-code: same PR URL in assistant text and raw line — only one pr_created event', () => {
+  const pf = promptFile('open a pr')
+  const url = 'https://github.com/JozzyAI/fin_bot/pull/4'
+  const env = {
+    ...fakeClaudePath,
+    FAKE_CLAUDE_EXTRA_TEXT: `Opened PR: ${url}`,
+    FAKE_CLAUDE_RAW_LINE: `PR #4 is open and ready for review: ${url}`,
+  }
+  const start = vibe(env, 'run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0, `start failed: ${start.stderr}`)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  const prEvents = events.filter((e) => e.type === 'pr_created') as PrCreatedEvent[]
+  assert.equal(prEvents.length, 1, 'exactly one pr_created event for the repeated URL')
+  assert.equal(prEvents[0].url, url)
+})
+
 test('claude-code: no PR URL in output — no pr_created event', () => {
   const pf = promptFile('write hello world')
   const start = vibe(fakeClaudePath, 'run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey(), '--prompt-file', pf)

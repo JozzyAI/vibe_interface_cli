@@ -330,6 +330,31 @@ test('codex: multiple PR URLs on one line — last one wins', () => {
   assert.equal(prEvents[0].url, 'https://github.com/JozzyAI/fin_bot/pull/4')
 })
 
+test('codex: same PR URL repeated across separate lines — only one pr_created event', () => {
+  const pf = promptFile('open a pr')
+  const url = 'https://github.com/JozzyAI/fin_bot/pull/4'
+  const env = {
+    ...isolatedNodeEnv(fakeCodexPath),
+    VIBE_ENABLE_CODEX: '1',
+    FAKE_CODEX_EXTRA_STDOUT: `Opened PR: ${url}\nPR #4 is open and ready for review: ${url}`,
+  }
+  const start = vibe(env, 'run', 'start', '--agent', 'codex', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0, `start failed: ${start.stderr}`)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  const prEvents = events.filter((e) => e.type === 'pr_created') as PrCreatedEvent[]
+  assert.equal(prEvents.length, 1, 'exactly one pr_created event for the repeated URL')
+  assert.equal(prEvents[0].url, url)
+
+  // both lines are still logged
+  const logEvents = events.filter((e) => e.type === 'log') as LogEvent[]
+  assert.ok(logEvents.some((e) => e.message.includes('Opened PR')), 'first line still logged')
+  assert.ok(logEvents.some((e) => e.message.includes('is open and ready')), 'second line still logged')
+})
+
 test('codex: no PR URL in output — no pr_created event', () => {
   const pf = promptFile('write hello world')
   const env = { ...isolatedNodeEnv(fakeCodexPath), VIBE_ENABLE_CODEX: '1' }
