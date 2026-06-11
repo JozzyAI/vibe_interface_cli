@@ -2,6 +2,8 @@
 // Fake claude CLI for contract tests.
 // FAKE_CLAUDE_EXIT_CODE — exit code to use (default 0)
 // FAKE_CLAUDE_HANG     — if set, hang after init (for stop tests)
+// FAKE_CLAUDE_EXTRA_TEXT — appended on its own line to the assistant text block
+// FAKE_CLAUDE_RAW_LINE   — emitted as a raw non-JSON stdout line after the result event
 
 const exitCode = parseInt(process.env.FAKE_CLAUDE_EXIT_CODE ?? '0', 10)
 const hang = !!process.env.FAKE_CLAUDE_HANG
@@ -25,13 +27,17 @@ process.stdin.on('end', () => {
 
   setTimeout(() => {
     if (exitCode === 0) {
+      let text = `Completed task: ${prompt.substring(0, 80).trim()}`
+      if (process.env.FAKE_CLAUDE_EXTRA_TEXT) {
+        text += `\n${process.env.FAKE_CLAUDE_EXTRA_TEXT}`
+      }
       emit({
         type: 'assistant',
         session_id: sessionId,
         message: {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'text', text: `Completed task: ${prompt.substring(0, 80).trim()}` }],
+          content: [{ type: 'text', text }],
         },
       })
     }
@@ -43,6 +49,10 @@ process.stdin.on('end', () => {
       result: exitCode === 0 ? 'Done' : 'Failed',
       session_id: sessionId,
     })
+
+    if (process.env.FAKE_CLAUDE_RAW_LINE) {
+      process.stdout.write(`${process.env.FAKE_CLAUDE_RAW_LINE}\n`)
+    }
 
     process.exit(exitCode)
   }, 100)

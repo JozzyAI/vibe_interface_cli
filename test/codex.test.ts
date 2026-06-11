@@ -10,7 +10,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import type { RunRecord, RunEvent, StatusEvent, LogEvent, VibeNode } from '../src/types.js'
+import type { RunRecord, RunEvent, StatusEvent, LogEvent, PrCreatedEvent, VibeNode } from '../src/types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -38,6 +38,16 @@ function promptFile(content: string): string {
   const p = path.join(os.tmpdir(), `vibe-test-prompt-${Date.now()}.md`)
   fs.writeFileSync(p, content)
   return p
+}
+
+// Points VIBE_NODE_STATE_FILE at a fresh, nonexistent path so the local node is computed
+// from resolveAgents()/PATH (via getBuiltinLocalNode) instead of a possibly-stale real
+// ~/.vibe/node-local.json daemon state file.
+function isolatedNodeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    VIBE_NODE_STATE_FILE: path.join(os.tmpdir(), `vibe-test-node-state-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`),
+  }
 }
 
 function parseEvents(jsonl: string): RunEvent[] {
@@ -275,6 +285,62 @@ test('codex: stream stdout is valid JSONL (all lines parse)', () => {
     assert.ok(event.run_id)
     assert.ok(event.ts)
   }
+})
+
+// ── PR detection ───────────────────────────────────────────────────────────
+
+test('codex: PR URL in stdout emits pr_created event', () => {
+  const pf = promptFile('open a pr')
+  const env = {
+    ...isolatedNodeEnv(fakeCodexPath),
+    VIBE_ENABLE_CODEX: '1',
+    FAKE_CODEX_EXTRA_STDOUT: 'Opened PR: https://github.com/JozzyAI/fin_bot/pull/4',
+  }
+  const start = vibe(env, 'run', 'start', '--agent', 'codex', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0, `start failed: ${start.stderr}`)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  const prEvent = events.find((e) => e.type === 'pr_created') as PrCreatedEvent | undefined
+  assert.ok(prEvent, 'has pr_created event')
+  assert.equal(prEvent!.url, 'https://github.com/JozzyAI/fin_bot/pull/4')
+
+  const last = events[events.length - 1] as StatusEvent
+  assert.equal(last.status, 'completed')
+})
+
+test('codex: multiple PR URLs on one line — last one wins', () => {
+  const pf = promptFile('open a pr')
+  const env = {
+    ...isolatedNodeEnv(fakeCodexPath),
+    VIBE_ENABLE_CODEX: '1',
+    FAKE_CODEX_EXTRA_STDOUT: 'Superseded https://github.com/JozzyAI/fin_bot/pull/3 with https://github.com/JozzyAI/fin_bot/pull/4',
+  }
+  const start = vibe(env, 'run', 'start', '--agent', 'codex', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0, `start failed: ${start.stderr}`)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  const prEvents = events.filter((e) => e.type === 'pr_created') as PrCreatedEvent[]
+  assert.equal(prEvents.length, 1, 'exactly one pr_created event for the line')
+  assert.equal(prEvents[0].url, 'https://github.com/JozzyAI/fin_bot/pull/4')
+})
+
+test('codex: no PR URL in output — no pr_created event', () => {
+  const pf = promptFile('write hello world')
+  const env = { ...isolatedNodeEnv(fakeCodexPath), VIBE_ENABLE_CODEX: '1' }
+  const start = vibe(env, 'run', 'start', '--agent', 'codex', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  assert.ok(!events.some((e) => e.type === 'pr_created'), 'no pr_created event when no PR URL is present')
 })
 
 // ── Redaction ──────────────────────────────────────────────────────────────

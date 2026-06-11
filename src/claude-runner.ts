@@ -4,6 +4,7 @@ import { appendEvent } from './events.js'
 import { readRun, updateRun } from './store.js'
 import { redact } from './redact.js'
 import { cloneIfEmpty } from './workspace.js'
+import { detectPrUrl } from './pr-detect.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes
 
@@ -25,6 +26,10 @@ function handleStreamEvent(
     for (const block of msg.message.content) {
       if (block.type === 'text' && block.text) {
         appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: redact(block.text), ts: ts() })
+        const prUrl = detectPrUrl(block.text)
+        if (prUrl) {
+          appendEvent({ type: 'pr_created', run_id, session_id, url: prUrl, ts: ts() })
+        }
       } else if (block.type === 'tool_use' && block.name) {
         appendEvent({ type: 'tool_call', run_id, session_id, tool: block.name, input: block.input, ts: ts() })
       }
@@ -113,6 +118,10 @@ export async function runClaudeRunner(run_id: string): Promise<void> {
         handleStreamEvent(msg, run_id, session_id, ts)
       } catch {
         appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: redact(line), ts: ts() })
+        const prUrl = detectPrUrl(line)
+        if (prUrl) {
+          appendEvent({ type: 'pr_created', run_id, session_id, url: prUrl, ts: ts() })
+        }
       }
     }
   })

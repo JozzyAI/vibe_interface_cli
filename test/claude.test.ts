@@ -9,7 +9,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import type { RunRecord, RunEvent, StatusEvent, LogEvent } from '../src/types.js'
+import type { RunRecord, RunEvent, StatusEvent, LogEvent, PrCreatedEvent } from '../src/types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -137,6 +137,53 @@ test('claude-code: run stop kills long-running claude process', () => {
   assert.equal(stop.status, 0, `stop failed: ${stop.stderr}`)
   const stopped = JSON.parse(stop.stdout.trim()) as RunRecord
   assert.equal(stopped.status, 'stopped')
+})
+
+// ── PR detection ───────────────────────────────────────────────────────────
+
+test('claude-code: PR URL in assistant text emits pr_created event', () => {
+  const pf = promptFile('open a pr')
+  const env = { ...fakeClaudePath, FAKE_CLAUDE_EXTRA_TEXT: 'Opened PR: https://github.com/JozzyAI/fin_bot/pull/4' }
+  const start = vibe(env, 'run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0, `start failed: ${start.stderr}`)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  const prEvent = events.find((e) => e.type === 'pr_created') as PrCreatedEvent | undefined
+  assert.ok(prEvent, 'has pr_created event')
+  assert.equal(prEvent!.url, 'https://github.com/JozzyAI/fin_bot/pull/4')
+
+  const last = events[events.length - 1] as StatusEvent
+  assert.equal(last.status, 'completed')
+})
+
+test('claude-code: PR URL in non-JSON stdout line emits pr_created event', () => {
+  const pf = promptFile('open a pr')
+  const env = { ...fakeClaudePath, FAKE_CLAUDE_RAW_LINE: 'Opened PR: https://github.com/JozzyAI/fin_bot/pull/5' }
+  const start = vibe(env, 'run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0, `start failed: ${start.stderr}`)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(env, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  const prEvent = events.find((e) => e.type === 'pr_created') as PrCreatedEvent | undefined
+  assert.ok(prEvent, 'has pr_created event')
+  assert.equal(prEvent!.url, 'https://github.com/JozzyAI/fin_bot/pull/5')
+})
+
+test('claude-code: no PR URL in output — no pr_created event', () => {
+  const pf = promptFile('write hello world')
+  const start = vibe(fakeClaudePath, 'run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey(), '--prompt-file', pf)
+  assert.equal(start.status, 0)
+  const record = JSON.parse(start.stdout.trim()) as RunRecord
+
+  const stream = vibeTimeout(fakeClaudePath, 'run', 'stream', record.run_id, '--jsonl')
+  const events = parseEvents(stream.stdout)
+
+  assert.ok(!events.some((e) => e.type === 'pr_created'), 'no pr_created event when no PR URL is present')
 })
 
 // ── stdout cleanliness ─────────────────────────────────────────────────────

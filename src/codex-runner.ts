@@ -4,6 +4,7 @@ import { appendEvent } from './events.js'
 import { readRun, updateRun } from './store.js'
 import { redact } from './redact.js'
 import { cloneIfEmpty } from './workspace.js'
+import { detectPrUrl } from './pr-detect.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes
 
@@ -83,6 +84,10 @@ export async function runCodexRunner(run_id: string): Promise<void> {
   child.stdout?.on('data', (chunk: Buffer) => {
     for (const line of chunk.toString('utf8').split('\n').filter(Boolean)) {
       appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: redact(line), ts: ts() })
+      const prUrl = detectPrUrl(line)
+      if (prUrl) {
+        appendEvent({ type: 'pr_created', run_id, session_id, url: prUrl, ts: ts() })
+      }
     }
   })
 
