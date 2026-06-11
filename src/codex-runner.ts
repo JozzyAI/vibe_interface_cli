@@ -3,7 +3,7 @@ import fs from 'fs'
 import { appendEvent } from './events.js'
 import { readRun, updateRun } from './store.js'
 import { redact } from './redact.js'
-import { cloneIfEmpty } from './workspace.js'
+import { cloneIfEmpty, WorkspaceRepoMismatchError } from './workspace.js'
 import { detectPrUrl, createPrUrlTracker } from './pr-detect.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes
@@ -32,7 +32,9 @@ export async function runCodexRunner(run_id: string): Promise<void> {
     try {
       cloneIfEmpty(record.workspace_path, record.repo_url, record.branch)
     } catch (err) {
-      appendEvent({ type: 'error', run_id, session_id, message: `clone failed: ${(err as Error).message}`, ts: ts() })
+      const isMismatch = err instanceof WorkspaceRepoMismatchError
+      const message = isMismatch ? err.message : `clone failed: ${(err as Error).message}`
+      appendEvent({ type: 'error', run_id, session_id, message, ...(isMismatch && { code: err.code }), ts: ts() })
       appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
       updateRun(run_id, { status: 'failed' })
       return

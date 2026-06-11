@@ -6,7 +6,7 @@ import { execSync } from 'child_process'
 import { resolveConfig } from '../config.js'
 import { generateRunId, readRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
-import { resolveWorkspacePath, ensureWorkspace, cloneIfEmpty } from '../workspace.js'
+import { resolveWorkspacePath, ensureWorkspace, cloneIfEmpty, WorkspaceRepoMismatchError } from '../workspace.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { codexBackend } from '../backends/codex.js'
@@ -64,10 +64,6 @@ export async function startRun(opts: StartRunOpts): Promise<RunRecord> {
 
   ensureWorkspace(workspacePath)
 
-  if (opts.repoUrl) {
-    cloneIfEmpty(workspacePath, opts.repoUrl, opts.branch)
-  }
-
   let metadata: Record<string, unknown> | undefined
   if (opts.metadataFile) {
     metadata = JSON.parse(fs.readFileSync(opts.metadataFile, 'utf8')) as Record<string, unknown>
@@ -93,6 +89,19 @@ export async function startRun(opts: StartRunOpts): Promise<RunRecord> {
     updated_at: new Date().toISOString(),
   }
   writeRun(record)
+
+  if (opts.repoUrl) {
+    try {
+      cloneIfEmpty(workspacePath, opts.repoUrl, opts.branch)
+    } catch (err) {
+      const isMismatch = err instanceof WorkspaceRepoMismatchError
+      const message = isMismatch ? err.message : `clone failed: ${(err as Error).message}`
+      const ts = new Date().toISOString()
+      appendEvent({ type: 'error', run_id, message, ...(isMismatch && { code: err.code }), ts })
+      appendEvent({ type: 'status', run_id, status: 'failed', ts })
+      return updateRun(run_id, { status: 'failed' })
+    }
+  }
 
   const backend = getBackend(record.agent)
   const result = await backend.start(record, {
