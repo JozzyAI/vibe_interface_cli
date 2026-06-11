@@ -113,6 +113,7 @@ export interface ApprovalResponseEvent extends BaseEvent {
 export interface ErrorEvent extends BaseEvent {
   type: 'error'
   message: string
+  code?: string
 }
 
 export type RunEvent =
