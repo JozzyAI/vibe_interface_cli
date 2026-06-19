@@ -27,6 +27,14 @@ export interface RunRecord {
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
   child_pid?: number       // PID of spawned agent process (for kill-on-stop)
+  // ── Meta-agent runtime projection (set by the supervisor; absent on plain single-agent runs) ──
+  started_agent?: AgentBackend   // the primary agent the run began with
+  final_agent?: AgentBackend     // the agent that produced the terminal status (differs from started_agent after a switch)
+  switched?: boolean             // true if the supervisor fell back from the primary to another agent
+  switch_reason?: string         // classified FailureReason that triggered the switch
+  handoff_path?: string          // path to the handoff doc written on switch
+  failure_reason?: string        // classified FailureReason on terminal failure
+  recoverable?: boolean          // whether the terminal failure was classified recoverable
   event_aes_key?: string   // base64 AES-256 key for run_event decryption (HKDF 'vibe-run-event-v1'); stored locally
   stop_aes_key?: string     // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally
   approval_aes_key?: string // base64 AES-256 key for approval_response encryption (HKDF 'vibe-approval-response-v1')
