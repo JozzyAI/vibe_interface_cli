@@ -10,7 +10,8 @@ export function registerRelayCommand(program: Command): void {
     )
     .option('--port <port>', 'port to listen on', '7433')
     .option('--host <host>', 'bind address (default: 127.0.0.1; use 0.0.0.0 for all interfaces)', '127.0.0.1')
-    .option('--token <token>', 'auth token', 'dev')
+    .option('--token <token>', 'auth token (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file). Defaults to "dev"')
+    .option('--token-file <path>', 'read the auth token from a file (kept out of process args)')
     .option('--require-pairing', 'reject node_register from unpaired nodes (MVP 4A)')
     .action(async (opts) => {
       const port = parseInt(opts.port, 10)
@@ -19,11 +20,21 @@ export function registerRelayCommand(program: Command): void {
         process.exit(1)
       }
 
+      // tokenFile > --token > VIBE_RELAY_TOKEN env > 'dev' (dev-server default).
+      const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+      let token: string
+      try {
+        token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+      } catch {
+        token = 'dev'
+      }
+      warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+
       const { startRelayServer } = await import('../relay/server.js')
       const server = await startRelayServer({
         port,
         host: opts.host,
-        token: opts.token,
+        token,
         requirePairing: Boolean(opts.requirePairing),
       })
 
@@ -31,7 +42,7 @@ export function registerRelayCommand(program: Command): void {
       process.stderr.write(
         `[vibe-relay] dev relay started (plaintext + signed — no payload encryption)\n` +
         `[vibe-relay] listening on ws://${boundHost}:${server.port}\n` +
-        `[vibe-relay] token: ${opts.token}\n` +
+        `[vibe-relay] token: ${token === 'dev' ? 'dev (default)' : '[REDACTED]'}\n` +
         (opts.requirePairing ? `[vibe-relay] require-pairing: ON — unpaired nodes will be rejected\n` : '') +
         `[vibe-relay] Ctrl-C to stop\n`,
       )

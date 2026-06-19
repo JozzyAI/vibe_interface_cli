@@ -24,7 +24,8 @@ export function registerRunCommand(program: Command): void {
     .option('--permission-mode <mode>', 'permission mode: default | unsafe-skip (unsafe-skip enables --dangerously-skip-permissions)')
     .option('--node <id>', 'node to run on: auto | local | <node_id> (default: auto)')
     .option('--relay <url>', 'relay WebSocket URL (required for remote nodes)')
-    .option('--token <token>', 'auth token for relay')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
     .option('--encrypt', 'encrypt the run_start payload for the target node (requires node to have identity)')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
@@ -39,16 +40,21 @@ export function registerRunCommand(program: Command): void {
       })
 
       if (isRemote) {
-        if (!opts.token) {
-          process.stderr.write('error: --token is required with --relay for remote nodes\n')
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        let token: string
+        try {
+          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
+        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
         try {
           const { remoteRunStart, fetchRemoteNodes } = await import('../relay/client.js')
 
           let encryptionPublicKey: string | undefined
           if (opts.encrypt) {
-            const nodes = await fetchRemoteNodes(opts.relay as string, opts.token as string)
+            const nodes = await fetchRemoteNodes(opts.relay as string, token)
             const target = nodes.find(n => n.node_id === nodeSelector)
             if (!target?.encryption_public_key) {
               process.stderr.write(`error: --encrypt requires the target node to have an identity (node ${nodeSelector} has no encryption_public_key)\n`)
@@ -58,7 +64,7 @@ export function registerRunCommand(program: Command): void {
             encryptionPublicKey = target.encryption_public_key
           }
 
-          const record = await remoteRunStart(opts.relay as string, opts.token as string, nodeSelector, {
+          const record = await remoteRunStart(opts.relay as string, token, nodeSelector, {
             agent: opts.agent as AgentBackend,
             workspaceKey: opts.workspaceKey,
             repoUrl: opts.repoUrl,
@@ -95,16 +101,22 @@ export function registerRunCommand(program: Command): void {
     .description('stream events for a run as JSONL')
     .option('--jsonl', 'output machine-readable JSONL to stdout (default behaviour)')
     .option('--relay <url>', 'relay WebSocket URL for remote stream')
-    .option('--token <token>', 'auth token for relay')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
     .action(async (run_id: string, opts) => {
       if (opts.relay) {
-        if (!opts.token) {
-          process.stderr.write('error: --token is required with --relay\n')
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        let token: string
+        try {
+          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
+        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
         try {
           const { remoteStream } = await import('../relay/client.js')
-          await remoteStream(opts.relay as string, opts.token as string, run_id)
+          await remoteStream(opts.relay as string, token, run_id)
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
@@ -129,16 +141,22 @@ export function registerRunCommand(program: Command): void {
     .description('stop a running run')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .option('--relay <url>', 'relay WebSocket URL for remote stop')
-    .option('--token <token>', 'auth token for relay')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
     .action(async (run_id: string, opts) => {
       if (opts.relay) {
-        if (!opts.token) {
-          process.stderr.write('error: --token is required with --relay\n')
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        let token: string
+        try {
+          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
+        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
         try {
           const { remoteStop } = await import('../relay/client.js')
-          const record = await remoteStop(opts.relay as string, opts.token as string, run_id)
+          const record = await remoteStop(opts.relay as string, token, run_id)
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
