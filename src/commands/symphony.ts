@@ -13,6 +13,7 @@ import type { Command } from 'commander'
 import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
 import { startRun, stopRun } from '../lib/run-actions.js'
+import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
 export function registerSymphonyCommand(program: Command): void {
@@ -24,6 +25,10 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--issue-id <id>', 'Symphony issue / task ID')
     .option('--issue-title <title>', 'human-readable issue title')
     .option('--agent <backend>', 'agent backend (mock, claude-code, codex, opencode)', 'mock')
+    .option('--fallback-agent <agents...>', 'fallback agent(s) to try on a recoverable failure (repeatable or comma-separated)')
+    .option('--switch-on <reasons>', 'comma-separated failure reasons that trigger fallback (default: session_limit,usage_limit,quota_exceeded,rate_limited)')
+    .option('--handoff-on-failure', 'write a handoff doc when switching agents (default: on)')
+    .option('--preserve-workspace', 'reuse the same workspace/branch for the fallback agent (default: on)')
     .option('--repo-url <url>', 'git repo to clone into workspace')
     .option('--branch <branch>', 'branch to checkout (default: repo default)')
     .option('--workspace-key <key>', 'unique workspace directory key (default: issue-id or run_id)')
@@ -38,6 +43,13 @@ export function registerSymphonyCommand(program: Command): void {
     .action(async (opts) => {
       const nodeSelector: string = opts.node ?? 'auto'
       const isRemote = opts.relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
+
+      const agentPolicy = buildAgentPolicyMetadata({
+        fallbackAgents: opts.fallbackAgent,
+        switchOn: opts.switchOn,
+        handoffOnFailure: opts.handoffOnFailure,
+        preserveWorkspace: opts.preserveWorkspace,
+      })
 
       if (isRemote) {
         if (!opts.token) {
@@ -62,6 +74,7 @@ export function registerSymphonyCommand(program: Command): void {
           const extraMetadata: Record<string, unknown> = { source: 'symphony' }
           if (opts.issueId) extraMetadata.issue_id = opts.issueId
           if (opts.issueTitle) extraMetadata.issue_title = opts.issueTitle
+          if (agentPolicy) extraMetadata.agent_policy = agentPolicy
           const record = await remoteRunStart(opts.relay as string, opts.token as string, nodeSelector, {
             agent: opts.agent as AgentBackend,
             workspaceKey: opts.workspaceKey ?? opts.issueId,
@@ -83,6 +96,7 @@ export function registerSymphonyCommand(program: Command): void {
       const extraMetadata: Record<string, unknown> = { source: 'symphony' }
       if (opts.issueId) extraMetadata.issue_id = opts.issueId
       if (opts.issueTitle) extraMetadata.issue_title = opts.issueTitle
+      if (agentPolicy) extraMetadata.agent_policy = agentPolicy
 
       const workspaceKey: string | undefined = opts.workspaceKey ?? opts.issueId
 

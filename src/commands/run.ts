@@ -2,6 +2,7 @@ import type { Command } from 'commander'
 import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
 import { startRun, stopRun } from '../lib/run-actions.js'
+import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
 export function registerRunCommand(program: Command): void {
@@ -11,6 +12,10 @@ export function registerRunCommand(program: Command): void {
     .command('start')
     .description('start a new run')
     .option('--agent <backend>', 'agent backend (mock, claude-code, codex, opencode)', 'mock')
+    .option('--fallback-agent <agents...>', 'fallback agent(s) to try on a recoverable failure (repeatable or comma-separated)')
+    .option('--switch-on <reasons>', 'comma-separated failure reasons that trigger fallback (default: session_limit,usage_limit,quota_exceeded,rate_limited)')
+    .option('--handoff-on-failure', 'write a handoff doc when switching agents (default: on)')
+    .option('--preserve-workspace', 'reuse the same workspace/branch for the fallback agent (default: on)')
     .option('--repo-url <url>', 'git repo to clone into workspace')
     .option('--branch <branch>', 'branch to checkout (default: repo default)')
     .option('--workspace-key <key>', 'unique key for workspace directory (default: run_id)')
@@ -25,6 +30,13 @@ export function registerRunCommand(program: Command): void {
     .action(async (opts) => {
       const nodeSelector: string = opts.node ?? 'auto'
       const isRemote = opts.relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
+
+      const agentPolicy = buildAgentPolicyMetadata({
+        fallbackAgents: opts.fallbackAgent,
+        switchOn: opts.switchOn,
+        handoffOnFailure: opts.handoffOnFailure,
+        preserveWorkspace: opts.preserveWorkspace,
+      })
 
       if (isRemote) {
         if (!opts.token) {
@@ -53,6 +65,7 @@ export function registerRunCommand(program: Command): void {
             branch: opts.branch,
             promptFile: opts.promptFile,
             permissionMode: opts.permissionMode as PermissionMode | undefined,
+            ...(agentPolicy && { metadata: { agent_policy: agentPolicy } }),
             encryptionPublicKey,
           })
           process.stdout.write(JSON.stringify(record) + '\n')
@@ -72,6 +85,7 @@ export function registerRunCommand(program: Command): void {
         promptFile: opts.promptFile,
         metadataFile: opts.metadataFile,
         permissionMode: opts.permissionMode as PermissionMode | undefined,
+        ...(agentPolicy && { extraMetadata: { agent_policy: agentPolicy } }),
       })
       process.stdout.write(JSON.stringify(record) + '\n')
     })

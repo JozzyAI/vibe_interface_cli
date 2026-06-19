@@ -9,7 +9,7 @@ const ENTRY = path.resolve(__dirname, '..', 'index.js')
 
 export const codexBackend: Backend = {
   async start(run: RunRecord, _opts: StartOptions): Promise<StartResult> {
-    const child = spawn(process.execPath, [ENTRY, '_codex-runner', run.run_id], {
+    const child = spawn(process.execPath, [ENTRY, '_supervisor', run.run_id], {
       detached: true,
       stdio: 'ignore',
     })
