@@ -51,6 +51,51 @@ test('redact: Bearer tokens and AWS/OpenAI keys', () => {
   assert.match(redact('key=sk-' + 'x'.repeat(40)), /\[REDACTED\]/)
 })
 
+test('redact: VIBE_RELAY_TOKEN env assignment (plain and export form)', () => {
+  const secret = 'aGVsbG93b3JsZHRoaXNpc2FzZWNyZXR0b2tlbnZhbHVlAA=='
+
+  const plain = redact(`VIBE_RELAY_TOKEN=${secret}`)
+  assert.doesNotMatch(plain, /aGVsbG93/)
+  assert.match(plain, /VIBE_RELAY_TOKEN=\[REDACTED\]/)
+
+  const exported = redact(`export VIBE_RELAY_TOKEN=${secret}`)
+  assert.doesNotMatch(exported, /aGVsbG93/)
+  assert.match(exported, /export VIBE_RELAY_TOKEN=\[REDACTED\]/)
+})
+
+test('redact: --token CLI arg (space and = forms), but NOT --token-file', () => {
+  const secret = 'c2VjcmV0Q2xpVG9rZW5WYWx1ZTEyMzQ1Njc4OTBhYmM='
+
+  const spaced = redact(`vibe node daemon --relay wss://r --token ${secret}`)
+  assert.doesNotMatch(spaced, /c2VjcmV0/)
+  assert.match(spaced, /--token \[REDACTED\]/)
+
+  const eq = redact(`vibe node daemon --token=${secret}`)
+  assert.doesNotMatch(eq, /c2VjcmV0/)
+  assert.match(eq, /--token=\[REDACTED\]/)
+
+  // --token-file carries a path, not a secret, and must survive untouched.
+  const file = redact('vibe node daemon --token-file /home/u/.config/vibe-symphony/token')
+  assert.match(file, /--token-file \/home\/u\/\.config\/vibe-symphony\/token/)
+  assert.doesNotMatch(file, /\[REDACTED\]/)
+})
+
+test('redact: token in URL query string (?token= and &token=)', () => {
+  const secret = 'dXJsUXVlcnlUb2tlblNlY3JldFZhbHVlMTIzNDU2Nzg5'
+
+  const q = redact(`wss://vibe-relay.example.ai/node?token=${secret}`)
+  assert.doesNotMatch(q, /dXJsUXVl/)
+  assert.match(q, /\?token=\[REDACTED\]/)
+
+  const amp = redact(`wss://vibe-relay.example.ai/node?node_id=abc&token=${secret}`)
+  assert.doesNotMatch(amp, /dXJsUXVl/)
+  assert.match(amp, /&token=\[REDACTED\]/)
+
+  // The query redaction must stop at a following param boundary.
+  const trailing = redact(`wss://r/node?token=${secret}&node_id=keepme`)
+  assert.match(trailing, /&node_id=keepme/)
+})
+
 test('redact: leaves ordinary text untouched', () => {
   const text = 'cloning repo, running tests, opening PR #4'
   assert.equal(redact(text), text)

@@ -25,8 +25,14 @@ const RULES: Rule[] = [
   { pattern: /Bearer [A-Za-z0-9\-._~+/]+=*/g, replacement: 'Bearer [REDACTED]' },
   // Credentials embedded in a URL: https://user:token@host or https://token@host.
   { pattern: /(https?:\/\/)[^\s/@]+@/g, replacement: '$1[REDACTED]@' },
-  // Token-bearing env assignments (GH_TOKEN=..., GITHUB_TOKEN: ..., GH_PAT=...).
-  { pattern: /\b(GH_TOKEN|GITHUB_TOKEN|GH_PAT|GITHUB_PAT|GHE_TOKEN)\b(\s*[=:]\s*)\S+/gi, replacement: '$1$2[REDACTED]' },
+  // Token-bearing env assignments (GH_TOKEN=..., GITHUB_TOKEN: ..., VIBE_RELAY_TOKEN=...).
+  // Works with or without a leading `export ` (the \b anchors on the var name).
+  { pattern: /\b(GH_TOKEN|GITHUB_TOKEN|GH_PAT|GITHUB_PAT|GHE_TOKEN|VIBE_RELAY_TOKEN)\b(\s*[=:]\s*)\S+/gi, replacement: '$1$2[REDACTED]' },
+  // Relay token passed as a CLI arg: `--token <value>` or `--token=<value>`.
+  // The `[=\s]` guard means `--token-file <path>` is NOT matched (its next char is `-`).
+  { pattern: /(--token[=\s]+)\S+/g, replacement: '$1[REDACTED]' },
+  // Relay token in a URL query string: `?token=<value>` or `&token=<value>`.
+  { pattern: /([?&]token=)[^&\s"']+/gi, replacement: '$1[REDACTED]' },
   // Private key PEM headers.
   { pattern: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/g, replacement: '[REDACTED]' },
 ]
