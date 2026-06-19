@@ -19,6 +19,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { VibeNode } from '../types.js'
 import type { RelayMessage, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, PublicIdentity } from './types.js'
 import { verifyEnvelope } from '../crypto.js'
+import { loadPairings, savePairings } from './pairing-store.js'
 
 interface NodeEntry {
   node: VibeNode
@@ -36,7 +37,18 @@ export interface RelayServer {
 
 export interface RelayServerOpts {
   port: number
+  /**
+   * Primary auth token. Retained for backward compatibility — a client
+   * presenting this token in the `?token=` query is accepted.
+   */
   token: string
+  /**
+   * Additional accepted tokens (token rotation grace window). The relay accepts
+   * a connection whose `?token=` matches `token` OR any entry here, so old and
+   * new tokens can both be valid while each side is rotated. Empty entries are
+   * ignored.
+   */
+  tokens?: string[]
   /** Bind address. Defaults to '127.0.0.1'. Pass '0.0.0.0' to listen on all interfaces. */
   host?: string
   /** Override stale threshold (ms). Defaults to VIBE_NODE_STALE_MS env or 15000. */
@@ -47,6 +59,13 @@ export interface RelayServerOpts {
    * Default false — old token-only dev mode continues to work.
    */
   requirePairing?: boolean
+  /**
+   * Path to persist paired-node identities to. When set, pairings are loaded on
+   * startup and re-saved whenever a node pairs, so they survive a relay
+   * restart. When omitted, pairings are in-memory only (legacy behaviour). The
+   * file holds only public identity material — never a token or private key.
+   */
+  pairingsFile?: string
 }
 
 function getStaleMs(override?: number): number {
@@ -75,9 +94,22 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const runOwnership = new Map<string, string>()
     // run_id → set of subscriber ws, for streaming run events to CLI clients
     const subscribers = new Map<string, Set<WebSocket>>()
-    // node_id → PublicIdentity (populated on node_pair_request)
-    const pairedIdentities = new Map<string, PublicIdentity>()
+    // node_id → PublicIdentity (populated on node_pair_request).
+    // Loaded from disk when a pairings file is configured so pairings survive a
+    // relay restart; otherwise starts empty (legacy in-memory behaviour).
+    const pairedIdentities = opts.pairingsFile
+      ? loadPairings(opts.pairingsFile)
+      : new Map<string, PublicIdentity>()
+    const persistPairings = (): void => {
+      if (opts.pairingsFile) savePairings(opts.pairingsFile, pairedIdentities)
+    }
     const staleMs = getStaleMs(opts.staleMs)
+
+    // Accepted-token set: primary token plus any rotation-grace tokens. Empty
+    // entries are dropped so an unset env never accidentally permits ''.
+    const acceptedTokens = new Set<string>()
+    if (opts.token && opts.token !== '') acceptedTokens.add(opts.token)
+    for (const t of opts.tokens ?? []) if (t && t !== '') acceptedTokens.add(t)
 
     // Token auth at the HTTP upgrade level — rejected clients never reach the WS layer.
     const verifyClient = (
@@ -86,7 +118,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     ) => {
       try {
         const url = new URL(info.req.url ?? '/', 'ws://localhost')
-        if (url.searchParams.get('token') === opts.token) return cb(true)
+        const presented = url.searchParams.get('token')
+        if (presented !== null && acceptedTokens.has(presented)) return cb(true)
       } catch {}
       cb(false, 401, 'Unauthorized')
     }
@@ -217,6 +250,7 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
           case 'node_pair_request': {
             const pid = msg.identity.id
             pairedIdentities.set(pid, msg.identity)
+            persistPairings()
             sendMsg(ws, {
               version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
               type: 'node_pair_ack', node_id: pid, ok: true,

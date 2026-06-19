@@ -15,6 +15,11 @@
 import fs from 'fs'
 
 export const RELAY_TOKEN_ENV = 'VIBE_RELAY_TOKEN'
+/** Grace-window envs: relay accepts the union of every configured token. */
+export const RELAY_TOKEN_ENV_CURRENT = 'VIBE_RELAY_TOKEN_CURRENT'
+export const RELAY_TOKEN_ENV_NEXT = 'VIBE_RELAY_TOKEN_NEXT'
+/** Comma-separated list form, e.g. VIBE_RELAY_TOKENS=old,new */
+export const RELAY_TOKENS_ENV = 'VIBE_RELAY_TOKENS'
 
 export interface RelayTokenSources {
   /** Path from --token-file: the file is read and trimmed. Highest precedence. */
@@ -55,6 +60,44 @@ export function resolveRelayToken(sources: RelayTokenSources = {}): string {
     `relay auth token required: set ${RELAY_TOKEN_ENV}, or pass --token-file <path> ` +
       `(--token <token> also works but is visible in process args)`,
   )
+}
+
+/**
+ * Resolve the *set* of relay auth tokens the relay SERVER should accept.
+ *
+ * Unlike {@link resolveRelayToken} (which picks the single token a client
+ * presents), the server may accept several tokens at once — this is what makes
+ * a zero-downtime token rotation possible: during the grace window the relay
+ * accepts both the current and the next token, so old and new clients both
+ * connect while each side is updated.
+ *
+ * Sources (all unioned, de-duplicated, trimmed; empties dropped):
+ *   --token-file <path>, --token <token> (deprecated),
+ *   VIBE_RELAY_TOKENS (comma-separated), VIBE_RELAY_TOKEN,
+ *   VIBE_RELAY_TOKEN_CURRENT, VIBE_RELAY_TOKEN_NEXT.
+ *
+ * Returns a list (possibly empty); token values are never logged or thrown.
+ */
+export function resolveRelayServerTokens(sources: RelayTokenSources = {}): string[] {
+  const out = new Set<string>()
+  const add = (v: string | undefined): void => {
+    if (v === undefined) return
+    const t = v.trim()
+    if (t !== '') out.add(t)
+  }
+
+  if (sources.tokenFile !== undefined) {
+    try { add(fs.readFileSync(sources.tokenFile, 'utf8')) } catch { /* ignore unreadable file */ }
+  }
+  add(sources.token)
+
+  const list = process.env[RELAY_TOKENS_ENV]
+  if (list) for (const part of list.split(',')) add(part)
+  add(process.env[RELAY_TOKEN_ENV])
+  add(process.env[RELAY_TOKEN_ENV_CURRENT])
+  add(process.env[RELAY_TOKEN_ENV_NEXT])
+
+  return [...out]
 }
 
 /**
