@@ -19,6 +19,7 @@ import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from
 import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
 import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, deriveApprovalKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
+import { nextBackoffMs, sleep } from './reconnect.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -265,11 +266,44 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
   })
 }
 
-/** Connect to relay as a node daemon: register, send heartbeats, handle run_start, exit on signal/close. */
+/** Outcome of a single relay connection attempt. */
+type ConnOutcome =
+  | { kind: 'closed'; registered: boolean }
+  | { kind: 'fatal'; reason: string }
+
+/** Observable connection-lifecycle events (test hook; no-op in production). */
+export type DaemonConnEvent =
+  | 'connecting' | 'registered' | 'closed' | 'rejected' | 'auth_failed' | 'reconnect_scheduled'
+
+/** Optional controls for {@link relayNodeDaemon}; defaults preserve production behaviour. */
+export interface RelayDaemonControl {
+  /** Stop the reconnect loop programmatically (used instead of process signals). */
+  signal?: AbortSignal
+  /** Reconnect backoff base/cap in ms (defaults 1000 / 30000). */
+  backoffBaseMs?: number
+  backoffCapMs?: number
+  /** Called instead of process.exit when the loop ends fatally (auth/pairing). */
+  onFatal?: (code: number, reason: string) => void
+  /** Lifecycle observer (test hook). */
+  onEvent?: (ev: DaemonConnEvent) => void
+}
+
+/**
+ * Connect to relay as a node daemon: register, send heartbeats, handle run_start.
+ *
+ * Resilient to relay restarts — when the WebSocket closes (relay reload, network
+ * blip) the daemon stays alive and reconnects with capped exponential backoff,
+ * re-registering the SAME node_id each time. Pairing persistence on the relay
+ * means no `vibe node pair` is needed across a restart. The loop only stops on:
+ *   - an explicit shutdown (SIGINT/SIGTERM, or an aborted control.signal), or
+ *   - a fatal auth/pairing rejection (401 / register rejected) — logged with the
+ *     token redacted, then exit with an explicit non-zero status (no busy-loop).
+ */
 export async function relayNodeDaemon(
   relay: string,
   token: string,
   nodeIdOverride?: string,
+  control?: RelayDaemonControl,
 ): Promise<void> {
   const config = resolveConfig()
   const heartbeatMs = getHeartbeatMs()
@@ -279,48 +313,85 @@ export async function relayNodeDaemon(
   try { identity = ensureIdentity() } catch { /* non-fatal — fall back to hostname-derived id */ }
   const nodeId = nodeIdOverride ?? identity?.id ?? deriveNodeId()
 
-  const node: VibeNode = {
+  // Built fresh per connection so active_runs / updated_at reflect current state.
+  const buildNode = (): VibeNode => ({
     node_id: nodeId,
     name: os.hostname(),
     status: 'online',
     transport: 'relay',
     capabilities: ['run', 'stream', 'stop', 'workspace'],
     agents: resolveAgents(),
-    active_runs: 0,
+    active_runs: countActiveRuns(),
     max_runs: 4,
     workspace_roots: [config.workspace_root],
     created_at: t(),
     updated_at: t(),
     ...(identity && { encryption_public_key: identity.encryption.public_key }),
+  })
+
+  const emit = (ev: DaemonConnEvent): void => control?.onEvent?.(ev)
+
+  // Shutdown plumbing: an aborted control.signal (tests) OR process signals
+  // (production) ends the loop. Process handlers are installed ONCE here, never
+  // per-connection, so reconnects can't accumulate duplicate handlers.
+  let stopped = false
+  let activeWs: WebSocket | null = null
+  const requestStop = (): void => {
+    stopped = true
+    if (activeWs) { try { activeWs.close() } catch { /* ignore */ } }
+  }
+  if (control?.signal) {
+    if (control.signal.aborted) stopped = true
+    else control.signal.addEventListener('abort', requestStop, { once: true })
+  } else {
+    const onSignal = (signal: string): void => {
+      process.stderr.write(`\n[vibe-node] received ${signal}, shutting down\n`)
+      requestStop()
+      setTimeout(() => process.exit(0), 300)
+    }
+    process.on('SIGINT', () => onSignal('SIGINT'))
+    process.on('SIGTERM', () => onSignal('SIGTERM'))
   }
 
-  process.stderr.write(`[vibe-node] connecting to relay: ${relay}\n`)
-  const ws = new WebSocket(relayUrl(relay, token))
+  const connectOnce = (): Promise<ConnOutcome> => new Promise<ConnOutcome>((resolve) => {
+    emit('connecting')
+    process.stderr.write(`[vibe-node] connecting to relay: ${relay}\n`)
+    const ws = new WebSocket(relayUrl(relay, token))
+    activeWs = ws
 
-  let timer: ReturnType<typeof setInterval> | null = null
-
-  const send = (msg: RelayMessage) => identity ? sendSigned(ws, msg, identity) : sendMsg(ws, msg)
-
-  return new Promise<void>((resolve, reject) => {
+    let hb: ReturnType<typeof setInterval> | null = null
+    let registered = false
     let settled = false
-    const done = (err?: Error) => {
+    const send = (msg: RelayMessage): void => { identity ? sendSigned(ws, msg, identity) : sendMsg(ws, msg) }
+    const finish = (outcome: ConnOutcome): void => {
       if (settled) return
       settled = true
-      if (timer) clearInterval(timer)
-      err ? reject(err) : resolve()
+      if (hb) clearInterval(hb)
+      resolve(outcome)
     }
 
     ws.on('open', () => {
       process.stderr.write(`[vibe-node] connected — registering node_id=${nodeId}\n`)
-      send({ version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'node_register', node })
+      send({ version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'node_register', node: buildNode() })
 
-      timer = setInterval(() => {
+      hb = setInterval(() => {
         send({
           version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
           type: 'node_heartbeat', node_id: nodeId,
           active_runs: countActiveRuns(), last_heartbeat_at: t(),
         })
       }, heartbeatMs)
+    })
+
+    // A 401 at the WS handshake is a definite auth failure — do not reconnect.
+    ws.on('unexpected-response', (_req, res) => {
+      if (res.statusCode === 401) {
+        process.stderr.write('[vibe-node] relay rejected connection: 401 unauthorized — check VIBE_RELAY_TOKEN [token REDACTED]\n')
+        emit('auth_failed')
+        try { ws.terminate() } catch { /* ignore */ }
+        finish({ kind: 'fatal', reason: 'relay returned 401 unauthorized (check token)' })
+      }
+      // other unexpected responses fall through to 'error'/'close' (transient)
     })
 
     ws.on('message', (raw) => {
@@ -331,9 +402,13 @@ export async function relayNodeDaemon(
         if (msg.type === 'node_register_ack') {
           const ack = msg as { node_id: string; ok?: boolean; error?: string; code?: string }
           if (ack.ok === false) {
-            process.stderr.write(`[vibe-node] registration REJECTED node_id=${ack.node_id} error=${ack.error ?? ack.code ?? 'unknown'}\n`)
-            done(new Error(`relay rejected registration: ${ack.error ?? ack.code ?? 'unknown'}`))
+            process.stderr.write(`[vibe-node] registration REJECTED node_id=${ack.node_id} error=${ack.error ?? ack.code ?? 'unknown'} — run \`vibe node pair\` to re-pair [token REDACTED]\n`)
+            emit('rejected')
+            try { ws.close() } catch { /* ignore */ }
+            finish({ kind: 'fatal', reason: `relay rejected registration: ${ack.error ?? ack.code ?? 'unknown'}` })
           } else {
+            registered = true
+            emit('registered')
             process.stderr.write(`[vibe-node] registered ✓ node_id=${msg.node_id}\n`)
             process.stderr.write(`[vibe-node] heartbeat every ${heartbeatMs}ms — Ctrl-C to stop\n`)
           }
@@ -386,30 +461,45 @@ export async function relayNodeDaemon(
           })
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
-          ws.close()
-          done(new Error(msg.message))
+          try { ws.close() } catch { /* ignore */ }
+          // transient: the 'close' handler resolves the outcome → reconnect
         }
       } catch {}
     })
 
     ws.on('close', () => {
       process.stderr.write('[vibe-node] relay connection closed\n')
-      done()
+      emit('closed')
+      finish({ kind: 'closed', registered })
     })
 
     ws.on('error', (err) => {
       process.stderr.write(`[vibe-node] connection error: ${err.message}\n`)
-      done(err)
+      finish({ kind: 'closed', registered })
     })
-
-    function shutdown(signal: string): void {
-      process.stderr.write(`\n[vibe-node] received ${signal}, shutting down\n`)
-      ws.close()
-      setTimeout(() => process.exit(0), 300)
-    }
-    process.on('SIGINT', () => shutdown('SIGINT'))
-    process.on('SIGTERM', () => shutdown('SIGTERM'))
   })
+
+  // Reconnect loop with capped exponential backoff. A session that registered
+  // resets the backoff so the first reconnect after a relay restart is quick.
+  let attempt = 0
+  while (!stopped) {
+    const outcome = await connectOnce()
+    activeWs = null
+    if (stopped) break
+
+    if (outcome.kind === 'fatal') {
+      const onFatal = control?.onFatal ?? ((code: number) => process.exit(code))
+      onFatal(1, outcome.reason)
+      return
+    }
+
+    if (outcome.registered) attempt = 0
+    const delay = nextBackoffMs(attempt, { baseMs: control?.backoffBaseMs, capMs: control?.backoffCapMs })
+    attempt++
+    emit('reconnect_scheduled')
+    process.stderr.write(`[vibe-node] reconnecting in ${delay}ms\n`)
+    await sleep(delay, control?.signal)
+  }
 }
 
 /** Execute the stop logic for a run and return the result (no I/O). */
