@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { redact } from '../src/redact.js'
+import { redact, redactDeep } from '../src/redact.js'
 
 test('redact: GitHub token prefixes (gho_, ghp_, ghu_, ghs_, ghr_)', () => {
   for (const prefix of ['gho_', 'ghp_', 'ghu_', 'ghs_', 'ghr_']) {
@@ -96,7 +96,76 @@ test('redact: token in URL query string (?token= and &token=)', () => {
   assert.match(trailing, /&node_id=keepme/)
 })
 
+test('redact: OPENAI_API_KEY / ANTHROPIC_API_KEY / LINEAR_API_KEY env assignments', () => {
+  const out1 = redact('OPENAI_API_KEY=sk-' + 'z'.repeat(40))
+  assert.doesNotMatch(out1, /sk-z/)
+  assert.match(out1, /OPENAI_API_KEY=\[REDACTED\]/)
+
+  const out2 = redact('ANTHROPIC_API_KEY: sk-ant-' + 'q'.repeat(40))
+  assert.doesNotMatch(out2, /sk-ant-q/)
+  assert.match(out2, /ANTHROPIC_API_KEY: \[REDACTED\]/)
+
+  const out3 = redact('export LINEAR_API_KEY=lin_api_' + 'w'.repeat(40))
+  assert.doesNotMatch(out3, /lin_api_w/)
+  assert.match(out3, /LINEAR_API_KEY=\[REDACTED\]/)
+})
+
 test('redact: leaves ordinary text untouched', () => {
   const text = 'cloning repo, running tests, opening PR #4'
   assert.equal(redact(text), text)
+})
+
+test('redact: leaves a non-secret GitHub repo URL untouched', () => {
+  const url = 'https://github.com/JozzyAI/mirror_social.git'
+  assert.equal(redact(url), url)
+})
+
+test('redactDeep: scrubs string leaves inside nested objects and arrays', () => {
+  const token = 'gho_' + 'A'.repeat(36)
+  const input = {
+    type: 'tool_call',
+    run_id: 'run_abc123',
+    input: {
+      command: `git clone https://${token}@github.com/o/r.git`,
+      args: ['--remote', `GH_TOKEN=${token}`],
+      nested: { note: `using ${token} here` },
+    },
+    count: 7,
+    ok: true,
+    nothing: null,
+  }
+  const out = redactDeep(input)
+
+  const serialized = JSON.stringify(out)
+  assert.doesNotMatch(serialized, /gho_A/, 'no token may survive anywhere in the tree')
+  assert.match(serialized, /\[REDACTED\]/)
+
+  // Structure and non-string leaves are preserved.
+  assert.equal(out.type, 'tool_call')
+  assert.equal(out.run_id, 'run_abc123')
+  assert.equal(out.count, 7)
+  assert.equal(out.ok, true)
+  assert.equal(out.nothing, null)
+  assert.ok(Array.isArray(out.input.args))
+  assert.equal(out.input.args.length, 2)
+})
+
+test('redactDeep: passes through primitives and preserves clean strings', () => {
+  assert.equal(redactDeep(42), 42)
+  assert.equal(redactDeep(true), true)
+  assert.equal(redactDeep(null), null)
+  assert.equal(redactDeep('opening PR #4'), 'opening PR #4')
+  assert.deepEqual(redactDeep(['a', 'b', 1]), ['a', 'b', 1])
+})
+
+test('redactDeep: redacts an error.message token (the tool_call leak vector)', () => {
+  const token = 'ghp_' + 'C'.repeat(36)
+  const event = {
+    type: 'error',
+    run_id: 'run_x',
+    message: `fatal: could not read Username for 'https://${token}@github.com'`,
+  }
+  const out = redactDeep(event)
+  assert.doesNotMatch(out.message, /ghp_C/)
+  assert.match(out.message, /\[REDACTED\]/)
 })

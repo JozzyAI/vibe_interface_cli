@@ -27,7 +27,7 @@ const RULES: Rule[] = [
   { pattern: /(https?:\/\/)[^\s/@]+@/g, replacement: '$1[REDACTED]@' },
   // Token-bearing env assignments (GH_TOKEN=..., GITHUB_TOKEN: ..., VIBE_RELAY_TOKEN=...).
   // Works with or without a leading `export ` (the \b anchors on the var name).
-  { pattern: /\b(GH_TOKEN|GITHUB_TOKEN|GH_PAT|GITHUB_PAT|GHE_TOKEN|VIBE_RELAY_TOKEN)\b(\s*[=:]\s*)\S+/gi, replacement: '$1$2[REDACTED]' },
+  { pattern: /\b(GH_TOKEN|GITHUB_TOKEN|GH_PAT|GITHUB_PAT|GHE_TOKEN|VIBE_RELAY_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|LINEAR_API_KEY)\b(\s*[=:]\s*)\S+/gi, replacement: '$1$2[REDACTED]' },
   // Relay token passed as a CLI arg: `--token <value>` or `--token=<value>`.
   // The `[=\s]` guard means `--token-file <path>` is NOT matched (its next char is `-`).
   { pattern: /(--token[=\s]+)\S+/g, replacement: '$1[REDACTED]' },
@@ -43,4 +43,31 @@ export function redact(text: string): string {
     out = out.replace(pattern, replacement)
   }
   return out
+}
+
+/**
+ * Recursively redact every string leaf in an arbitrary JSON-ish value,
+ * preserving structure. Used at the persistence choke points (event log,
+ * run records) so secrets cannot leak through nested fields such as
+ * `tool_call.input` or `error.message` that bypass the top-level redact().
+ *
+ * Only string leaves are rewritten; numbers/booleans/null and object shape
+ * are left untouched. Arrays and plain objects are mapped; class instances
+ * and other exotic values are passed through unchanged.
+ */
+export function redactDeep<T>(value: T): T {
+  if (typeof value === 'string') {
+    return redact(value) as unknown as T
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => redactDeep(v)) as unknown as T
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = redactDeep(v)
+    }
+    return out as T
+  }
+  return value
 }

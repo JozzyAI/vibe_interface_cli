@@ -15,7 +15,9 @@ import { fileURLToPath } from 'url'
 import {
   cloneIfEmpty,
   checkWorkspaceRepoMatch,
+  assertCleanRepoUrl,
   WorkspaceRepoMismatchError,
+  RepoUrlCredentialsError,
 } from '../src/workspace.js'
 import type { RunRecord, RunEvent, ErrorEvent, StatusEvent, LogEvent } from '../src/types.js'
 
@@ -125,6 +127,72 @@ test('non-empty non-git workspace with repoUrl: fails fast', () => {
       return true
     },
   )
+})
+
+// ── Unit tests: assertCleanRepoUrl (reject token-bearing repo URLs) ────────
+
+test('assertCleanRepoUrl: clean https URL is accepted (with and without .git)', () => {
+  assert.doesNotThrow(() => assertCleanRepoUrl('https://github.com/JozzyAI/mirror_social'))
+  assert.doesNotThrow(() => assertCleanRepoUrl('https://github.com/JozzyAI/mirror_social.git'))
+})
+
+test('assertCleanRepoUrl: scp-style ssh remote is left alone', () => {
+  assert.doesNotThrow(() => assertCleanRepoUrl('git@github.com:JozzyAI/fin_bot.git'))
+  assert.doesNotThrow(() => assertCleanRepoUrl('ssh://git@github.com/JozzyAI/fin_bot.git'))
+})
+
+test('assertCleanRepoUrl: TOKEN@host form is rejected, message carries no token', () => {
+  const token = 'gho_' + 'A'.repeat(36)
+  assert.throws(
+    () => assertCleanRepoUrl(`https://${token}@github.com/JozzyAI/fin_bot.git`),
+    (err: unknown) => {
+      assert.ok(err instanceof RepoUrlCredentialsError)
+      assert.equal((err as RepoUrlCredentialsError).code, 'repo_url_has_credentials')
+      assert.doesNotMatch(err.message, /gho_A/, 'rejection message must not contain the token')
+      assert.match(err.message, /\[credentials REDACTED\]/)
+      return true
+    },
+  )
+})
+
+test('assertCleanRepoUrl: user:TOKEN@host form is rejected, message carries no token', () => {
+  const token = 'ghp_' + 'B'.repeat(36)
+  assert.throws(
+    () => assertCleanRepoUrl(`https://x-access-token:${token}@github.com/o/r.git`),
+    (err: unknown) => {
+      assert.ok(err instanceof RepoUrlCredentialsError)
+      assert.doesNotMatch(err.message, /ghp_B/)
+      return true
+    },
+  )
+})
+
+test('cloneIfEmpty / checkWorkspaceRepoMatch reject a token-bearing repoUrl before any git runs', () => {
+  const token = 'ghs_' + 'C'.repeat(36)
+  const tokenUrl = `https://${token}@github.com/o/r.git`
+  const ws = tmpDir('vibe-ws-tokenurl-')
+
+  assert.throws(() => cloneIfEmpty(ws, tokenUrl), RepoUrlCredentialsError)
+  assert.throws(() => checkWorkspaceRepoMatch(ws, tokenUrl), RepoUrlCredentialsError)
+
+  // Fail-closed: nothing was cloned into the workspace.
+  assert.equal(fs.readdirSync(ws).length, 0, 'no clone happened')
+})
+
+test('token-bearing repoUrl is never written to a workspace git remote', () => {
+  const repo = makeFixtureRepo()
+  const ws = tmpDir('vibe-ws-noremote-')
+  cloneIfEmpty(ws, repo) // clean clone
+
+  const token = 'ghr_' + 'D'.repeat(36)
+  const tokenUrl = `https://${token}@github.com/o/r.git`
+
+  // A subsequent reconcile against a token URL must throw, not rewrite origin.
+  assert.throws(() => checkWorkspaceRepoMatch(ws, tokenUrl), RepoUrlCredentialsError)
+
+  const origin = execSync('git remote get-url origin', { cwd: ws, encoding: 'utf8' }).trim()
+  assert.doesNotMatch(origin, /ghr_D/, 'origin remote must not contain the token')
+  assert.equal(origin, repo, 'origin remote is unchanged')
 })
 
 // ── CLI end-to-end: `vibe run start` ───────────────────────────────────────

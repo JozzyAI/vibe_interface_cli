@@ -32,6 +32,34 @@ export class WorkspaceRepoMismatchError extends Error {
   }
 }
 
+/** Thrown by assertCleanRepoUrl() when a repoUrl carries embedded credentials
+ * (e.g. https://TOKEN@github.com/... or https://user:TOKEN@github.com/...).
+ * We fail closed so a token can never reach `git clone`, a stored remote, or
+ * any log. The message never contains the raw credential. */
+export class RepoUrlCredentialsError extends Error {
+  readonly code = 'repo_url_has_credentials'
+
+  constructor() {
+    super(
+      'repoUrl contains embedded credentials (userinfo before "@") and was rejected. ' +
+      'Provide a clean URL with no token, e.g. https://github.com/<owner>/<repo>.git — ' +
+      'authentication must come from the configured git credential helper. [credentials REDACTED]'
+    )
+    this.name = 'RepoUrlCredentialsError'
+  }
+}
+
+/** Reject any http(s) URL that carries userinfo (`token@host` or
+ * `user:token@host`) before the host. Clean https URLs and scp-style ssh
+ * (`git@github.com:owner/repo.git`) are left alone. Fail-closed: throws
+ * RepoUrlCredentialsError rather than silently stripping, so a token never
+ * reaches `git clone`, a persisted remote, or a log line. */
+export function assertCleanRepoUrl(repoUrl: string): void {
+  if (/^https?:\/\/[^/@]+@/i.test(repoUrl.trim())) {
+    throw new RepoUrlCredentialsError()
+  }
+}
+
 /** Strip a trailing slash and an optional trailing ".git" so equivalent repo
  * URLs (with/without ".git", with/without a trailing slash) compare equal. */
 export function normalizeRepoUrl(url: string): string {
@@ -70,6 +98,8 @@ function readOriginUrl(workspacePath: string): string | undefined {
  *   unreadable): throws WorkspaceRepoMismatchError.
  */
 export function checkWorkspaceRepoMatch(workspacePath: string, repoUrl: string): void {
+  assertCleanRepoUrl(repoUrl)
+
   const entries = fs.readdirSync(workspacePath)
   if (entries.length === 0) return
 
@@ -95,6 +125,7 @@ export function checkWorkspaceRepoMatch(workspacePath: string, repoUrl: string):
 }
 
 export function cloneIfEmpty(workspacePath: string, repoUrl: string, branch?: string): void {
+  assertCleanRepoUrl(repoUrl)
   checkWorkspaceRepoMatch(workspacePath, repoUrl)
 
   const entries = fs.readdirSync(workspacePath)
