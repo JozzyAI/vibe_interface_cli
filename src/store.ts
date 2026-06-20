@@ -2,6 +2,7 @@ import fs from 'fs'
 import path from 'path'
 import { vibeDir } from './config.js'
 import type { RunRecord } from './types.js'
+import { redactDeep } from './redact.js'
 
 function runsDir(): string {
   return path.join(vibeDir(), 'runs')
@@ -12,7 +13,9 @@ function runPath(run_id: string): string {
 }
 
 export function writeRun(record: RunRecord): void {
-  fs.writeFileSync(runPath(record.run_id), JSON.stringify(record, null, 2))
+  // Redact every string leaf before persisting the run record. Path is keyed on
+  // the original run_id (never a secret) so redaction cannot misdirect the write.
+  fs.writeFileSync(runPath(record.run_id), JSON.stringify(redactDeep(record), null, 2))
 }
 
 export function readRun(run_id: string): RunRecord {

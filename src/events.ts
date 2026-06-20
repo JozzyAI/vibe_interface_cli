@@ -2,13 +2,16 @@ import fs from 'fs'
 import path from 'path'
 import { vibeDir } from './config.js'
 import { isTerminal, type RunEvent } from './types.js'
+import { redactDeep } from './redact.js'
 
 function eventsPath(run_id: string): string {
   return path.join(vibeDir(), 'events', `${run_id}.jsonl`)
 }
 
 export function appendEvent(event: RunEvent): void {
-  fs.appendFileSync(eventsPath(event.run_id), JSON.stringify(event) + '\n')
+  // Redact every string leaf before persisting. The path is computed from the
+  // original run_id (never a secret) so redaction cannot misdirect the write.
+  fs.appendFileSync(eventsPath(event.run_id), JSON.stringify(redactDeep(event)) + '\n')
 }
 
 export function readEvents(run_id: string): RunEvent[] {
