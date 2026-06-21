@@ -26,10 +26,16 @@ const RULES: Rule[] = [
   { reason: 'auth_expired', recoverable: true, patterns: [/all credential paths are exhausted/i, /authentication (?:failed|expired|required)/i, /\b401\b/, /invalid api key/i, /not (?:logged in|authenticated)/i] },
 
   // ── Non-recoverable: the work or repo is the problem ──────────────────────
+  // Repo gate / allowlist rejection (PR C1). Listed before auth_misconfigured so
+  // a repo-binding rejection is tagged precisely and never mistaken for an auth
+  // problem. Covers a non-allowlisted remote and a credential-bearing repo URL.
+  { reason: 'repo_not_allowed', recoverable: false, patterns: [/blocked by repo allowlist/i, /repo_url_has_credentials/i, /embedded credentials/i] },
   // Controlled-auth misconfiguration (preflight, or a wrong-account push). Listed
   // before permission_denied so a clear auth-misconfig signal is tagged precisely.
   // Never recoverable: switching agents shares the same broken credential path.
-  { reason: 'auth_misconfigured', recoverable: false, patterns: [/auth preflight failed/i, /not in the allowlist/i, /git credential manager/i] },
+  // The allowlist pattern is anchored on the account-allowlist wording
+  // ("not in the allowlist [") so it cannot collide with the repo allowlist above.
+  { reason: 'auth_misconfigured', recoverable: false, patterns: [/auth preflight failed/i, /not in the allowlist \[/i, /git credential manager/i] },
   { reason: 'tests_failed', recoverable: false, patterns: [/tests? failed/i, /test suite failed/i, /\d+ failing/i] },
   { reason: 'merge_conflict', recoverable: false, patterns: [/merge conflict/i, /conflict markers/i, /automatic merge failed/i] },
   { reason: 'repo_not_found', recoverable: false, patterns: [/repository not found/i, /could not read from remote repository/i] },

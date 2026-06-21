@@ -1,6 +1,7 @@
 import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
+import { assertRepoAllowed, resolveRepoAllowlist, repoAllowlistEnabled } from './repo-policy.js'
 
 export function resolveWorkspacePath(workspaceKey: string, workspaceRoot: string): string {
   fs.mkdirSync(workspaceRoot, { recursive: true })
@@ -60,6 +61,17 @@ export function assertCleanRepoUrl(repoUrl: string): void {
   }
 }
 
+/**
+ * Reject a repoUrl that is not on the active allowlist (PR C1). Called AFTER
+ * assertCleanRepoUrl so a token-bearing URL surfaces as RepoUrlCredentialsError,
+ * not RepoNotAllowedError. No-op when enforcement is disabled. Local filesystem
+ * paths are not remotes and are never rejected (see repo-policy).
+ */
+export function enforceRepoAllowlist(repoUrl: string): void {
+  if (!repoAllowlistEnabled()) return
+  assertRepoAllowed(repoUrl, resolveRepoAllowlist())
+}
+
 /** Strip a trailing slash and an optional trailing ".git" so equivalent repo
  * URLs (with/without ".git", with/without a trailing slash) compare equal. */
 export function normalizeRepoUrl(url: string): string {
@@ -76,7 +88,7 @@ function suggestedFixes(repoUrl: string, workspacePath: string, existingOrigin?:
   ].join('\n')
 }
 
-function readOriginUrl(workspacePath: string): string | undefined {
+export function readOriginUrl(workspacePath: string): string | undefined {
   try {
     return execSync('git remote get-url origin', {
       cwd: workspacePath,
@@ -99,6 +111,7 @@ function readOriginUrl(workspacePath: string): string | undefined {
  */
 export function checkWorkspaceRepoMatch(workspacePath: string, repoUrl: string): void {
   assertCleanRepoUrl(repoUrl)
+  enforceRepoAllowlist(repoUrl)
 
   const entries = fs.readdirSync(workspacePath)
   if (entries.length === 0) return
@@ -126,6 +139,7 @@ export function checkWorkspaceRepoMatch(workspacePath: string, repoUrl: string):
 
 export function cloneIfEmpty(workspacePath: string, repoUrl: string, branch?: string): void {
   assertCleanRepoUrl(repoUrl)
+  enforceRepoAllowlist(repoUrl)
   checkWorkspaceRepoMatch(workspacePath, repoUrl)
 
   const entries = fs.readdirSync(workspacePath)
