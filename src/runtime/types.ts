@@ -32,6 +32,11 @@ export type NonRecoverableReason =
   // agent on this node shares the same broken credential path, so switching
   // would not help — and we must never fall back to a wrong-auth push.
   | 'auth_misconfigured'
+  // The requested repo (or a stale workspace's origin) is not an allowlisted
+  // remote, or carries embedded credentials (PR C1 repo gate). Non-recoverable:
+  // it is a binding/config problem, not an agent problem — switching agents
+  // would just point the next one at the same unsafe repo.
+  | 'repo_not_allowed'
 
 export type FailureReason = RecoverableReason | NonRecoverableReason | 'unknown'
 

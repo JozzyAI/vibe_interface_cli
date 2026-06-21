@@ -13,7 +13,8 @@ import fs from 'fs'
 import { appendEvent } from '../../events.js'
 import { readRun, updateRun } from '../../store.js'
 import { redact } from '../../redact.js'
-import { cloneIfEmpty, WorkspaceRepoMismatchError } from '../../workspace.js'
+import { cloneIfEmpty, WorkspaceRepoMismatchError, RepoUrlCredentialsError } from '../../workspace.js'
+import { RepoNotAllowedError } from '../../repo-policy.js'
 import { detectPrUrl, createPrUrlTracker } from '../../pr-detect.js'
 import { buildAgentEnv } from '../agent-env.js'
 import type { RunRecord } from '../../types.js'
@@ -79,9 +80,14 @@ export async function execAgent(record: RunRecord, ctx: AgentAdapterContext, opt
     try {
       cloneIfEmpty(record.workspace_path, record.repo_url, record.branch)
     } catch (err) {
-      const isMismatch = err instanceof WorkspaceRepoMismatchError
-      const message = isMismatch ? err.message : `clone failed: ${(err as Error).message}`
-      return diagnosticError(message, isMismatch ? err.code : undefined)
+      // Workspace/repo-binding errors carry a structured code and a token-free
+      // message; pass those through verbatim. Anything else is a real clone failure.
+      const known =
+        err instanceof WorkspaceRepoMismatchError ||
+        err instanceof RepoUrlCredentialsError ||
+        err instanceof RepoNotAllowedError
+      const message = known ? (err as Error).message : `clone failed: ${(err as Error).message}`
+      return diagnosticError(message, known ? (err as { code: string }).code : undefined)
     }
   }
 

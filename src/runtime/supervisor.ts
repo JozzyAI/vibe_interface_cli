@@ -21,6 +21,19 @@ import { classifyFailure } from './classify.js'
 import { resolveAgentPolicy } from './policy.js'
 import { writeHandoff, handoffPath } from './handoff.js'
 import { preflightGithubAuth, preauthEnabled } from './preauth.js'
+import {
+  assertCleanRepoUrl,
+  checkWorkspaceRepoMatch,
+  readOriginUrl,
+  RepoUrlCredentialsError,
+  WorkspaceRepoMismatchError,
+} from '../workspace.js'
+import {
+  assertRepoAllowed,
+  resolveRepoAllowlist,
+  repoAllowlistEnabled,
+  RepoNotAllowedError,
+} from '../repo-policy.js'
 import type { AgentAdapter, AgentAdapterContext, AgentOutcome, FailureReason } from './types.js'
 import { mockAdapter } from './adapters/mock.js'
 import { claudeAdapter } from './adapters/claude.js'
@@ -40,6 +53,59 @@ function shouldPreauth(record: RunRecord, chain: AgentBackend[]): boolean {
   if (!preauthEnabled()) return false
   if (!record.repo_url || !/github\.com/i.test(record.repo_url)) return false
   return chain.some((a) => a === 'claude-code' || a === 'codex')
+}
+
+/** Whether to run the repo allowlist/remote gate: only when enforcement is on,
+ *  the run targets a github.com remote, and a real (pushing) agent is in the
+ *  chain. Mock-only chains never push, so they are exempt. */
+export function shouldRepoGate(record: RunRecord, chain: AgentBackend[]): boolean {
+  if (!repoAllowlistEnabled()) return false
+  if (!record.repo_url || !/github\.com/i.test(record.repo_url)) return false
+  return chain.some((a) => a === 'claude-code' || a === 'codex')
+}
+
+export interface RepoGateResult {
+  ok: boolean
+  code?: string
+  reason?: FailureReason
+  message?: string
+}
+
+/**
+ * Fail-closed repo gate run before a real pushing agent launches. Verifies the
+ * requested repo_url is clean + allowlisted, and (when the workspace already has
+ * a checkout) that its origin remote matches, is clean, and is allowlisted. No
+ * fallback for any of these — they are binding/config problems, and no token ever
+ * appears in the returned message.
+ */
+export function runRepoGate(repoUrl: string, workspacePath: string): RepoGateResult {
+  const allowlist = resolveRepoAllowlist()
+  try {
+    // Requested repo: token-bearing first (precise error), then allowlist.
+    assertCleanRepoUrl(repoUrl)
+    assertRepoAllowed(repoUrl, allowlist)
+
+    // Stale-workspace defense: if a checkout already exists, its origin must be
+    // clean, allowlisted, and match the requested repo (no wrong/stale remote).
+    const origin = readOriginUrl(workspacePath)
+    if (origin) {
+      assertCleanRepoUrl(origin)
+      assertRepoAllowed(origin, allowlist)
+    }
+    checkWorkspaceRepoMatch(workspacePath, repoUrl)
+  } catch (err) {
+    if (err instanceof RepoUrlCredentialsError) {
+      return { ok: false, code: err.code, reason: 'repo_not_allowed', message: err.message }
+    }
+    if (err instanceof RepoNotAllowedError) {
+      return { ok: false, code: err.code, reason: 'repo_not_allowed', message: err.message }
+    }
+    if (err instanceof WorkspaceRepoMismatchError) {
+      return { ok: false, code: err.code, reason: 'unknown_repo', message: err.message }
+    }
+    return { ok: false, code: 'repo_gate_error', reason: 'repo_not_allowed', message: `repo gate failed: ${(err as Error).message}` }
+  }
+  return { ok: true }
 }
 
 /** Compose `handoff + --- + original prompt` to a deterministic file the fallback adapter reads. */
@@ -82,6 +148,25 @@ export async function runSupervisor(run_id: string): Promise<void> {
       updateRun(run_id, {
         status: 'failed', started_agent: startedAgent, final_agent: startedAgent,
         switched: false, failure_reason: 'auth_misconfigured', recoverable: false,
+        child_pid: undefined,
+      })
+      appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+      return
+    }
+  }
+
+  // ── Fail-closed repo allowlist / remote gate ────────────────────────────────
+  // Before a real pushing agent runs against a github.com remote, confirm the
+  // requested repo and any existing workspace origin are clean (no token),
+  // allowlisted, and consistent — so an agent can never be pointed at the wrong
+  // or non-JozzyAI repo. Fail before any agent runs; not recoverable → no fallback.
+  if (shouldRepoGate(initial, chain)) {
+    const gate = runRepoGate(initial.repo_url as string, initial.workspace_path)
+    if (!gate.ok) {
+      appendEvent({ type: 'error', run_id, session_id, message: gate.message as string, code: gate.code, ts: ts() })
+      updateRun(run_id, {
+        status: 'failed', started_agent: startedAgent, final_agent: startedAgent,
+        switched: false, failure_reason: gate.reason, recoverable: false,
         child_pid: undefined,
       })
       appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })

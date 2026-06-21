@@ -6,7 +6,8 @@ import { execSync } from 'child_process'
 import { resolveConfig } from '../config.js'
 import { generateRunId, readRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
-import { resolveWorkspacePath, ensureWorkspace, cloneIfEmpty, WorkspaceRepoMismatchError } from '../workspace.js'
+import { resolveWorkspacePath, ensureWorkspace, cloneIfEmpty, WorkspaceRepoMismatchError, RepoUrlCredentialsError } from '../workspace.js'
+import { RepoNotAllowedError } from '../repo-policy.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { codexBackend } from '../backends/codex.js'
@@ -94,10 +95,16 @@ export async function startRun(opts: StartRunOpts): Promise<RunRecord> {
     try {
       cloneIfEmpty(workspacePath, opts.repoUrl, opts.branch)
     } catch (err) {
-      const isMismatch = err instanceof WorkspaceRepoMismatchError
-      const message = isMismatch ? err.message : `clone failed: ${(err as Error).message}`
+      // Structured workspace/repo-binding errors (mismatch, token-in-URL,
+      // not-allowlisted) carry a code and a token-free message; surface those.
+      const known =
+        err instanceof WorkspaceRepoMismatchError ||
+        err instanceof RepoUrlCredentialsError ||
+        err instanceof RepoNotAllowedError
+      const message = known ? (err as Error).message : `clone failed: ${(err as Error).message}`
+      const code = known ? (err as { code: string }).code : undefined
       const ts = new Date().toISOString()
-      appendEvent({ type: 'error', run_id, message, ...(isMismatch && { code: err.code }), ts })
+      appendEvent({ type: 'error', run_id, message, ...(code && { code }), ts })
       appendEvent({ type: 'status', run_id, status: 'failed', ts })
       return updateRun(run_id, { status: 'failed' })
     }
