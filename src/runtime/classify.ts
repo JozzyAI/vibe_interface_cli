@@ -26,6 +26,10 @@ const RULES: Rule[] = [
   { reason: 'auth_expired', recoverable: true, patterns: [/all credential paths are exhausted/i, /authentication (?:failed|expired|required)/i, /\b401\b/, /invalid api key/i, /not (?:logged in|authenticated)/i] },
 
   // ── Non-recoverable: the work or repo is the problem ──────────────────────
+  // Controlled-auth misconfiguration (preflight, or a wrong-account push). Listed
+  // before permission_denied so a clear auth-misconfig signal is tagged precisely.
+  // Never recoverable: switching agents shares the same broken credential path.
+  { reason: 'auth_misconfigured', recoverable: false, patterns: [/auth preflight failed/i, /not in the allowlist/i, /git credential manager/i] },
   { reason: 'tests_failed', recoverable: false, patterns: [/tests? failed/i, /test suite failed/i, /\d+ failing/i] },
   { reason: 'merge_conflict', recoverable: false, patterns: [/merge conflict/i, /conflict markers/i, /automatic merge failed/i] },
   { reason: 'repo_not_found', recoverable: false, patterns: [/repository not found/i, /could not read from remote repository/i] },

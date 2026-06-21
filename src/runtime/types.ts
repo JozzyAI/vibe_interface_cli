@@ -27,6 +27,11 @@ export type NonRecoverableReason =
   | 'permission_denied'
   | 'unknown_repo'
   | 'invalid_task'
+  // The controlled GitHub auth path did not resolve to an allowlisted account
+  // (e.g. the Windows GCM / personal-account fallback). Non-recoverable: every
+  // agent on this node shares the same broken credential path, so switching
+  // would not help — and we must never fall back to a wrong-auth push.
+  | 'auth_misconfigured'
 
 export type FailureReason = RecoverableReason | NonRecoverableReason | 'unknown'
 
