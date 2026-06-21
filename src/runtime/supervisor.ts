@@ -20,6 +20,7 @@ import type { AgentBackend, RunRecord } from '../types.js'
 import { classifyFailure } from './classify.js'
 import { resolveAgentPolicy } from './policy.js'
 import { writeHandoff, handoffPath } from './handoff.js'
+import { preflightGithubAuth, preauthEnabled } from './preauth.js'
 import type { AgentAdapter, AgentAdapterContext, AgentOutcome, FailureReason } from './types.js'
 import { mockAdapter } from './adapters/mock.js'
 import { claudeAdapter } from './adapters/claude.js'
@@ -30,6 +31,15 @@ const ADAPTERS: Record<AgentBackend, AgentAdapter | undefined> = {
   'claude-code': claudeAdapter,
   codex: codexAdapter,
   opencode: undefined,
+}
+
+/** Whether to run the github.com auth preflight: only when enabled, the run
+ *  targets a github.com remote, and a real (pushing) agent is in the chain.
+ *  The mock agent never pushes, so a mock-only chain is exempt. */
+function shouldPreauth(record: RunRecord, chain: AgentBackend[]): boolean {
+  if (!preauthEnabled()) return false
+  if (!record.repo_url || !/github\.com/i.test(record.repo_url)) return false
+  return chain.some((a) => a === 'claude-code' || a === 'codex')
 }
 
 /** Compose `handoff + --- + original prompt` to a deterministic file the fallback adapter reads. */
@@ -57,6 +67,27 @@ export async function runSupervisor(run_id: string): Promise<void> {
 
   // Agents to try, in order: primary then each fallback.
   const chain: AgentBackend[] = [policy.primary, ...policy.fallbacks]
+
+  // ── Fail-closed GitHub auth preflight ──────────────────────────────────────
+  // Before a real (pushing) agent runs against a github.com remote, confirm the
+  // controlled credential path resolves to an allowlisted account, not the
+  // Windows GCM / personal-account fallback (JOZ-32). Fail before any agent runs
+  // so nothing is ever pushed under the wrong identity. Not recoverable → no
+  // fallback for a wrong-auth node misconfiguration.
+  if (shouldPreauth(initial, chain)) {
+    const pre = preflightGithubAuth()
+    if (!pre.ok) {
+      const message = `auth preflight failed: ${pre.reason}`
+      appendEvent({ type: 'error', run_id, session_id, message, code: 'auth_misconfigured', ts: ts() })
+      updateRun(run_id, {
+        status: 'failed', started_agent: startedAgent, final_agent: startedAgent,
+        switched: false, failure_reason: 'auth_misconfigured', recoverable: false,
+        child_pid: undefined,
+      })
+      appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+      return
+    }
+  }
 
   let ctx: AgentAdapterContext = {}
   let switched = false

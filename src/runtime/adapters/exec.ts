@@ -15,6 +15,7 @@ import { readRun, updateRun } from '../../store.js'
 import { redact } from '../../redact.js'
 import { cloneIfEmpty, WorkspaceRepoMismatchError } from '../../workspace.js'
 import { detectPrUrl, createPrUrlTracker } from '../../pr-detect.js'
+import { buildAgentEnv } from '../agent-env.js'
 import type { RunRecord } from '../../types.js'
 import type { AgentOutcome, AgentAdapterContext } from '../types.js'
 
@@ -92,10 +93,14 @@ export async function execAgent(record: RunRecord, ctx: AgentAdapterContext, opt
     pr: (url) => { if (isNewPrUrl(url)) appendEvent({ type: 'pr_created', run_id, session_id, url, ts: ts() }) },
   }
 
+  // Hardened env so the agent's git uses WSL git + the controlled gh credential
+  // helper (JozzyAI) and can never fall through to the Windows GCM / personal
+  // account path (the JOZ-32 root cause the real-agent canary reproduced).
   const child = spawn(options.binary, options.buildArgs(record), {
     cwd: record.workspace_path,
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: true,
+    env: buildAgentEnv(process.env),
   })
 
   let childStarted = false
