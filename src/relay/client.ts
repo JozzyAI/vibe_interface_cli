@@ -807,42 +807,136 @@ export async function remoteRunStart(
   })
 }
 
+/** Observable stream-lifecycle events (test hook; no-op in production). */
+export type StreamConnEvent =
+  | 'connecting' | 'subscribed' | 'closed' | 'reconnect_scheduled' | 'gave_up'
+
+/** Optional controls for {@link remoteStream}; defaults preserve production behaviour. */
+export interface RemoteStreamControl {
+  /** Stop the stream/reconnect loop programmatically (used instead of process signals). */
+  signal?: AbortSignal
+  /** Reconnect backoff base/cap in ms (defaults 1000 / 30000). */
+  backoffBaseMs?: number
+  backoffCapMs?: number
+  /** Max reconnect attempts after an unexpected close before giving up (default 6). */
+  maxReconnects?: number
+  /** WS keep-alive ping interval in ms (default 15000). A missed pong terminates the
+   *  socket so a half-open connection reconnects instead of hanging silently. */
+  pingMs?: number
+  /** Lifecycle observer (test hook). */
+  onEvent?: (ev: StreamConnEvent) => void
+}
+
+/** Outcome of a single subscriber connection attempt. */
+type StreamOutcome =
+  | { kind: 'terminal' }              // a terminal status event was printed → done
+  | { kind: 'closed' }               // socket closed/errored before terminal → reconnect
+  | { kind: 'fatal'; reason: string } // relay_error / 401 → do not reconnect
+
 /**
  * Connect to relay, subscribe to a run's event stream, print each event as JSONL to stdout.
- * Exits when a terminal event is received or the relay closes the connection.
+ * Resolves when a terminal event is received.
  *
  * For encrypted runs (started with --encrypt), reads the event AES key from the local
  * run record (written by remoteRunStart), decrypts each encrypted_run_event, and prints
  * the same VibeEvent JSONL schema as plaintext runs.
  *
- * Note: the relay does not buffer past events. Subscribing after some events have already
- * been forwarded will miss those events. Callers should subscribe immediately after run_start.
+ * Robustness (fixes the JOZ-37 false-stall class):
+ *  - A broken downstream pipe (consumer gone → EPIPE/backpressure on stdout) is handled,
+ *    not left as an unhandled `'error'` that crashes the process mid-stream.
+ *  - An unexpected WebSocket close/error BEFORE a terminal event no longer ends the stream
+ *    silently. The subscriber reconnects and re-subscribes with capped exponential backoff
+ *    (the relay does not buffer past events, but live events resume — keeping the caller's
+ *    activity watchdog fed). A WS keep-alive ping detects half-open sockets.
+ *  - If the stream truly cannot be re-established (reconnects exhausted), an explicit
+ *    structured terminal (`error` code=stream_disconnected + `status:failed`) is emitted so
+ *    the caller (Symphony) sees a clear failure reason instead of silent inactivity.
+ *  - 401 / relay_error are fatal (no reconnect); the token is never logged.
  */
-export async function remoteStream(relay: string, token: string, runId: string): Promise<void> {
+export async function remoteStream(
+  relay: string,
+  token: string,
+  runId: string,
+  control?: RemoteStreamControl,
+): Promise<void> {
   // Read event AES key from local run record (set during run_start --encrypt, if applicable).
   const localRecord = tryReadRun(runId)
   const eventAesKey = localRecord?.event_aes_key
+  const emit = (ev: StreamConnEvent): void => control?.onEvent?.(ev)
 
-  return new Promise<void>((resolve, reject) => {
+  // ── stdout pipe guard ───────────────────────────────────────────────────────
+  // If the downstream consumer (e.g. Symphony's port) closes, Node emits an
+  // async 'error' (EPIPE) on stdout. Without a listener that crashes the whole
+  // process — exactly the kind of silent stream death we are fixing. Catch it,
+  // stop streaming (there is no one left to forward to), and exit cleanly.
+  let finished = false
+  let stopped = false
+  let activeWs: WebSocket | null = null
+  const onStdoutError = (): void => {
+    stopped = true
+    finished = true
+    try { activeWs?.close() } catch { /* ignore */ }
+  }
+  process.stdout.on('error', onStdoutError)
+
+  const safeWrite = (line: string): void => {
+    if (finished || stopped) return
+    try { process.stdout.write(line) } catch { /* downstream gone; onStdoutError handles it */ }
+  }
+  /** Print one event; returns true if it was terminal. */
+  const printEvent = (event: RunEvent): boolean => {
+    safeWrite(JSON.stringify(event) + '\n')
+    return isTerminal(event)
+  }
+
+  // ── shutdown plumbing (abortable for tests) ─────────────────────────────────
+  if (control?.signal) {
+    if (control.signal.aborted) { stopped = true }
+    else control.signal.addEventListener('abort', () => {
+      stopped = true
+      try { activeWs?.close() } catch { /* ignore */ }
+    }, { once: true })
+  }
+
+  const pingMs = control?.pingMs ?? 15_000
+
+  const connectOnce = (): Promise<StreamOutcome> => new Promise<StreamOutcome>((resolve) => {
+    emit('connecting')
     const ws = new WebSocket(relayUrl(relay, token))
+    activeWs = ws
+    let settled = false
+    let hb: ReturnType<typeof setInterval> | null = null
+    let alive = true
+    const finish = (outcome: StreamOutcome): void => {
+      if (settled) return
+      settled = true
+      if (hb) clearInterval(hb)
+      resolve(outcome)
+    }
 
     ws.on('open', () => {
+      emit('subscribed')
       sendMsg(ws, {
         version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
         type: 'run_stream_subscribe', run_id: runId,
       })
+      // Keep-alive: a half-open socket never fires 'close'. If the previous ping
+      // went unanswered, terminate so the reconnect loop takes over.
+      hb = setInterval(() => {
+        if (!alive) { try { ws.terminate() } catch { /* ignore */ } ; return }
+        alive = false
+        try { ws.ping() } catch { /* ignore */ }
+      }, pingMs)
     })
+    ws.on('pong', () => { alive = true })
 
     ws.on('message', (raw) => {
+      alive = true // any inbound traffic proves liveness
       try {
         const msg = JSON.parse(raw.toString()) as RelayMessage
         if (msg.type === 'run_event' && msg.run_id === runId) {
           // Plaintext event (unencrypted run)
-          process.stdout.write(JSON.stringify(msg.event) + '\n')
-          if (isTerminal(msg.event)) {
-            ws.close()
-            resolve()
-          }
+          if (printEvent(msg.event)) { try { ws.close() } catch { /* ignore */ } ; finish({ kind: 'terminal' }) }
         } else if ((msg as { type?: string }).type === 'encrypted_run_event'
                    && (msg as { run_id?: string }).run_id === runId) {
           // MVP 4C: encrypted event — decrypt and print the same VibeEvent schema
@@ -853,25 +947,72 @@ export async function remoteStream(relay: string, token: string, runId: string):
           }
           try {
             const event = decryptEvent(eventAesKey, { nonce: enc.nonce, ciphertext: enc.ciphertext }) as RunEvent
-            process.stdout.write(JSON.stringify(event) + '\n')
-            if (isTerminal(event)) {
-              ws.close()
-              resolve()
-            }
+            if (printEvent(event)) { try { ws.close() } catch { /* ignore */ } ; finish({ kind: 'terminal' }) }
           } catch (err) {
             process.stderr.write(`[vibe] failed to decrypt event: ${(err as Error).message}\n`)
           }
         } else if (msg.type === 'relay_error') {
-          ws.terminate()
-          reject(new Error(`${msg.code}: ${msg.message}`))
+          try { ws.terminate() } catch { /* ignore */ }
+          finish({ kind: 'fatal', reason: `${msg.code}: ${msg.message}` })
         }
         // run_stream_subscribe_ack is silently accepted — no action needed
-      } catch {}
+      } catch { /* ignore malformed frame */ }
     })
 
-    ws.on('close', () => resolve())
-    ws.on('error', (err) => reject(err))
+    // A 401 at the WS handshake is a definite auth failure — do not reconnect.
+    ws.on('unexpected-response', (_req, res) => {
+      if (res.statusCode === 401) {
+        process.stderr.write('[vibe] relay rejected stream: 401 unauthorized — check VIBE_RELAY_TOKEN [token REDACTED]\n')
+        try { ws.terminate() } catch { /* ignore */ }
+        finish({ kind: 'fatal', reason: 'relay returned 401 unauthorized (check token)' })
+      }
+      // other unexpected responses fall through to 'error'/'close' (transient → reconnect)
+    })
+
+    ws.on('close', () => { emit('closed'); finish({ kind: 'closed' }) })
+    // Transient transport error → treat as a close and reconnect; never reject silently.
+    ws.on('error', () => { finish({ kind: 'closed' }) })
   })
+
+  try {
+    let attempt = 0
+    const maxReconnects = control?.maxReconnects ?? 6
+    let lastReason = 'relay event stream closed before a terminal status'
+
+    while (!stopped) {
+      const outcome = await connectOnce()
+      activeWs = null
+      if (outcome.kind === 'terminal') { finished = true; return }
+      if (stopped) return
+      if (outcome.kind === 'fatal') { lastReason = outcome.reason; break }
+
+      // closed without terminal → reconnect with capped backoff, bounded attempts
+      if (attempt >= maxReconnects) {
+        lastReason = `relay event stream closed before a terminal status (gave up after ${attempt} reconnect attempt(s))`
+        break
+      }
+      const delay = nextBackoffMs(attempt, { baseMs: control?.backoffBaseMs, capMs: control?.backoffCapMs })
+      attempt++
+      emit('reconnect_scheduled')
+      process.stderr.write(`[vibe] event stream closed — reconnecting in ${delay}ms (attempt ${attempt}/${maxReconnects})\n`)
+      await sleep(delay, control?.signal)
+    }
+
+    if (stopped) return
+
+    // Give up: emit an explicit, structured terminal so the caller gets a clear
+    // failure instead of silent inactivity. Never silently stop forwarding.
+    emit('gave_up')
+    const ts = t()
+    safeWrite(JSON.stringify({
+      run_id: runId, ts, type: 'error', code: 'stream_disconnected',
+      message: `${lastReason} — the run may still be active on the node`,
+    } satisfies RunEvent) + '\n')
+    safeWrite(JSON.stringify({ run_id: runId, ts, type: 'status', status: 'failed' } satisfies RunEvent) + '\n')
+    finished = true
+  } finally {
+    process.stdout.removeListener('error', onStdoutError)
+  }
 }
 
 export interface PairedRelayRecord {
