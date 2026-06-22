@@ -154,8 +154,31 @@ export function registerSymphonyCommand(program: Command): void {
   sym
     .command('status <run_id>')
     .description('get current status of a Symphony run')
+    .option('--relay <url>', 'relay WebSocket URL: query the owning node for authoritative remote status')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
-    .action((run_id: string) => {
+    .action(async (run_id: string, opts) => {
+      if (opts.relay) {
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        let token: string
+        try {
+          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        try {
+          const { remoteRunStatus } = await import('../relay/client.js')
+          const record = await remoteRunStatus(opts.relay as string, token, run_id)
+          process.stdout.write(JSON.stringify(record) + '\n')
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        return
+      }
       const record = readRun(run_id)
       process.stdout.write(JSON.stringify(record) + '\n')
     })
