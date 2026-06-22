@@ -16,7 +16,7 @@ import { codexBackend } from '../backends/codex.js'
 import { resolveAgents } from '../agent-registry.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
-import type { RelayMessage, RunStartMsg, RunStopRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
+import type { RelayMessage, RunStartMsg, RunStopRequestMsg, RunStatusRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
 import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, deriveApprovalKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
 import { nextBackoffMs, sleep } from './reconnect.js'
@@ -454,6 +454,17 @@ export async function relayNodeDaemon(
               error: err.message, code: 'internal_error',
             })
           })
+        } else if (msg.type === 'run_status_request') {
+          const reqId = msg.req_id
+          const runId = msg.run_id
+          handleRunStatus(ws, nodeId, msg).catch((err: Error) => {
+            process.stderr.write(`[vibe-node] run_status error: ${err.message}\n`)
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+              type: 'run_status_ack', req_id: reqId, run_id: runId, ok: false,
+              error: err.message, code: 'internal_error',
+            })
+          })
         } else if (rawKind === 'encrypted' && (msg as { type?: string }).type === 'encrypted_approval_response') {
           const enc = msg as EncryptedApprovalResponseMsg
           handleEncryptedApprovalResponse(ws, nodeId, enc).catch((err: Error) => {
@@ -554,6 +565,30 @@ async function handleRunStop(ws: WebSocket, nodeId: string, msg: RunStopRequestM
       type: 'run_stop_ack', req_id: msg.req_id, run_id: msg.run_id, ...result,
     })
   }
+}
+
+/**
+ * Answer a non-destructive run_status_request from the node's authoritative
+ * local run record. Read-only: no process signals, no event/record mutation —
+ * safe to call repeatedly (e.g. from Symphony's stall watchdog) without any
+ * side effect on the run. The RunRecord carries only run metadata (status,
+ * pr_url, branch, etc.), never secrets.
+ */
+async function handleRunStatus(ws: WebSocket, nodeId: string, msg: RunStatusRequestMsg): Promise<void> {
+  const record = tryReadRun(msg.run_id)
+  if (!record) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_status_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+      error: `Run not found: ${msg.run_id}`, code: 'run_not_found',
+    })
+    return
+  }
+
+  sendMsg(ws, {
+    version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+    type: 'run_status_ack', req_id: msg.req_id, run_id: msg.run_id, ok: true, record,
+  })
 }
 
 /**
@@ -1189,6 +1224,66 @@ export async function remoteStop(relay: string, token: string, runId: string): P
     })
 
     ws.on('close', () => done(undefined, new Error('Relay connection closed before run_stop_ack')))
+    ws.on('error', (err) => done(undefined, err))
+  })
+}
+
+/**
+ * One-shot, read-only: connect to relay, send a run_status_request to the owning
+ * node, and return its authoritative RunRecord. Unlike `vibe symphony status`
+ * without --relay (which reads the *local* record and is stale for remote runs),
+ * this reflects the node's true run state — used by Symphony's stall watchdog to
+ * avoid false-parking a run that actually completed/failed. No side effects on
+ * the run. The relay/node never receive the token in the record; redaction in
+ * the node daemon already strips secrets from any persisted record.
+ */
+export async function remoteRunStatus(relay: string, token: string, runId: string): Promise<RunRecord> {
+  return new Promise<RunRecord>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+
+    let settled = false
+    const done = (record?: RunRecord, err?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      record ? resolve(record) : reject(err!)
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate()
+      done(undefined, new Error('Timeout waiting for run_status_ack from relay'))
+    }, 10_000)
+
+    ws.on('open', () => {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
+        type: 'run_status_request', req_id: reqId, run_id: runId,
+      })
+    })
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        const msgType = (msg as { type?: string }).type
+
+        if (msgType === 'run_status_ack' && (msg as { req_id?: string }).req_id === reqId) {
+          const ack = msg as import('./types.js').RunStatusAckMsg
+          ws.close()
+          if (ack.ok && ack.record) {
+            done(ack.record)
+          } else {
+            done(undefined, new Error(`${ack.code ?? 'status_failed'}: ${ack.error ?? 'unknown error'}`))
+          }
+        } else if (msgType === 'relay_error') {
+          const errMsg = msg as import('./types.js').RelayErrorMsg
+          ws.terminate()
+          reject(new Error(`${errMsg.code}: ${errMsg.message}`))
+        }
+      } catch {}
+    })
+
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before run_status_ack')))
     ws.on('error', (err) => done(undefined, err))
   })
 }
