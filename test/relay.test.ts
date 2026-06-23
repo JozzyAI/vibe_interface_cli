@@ -1279,6 +1279,110 @@ test('vibe symphony stop --relay: returns stopped RunRecord', async () => {
   }
 })
 
+// ── node-authoritative run status over relay (stall reconciliation) ────────
+
+test('vibe symphony status --relay: returns authoritative completed RunRecord from node', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  const daemonProc = await spawnAndWaitForDaemon(server.port, 'sym-status-node')
+
+  try {
+    const record = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'sym-status-node',
+      { agent: 'mock', workspaceKey: 'sym-status-ws' },
+    )
+    assert.equal(record.status, 'running', 'run starts running')
+
+    // Wait until the node's authoritative local record reaches completed.
+    const runPath = path.join(os.homedir(), '.vibe', 'runs', `${record.run_id}.json`)
+    let completed = false
+    const deadline = Date.now() + 15000
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 600))
+      try {
+        const cur = JSON.parse(fs.readFileSync(runPath, 'utf8')) as RunRecord
+        if (cur.status === 'completed') { completed = true; break }
+      } catch {}
+    }
+    assert.ok(completed, 'node-local record reached completed')
+
+    // The remote status query must reflect the node's authoritative completed
+    // status (this is the JOZ-37 false-stall fix: --relay must NOT read the
+    // local controller record, which for a remote run would be stale).
+    const statusR = await vibeAsync([
+      'symphony', 'status', record.run_id,
+      '--relay', `ws://127.0.0.1:${server.port}`,
+      '--token', TEST_TOKEN,
+    ])
+    assert.equal(statusR.status, 0, `status stderr: ${statusR.stderr}`)
+    const remote = JSON.parse(statusR.stdout.trim()) as RunRecord
+    assert.equal(remote.run_id, record.run_id, 'run_id matches')
+    assert.equal(remote.status, 'completed', 'remote status is authoritative completed')
+    // No secret material in the returned record / output.
+    assert.ok(!statusR.stdout.includes(TEST_TOKEN), 'token not echoed in status output')
+  } finally {
+    daemonProc.kill('SIGTERM')
+    await new Promise((r) => setTimeout(r, 400))
+    await server.close()
+  }
+})
+
+test('remoteRunStatus: unknown run rejects with run_not_found', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    const { remoteRunStatus } = await import('../src/relay/client.js')
+    await assert.rejects(
+      remoteRunStatus(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'run_does_not_exist'),
+      /run_not_found/,
+      'unknown run surfaces run_not_found, not a silent stale record',
+    )
+  } finally {
+    await server.close()
+  }
+})
+
+test('remoteRunStatus: owning node offline rejects with node_offline', async () => {
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    // Fake node: register, ack a run_start (so relay records ownership), then drop.
+    const nodeWs = await connect(`ws://127.0.0.1:${server.port}?token=${TEST_TOKEN}`)
+    await registerNode(nodeWs, 'offline-status-node')
+    let knownRunId = ''
+    nodeWs.on('message', (raw: Buffer) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        if (msg.type === 'run_start') {
+          knownRunId = `run_off_${Date.now().toString(36)}`
+          send(nodeWs, {
+            version: 1, kind: 'plaintext', from: 'offline-status-node', to: 'relay', ts: now(),
+            type: 'run_start_ack', req_id: msg.req_id, ok: true,
+            record: {
+              run_id: knownRunId, session_id: '', node_id: 'offline-status-node',
+              node_selector: 'offline-status-node', agent: 'mock', status: 'queued',
+              workspace_path: '/tmp/off-ws', created_at: now(), updated_at: now(),
+            } as RunRecord,
+          })
+        }
+      } catch {}
+    })
+    const started = await remoteRunStart(
+      `ws://127.0.0.1:${server.port}`, TEST_TOKEN, 'offline-status-node', { agent: 'mock' },
+    )
+
+    // Node goes away; ownership persists on the relay → status must report node_offline.
+    nodeWs.terminate()
+    await new Promise((r) => setTimeout(r, 200))
+
+    const { remoteRunStatus } = await import('../src/relay/client.js')
+    await assert.rejects(
+      remoteRunStatus(`ws://127.0.0.1:${server.port}`, TEST_TOKEN, started.run_id),
+      /node_offline/,
+      'offline owner surfaces node_offline diagnostic',
+    )
+  } finally {
+    await server.close()
+  }
+})
+
 // ── existing local node behavior unchanged ─────────────────────────────────
 
 test('vibe node list (local, no --remote): unaffected by relay feature', () => {

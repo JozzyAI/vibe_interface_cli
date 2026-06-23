@@ -242,6 +242,15 @@ export interface RunStopRequestMsg extends RelayMsgBase {
   reason?: string
 }
 
+// Non-destructive, read-only status query. cli → relay → owning node daemon,
+// which answers from its authoritative local run record. Used by Symphony's
+// stall watchdog to confirm a run's real outcome before declaring it stalled.
+export interface RunStatusRequestMsg extends RelayMsgBase {
+  type: 'run_status_request'
+  req_id: string
+  run_id: string
+}
+
 // ── node daemon → relay → cli subscribers ─────────────────────────────────
 
 export interface RunEventMsg extends RelayMsgBase {
@@ -256,6 +265,16 @@ export interface RunStopAckMsg extends RelayMsgBase {
   run_id: string
   ok: boolean
   record?: RunRecord   // updated RunRecord (status: stopped) if ok=true
+  error?: string
+  code?: string
+}
+
+export interface RunStatusAckMsg extends RelayMsgBase {
+  type: 'run_status_ack'
+  req_id: string
+  run_id: string
+  ok: boolean
+  record?: RunRecord   // authoritative RunRecord from the owning node if ok=true
   error?: string
   code?: string
 }
@@ -314,6 +333,7 @@ export type RelayMessage =
   | RunStreamSubscribeMsg
   | RunStartMsg
   | RunStopRequestMsg
+  | RunStatusRequestMsg
   | RunEventMsg
   | NodeRegisterAckMsg
   | NodeHeartbeatAckMsg
@@ -321,4 +341,5 @@ export type RelayMessage =
   | RunStartAckMsg
   | RunStreamSubscribeAckMsg
   | RunStopAckMsg
+  | RunStatusAckMsg
   | RelayErrorMsg

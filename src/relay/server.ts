@@ -88,6 +88,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const pendingReqs = new Map<string, WebSocket>()
     // req_id → requester ws, for routing run_stop_ack back to CLI
     const pendingStops = new Map<string, WebSocket>()
+    // req_id → requester ws, for routing run_status_ack back to CLI
+    const pendingStatuses = new Map<string, WebSocket>()
     // req_id → requester ws, for routing approval_response_ack back to CLI
     const pendingApprovals = new Map<string, WebSocket>()
     // run_id → node_id, populated on run_start_ack ok=true for routing stop requests
@@ -410,6 +412,41 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             }
             break
           }
+
+          case 'run_status_request': {
+            pendingStatuses.set(msg.req_id, ws)
+            const ownerId = runOwnership.get(msg.run_id)
+            if (!ownerId) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'run_status_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+                error: `Run not found in relay: ${msg.run_id}`, code: 'run_not_found',
+              })
+              pendingStatuses.delete(msg.req_id)
+              break
+            }
+            const target = registry.get(ownerId)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'run_status_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false,
+                error: `Owning node is offline: ${ownerId}`, code: 'node_offline',
+              })
+              pendingStatuses.delete(msg.req_id)
+              break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+
+          case 'run_status_ack': {
+            const requester = pendingStatuses.get(msg.req_id)
+            if (requester) {
+              sendMsg(requester, msg)
+              pendingStatuses.delete(msg.req_id)
+            }
+            break
+          }
         }
       })
 
@@ -421,6 +458,9 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         }
         for (const [reqId, reqWs] of pendingStops) {
           if (reqWs === ws) pendingStops.delete(reqId)
+        }
+        for (const [reqId, reqWs] of pendingStatuses) {
+          if (reqWs === ws) pendingStatuses.delete(reqId)
         }
         for (const [reqId, reqWs] of pendingApprovals) {
           if (reqWs === ws) pendingApprovals.delete(reqId)
