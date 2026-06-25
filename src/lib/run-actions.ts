@@ -2,7 +2,7 @@
  * Shared run lifecycle actions used by both `vibe run` and `vibe symphony`.
  */
 import fs from 'fs'
-import { execSync } from 'child_process'
+import { spawnSync } from 'child_process'
 import { resolveConfig } from '../config.js'
 import { generateRunId, readRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
@@ -12,8 +12,22 @@ import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { codexBackend } from '../backends/codex.js'
 import { resolveNode } from '../nodes.js'
-import type { AgentBackend, PermissionMode, RunRecord } from '../types.js'
+import type { AgentBackend, PermissionMode, RunRecord, RunStatus } from '../types.js'
 import type { Backend } from '../backends/types.js'
+
+const TERMINAL_STATES: readonly RunStatus[] = ['completed', 'failed', 'stopped', 'cancelled']
+
+/** A run's session_id is a tmux session name (not a PID) when tmux-backed. */
+function isTmuxSessionName(session_id: string): boolean {
+  return Boolean(session_id) && !/^\d+$/.test(session_id)
+}
+
+/** True if `session_id` names a tmux session that currently exists. */
+function isLiveTmuxSession(session_id: string): boolean {
+  if (!isTmuxSessionName(session_id)) return false
+  const r = spawnSync('tmux', ['has-session', '-t', session_id], { stdio: 'ignore' })
+  return r.status === 0
+}
 
 export interface StartRunOpts {
   agent: AgentBackend
@@ -124,17 +138,21 @@ export async function startRun(opts: StartRunOpts): Promise<RunRecord> {
 export function stopRun(run_id: string): RunRecord {
   const record = readRun(run_id)
 
-  if (['completed', 'failed', 'stopped', 'cancelled'].includes(record.status)) {
+  if (TERMINAL_STATES.includes(record.status)) {
     process.stderr.write(`error: run ${run_id} is already in terminal state: ${record.status}\n`)
     process.exit(1)
   }
 
+  // session_id is either a numeric PID (detached process) or a tmux session
+  // name (tmux-backed run). Tear down whichever applies.
   if (record.session_id) {
-    const pid = parseInt(record.session_id, 10)
-    if (!isNaN(pid) && pid > 0) {
-      try { process.kill(pid, 'SIGTERM') } catch {}
+    if (isTmuxSessionName(record.session_id)) {
+      spawnSync('tmux', ['kill-session', '-t', record.session_id], { stdio: 'ignore' })
     } else {
-      try { execSync(`tmux kill-session -t ${record.session_id}`, { stdio: 'ignore' }) } catch {}
+      const pid = parseInt(record.session_id, 10)
+      if (!isNaN(pid) && pid > 0) {
+        try { process.kill(pid, 'SIGTERM') } catch {}
+      }
     }
   }
   if (record.child_pid) {
@@ -144,4 +162,44 @@ export function stopRun(run_id: string): RunRecord {
 
   appendEvent({ type: 'status', run_id, session_id: record.session_id, status: 'stopped', ts: new Date().toISOString() })
   return updateRun(run_id, { status: 'stopped' })
+}
+
+/** Structured outcome for `vibe run attach`. */
+export type AttachResult =
+  | { ok: true; run_id: string; session_id: string; mode: 'tmux'; tmux_session: string }
+  | { ok: false; run_id: string; status: RunStatus; code: 'session_not_found' | 'session_not_attachable'; message: string }
+
+/**
+ * Decide how to attach to a run's live session, without performing any
+ * interactive I/O (the caller does the actual `tmux attach`). Reads the run
+ * record (which exits 3 if the run does not exist).
+ *
+ *  - terminal run            → session_not_found (nothing live to attach to)
+ *  - active + live tmux       → ok: attach to the tmux session
+ *  - active + detached process → session_not_attachable (use `run stream`)
+ */
+export function resolveAttach(run_id: string): AttachResult {
+  const record = readRun(run_id)
+
+  if (TERMINAL_STATES.includes(record.status)) {
+    return {
+      ok: false,
+      run_id,
+      status: record.status,
+      code: 'session_not_found',
+      message: `run ${run_id} has no active session (status: ${record.status}); use \`vibe run status ${run_id}\` or \`vibe run stream ${run_id}\``,
+    }
+  }
+
+  if (isLiveTmuxSession(record.session_id)) {
+    return { ok: true, run_id, session_id: record.session_id, mode: 'tmux', tmux_session: record.session_id }
+  }
+
+  return {
+    ok: false,
+    run_id,
+    status: record.status,
+    code: 'session_not_attachable',
+    message: `run ${run_id} is active as a detached process (no tmux session); use \`vibe run stream ${run_id}\` to follow output, or start the run with VIBE_USE_TMUX=1 for an attachable tmux session`,
+  }
 }

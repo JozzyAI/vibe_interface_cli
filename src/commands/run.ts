@@ -1,7 +1,8 @@
 import type { Command } from 'commander'
+import { spawnSync } from 'child_process'
 import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
-import { startRun, stopRun } from '../lib/run-actions.js'
+import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
@@ -184,5 +185,40 @@ export function registerRunCommand(program: Command): void {
       }
       const updated = stopRun(run_id)
       process.stdout.write(JSON.stringify(updated) + '\n')
+    })
+
+  run
+    .command('attach <run_id>')
+    .description('attach to a local run\'s live tmux session (local runs only)')
+    .option('--json', 'print the attach decision as JSON instead of attaching interactively')
+    .action((run_id: string, opts) => {
+      const result = resolveAttach(run_id) // readRun inside exits 3 if the run is unknown
+      if (!result.ok) {
+        process.stdout.write(JSON.stringify({
+          error: true,
+          code: result.code,
+          run_id: result.run_id,
+          status: result.status,
+          message: result.message,
+          ts: new Date().toISOString(),
+        }) + '\n')
+        process.exit(1)
+      }
+
+      // A non-interactive caller (no TTY, or --json) can't host an interactive
+      // tmux client, so report how to attach instead of attaching.
+      if (opts.json || !process.stdout.isTTY) {
+        process.stdout.write(JSON.stringify({
+          run_id: result.run_id,
+          session_id: result.session_id,
+          mode: result.mode,
+          attach_command: `tmux attach -t ${result.tmux_session}`,
+          ts: new Date().toISOString(),
+        }) + '\n')
+        return
+      }
+
+      const r = spawnSync('tmux', ['attach', '-t', result.tmux_session], { stdio: 'inherit' })
+      process.exit(r.status ?? 0)
     })
 }
