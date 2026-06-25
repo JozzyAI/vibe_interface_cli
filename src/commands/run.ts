@@ -3,6 +3,7 @@ import { spawnSync } from 'child_process'
 import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
 import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
+import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer } from '../lib/run-web.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
@@ -220,5 +221,61 @@ export function registerRunCommand(program: Command): void {
 
       const r = spawnSync('tmux', ['attach', '-t', result.tmux_session], { stdio: 'inherit' })
       process.exit(r.status ?? 0)
+    })
+
+  run
+    .command('web <run_id>')
+    .description('serve a personal, local, read-only web viewer for a run (local tmux runs only)')
+    .option('--port <port>', 'port to bind (default: an ephemeral free port)', '0')
+    .option('--host <host>', 'host to bind (default: 127.0.0.1 — private)', '127.0.0.1')
+    .option('--allow-public-bind', 'permit binding a non-loopback host (exposes the session on the network)')
+    .option('--json', 'print the listening URL as JSON and keep serving')
+    .action(async (run_id: string, opts) => {
+      const fail = (code: string, message: string, extra: Record<string, unknown> = {}) => {
+        process.stdout.write(JSON.stringify({ error: true, code, run_id, message, ...extra, ts: new Date().toISOString() }) + '\n')
+        process.exit(1)
+      }
+
+      // 1. Refuse a public bind unless explicitly allowed.
+      const bind = validateBind(opts.host as string, Boolean(opts.allowPublicBind))
+      if (!bind.ok) fail(bind.code, bind.message)
+      if (!('ok' in bind) || !bind.ok) return
+      if (opts.allowPublicBind && !['127.0.0.1', 'localhost', '::1'].includes(opts.host)) {
+        process.stderr.write(`warning: binding ${opts.host} exposes this run's session on the network. The viewer is read-only, but anyone who can reach this host can watch it.\n`)
+      }
+
+      // 2. The viewer's only hard dependency is tmux.
+      if (!tmuxAvailable()) {
+        fail('web_viewer_dependency_missing', 'the web viewer requires tmux (tmux -V failed); install tmux or use `vibe run stream` instead')
+        return
+      }
+
+      // 3. Resolve the run to a live tmux session (readRun exits 3 if unknown).
+      const target = resolveWebTarget(run_id)
+      if (!target.ok) {
+        fail(target.code, target.message, { status: target.status })
+        return
+      }
+
+      // 4. Start the read-only server.
+      const port = Number.parseInt(opts.port as string, 10) || 0
+      let server
+      try {
+        server = await startViewerServer({ run_id, tmux_session: target.tmux_session, host: bind.host, port })
+      } catch (err) {
+        fail('web_viewer_start_failed', `failed to bind ${bind.host}:${port}: ${(err as Error).message}`)
+        return
+      }
+
+      const info = { run_id, session_id: target.tmux_session, url: server.url, host: server.host, port: server.port, mode: 'read-only', ts: new Date().toISOString() }
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(info) + '\n')
+      } else {
+        process.stdout.write(`vibe run web: read-only viewer for ${run_id} at ${server.url}  (Ctrl-C to stop)\n`)
+      }
+
+      const shutdown = () => { server!.close().finally(() => process.exit(0)) }
+      process.on('SIGINT', shutdown)
+      process.on('SIGTERM', shutdown)
     })
 }

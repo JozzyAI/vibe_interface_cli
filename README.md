@@ -170,6 +170,36 @@ back to the detached-process model.
 > `VIBE_MOCK_*`) onto the `tmux new-session` argv, so relay tokens and other secrets are never exposed
 > in process arguments.
 
+### Personal Local Web Viewer
+
+`vibe run web <run_id>` serves a **personal, local, read-only** browser view of a run's live session.
+It is intentionally minimal and private:
+
+- **Private by default:** binds `127.0.0.1` only. No relay, no public share links, no E2E capability
+  links. Binding a non-loopback host is refused unless you pass `--allow-public-bind` (which prints a
+  warning).
+- **Read-only:** only `GET` is served (any other method returns `405`); there is no keyboard/terminal
+  input and no shell is exposed. The single tmux interaction is the read-only `tmux capture-pane -p`.
+- **tmux-backed runs:** the run must have a live tmux session (start it with `VIBE_USE_TMUX=1`). A
+  detached-PID run returns a structured `session_not_web_attachable` (use `vibe run stream` instead);
+  an unknown run exits `3`; if tmux is not installed it returns `web_viewer_dependency_missing`.
+- **What it shows:** the live tmux pane when it has output, otherwise the run's redacted event log
+  (so structured-output agents like the mock runner are still visible). Output is passed through the
+  same secret-redaction as the event log before reaching the browser.
+- **Clean shutdown:** when the run stops, the viewer keeps serving and shows the session as ended.
+
+```
+vibe run web <run_id> [--port <port>] [--host 127.0.0.1] [--allow-public-bind] [--json]
+```
+
+```bash
+# Personal local viewer for a tmux-backed mock run
+VIBE_USE_TMUX=1 VIBE_MOCK_RUN_MS=20000 vibe run start --agent mock --workspace-key demo --json
+vibe run web <run_id> --port 7681          # then open http://127.0.0.1:7681
+vibe run web <run_id> --port 7681 --json   # prints { url, host, port, mode:"read-only", ... }
+vibe run stop <run_id>                     # viewer then shows the session as ended
+```
+
 ### Codex CLI setup
 
 **Install:**
