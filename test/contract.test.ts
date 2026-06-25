@@ -155,3 +155,54 @@ test('run stop stdout is valid JSON', () => {
   assert.equal(r.status, 0)
   JSON.parse(r.stdout.trim())
 })
+
+// ── run contract: exit_code / error on terminal outcomes ───────────────────
+
+test('completed run records exit_code: 0, no error', () => {
+  const start = vibe('run', 'start', '--agent', 'mock', '--workspace-key', uniqueKey('t'))
+  const { run_id } = JSON.parse(start.stdout.trim())
+
+  vibeTimeout('run', 'stream', run_id) // wait for terminal event
+
+  const r = vibe('run', 'status', run_id, '--json')
+  assert.equal(r.status, 0)
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.status, 'completed')
+  assert.equal(record.exit_code, 0)
+  assert.equal(record.error, undefined)
+})
+
+test('failed run records a non-zero exit_code and the human-readable error message', () => {
+  const start = spawnSync(NODE, [CLI, 'run', 'start', '--agent', 'mock', '--workspace-key', uniqueKey('t'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, VIBE_MOCK_FAIL_REASON: 'quota_exceeded' },
+  })
+  const { run_id } = JSON.parse(start.stdout.trim())
+
+  spawnSync(NODE, [CLI, 'run', 'stream', run_id], { encoding: 'utf8', timeout: 15000 }) // wait for terminal event
+
+  const r = vibe('run', 'status', run_id, '--json')
+  assert.equal(r.status, 0)
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.status, 'failed')
+  assert.equal(record.exit_code, 1)
+  assert.match(record.error, /quota exceeded/)
+  assert.equal(record.failure_reason, 'quota_exceeded')
+})
+
+test('command_not_found simulation: exit_code 127, classified recoverable', () => {
+  const start = spawnSync(NODE, [CLI, 'run', 'start', '--agent', 'mock', '--workspace-key', uniqueKey('t'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, VIBE_MOCK_FAIL_REASON: 'command_not_found' },
+  })
+  const { run_id } = JSON.parse(start.stdout.trim())
+
+  spawnSync(NODE, [CLI, 'run', 'stream', run_id], { encoding: 'utf8', timeout: 15000 })
+
+  const r = vibe('run', 'status', run_id, '--json')
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.status, 'failed')
+  assert.equal(record.exit_code, 127)
+  assert.equal(record.failure_reason, 'command_not_found')
+  assert.equal(record.recoverable, true)
+})

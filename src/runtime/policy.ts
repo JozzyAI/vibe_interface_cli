@@ -14,7 +14,7 @@ import { DEFAULT_SWITCH_ON, type AgentPolicy, type FailureReason } from './types
 const KNOWN_AGENTS: AgentBackend[] = ['mock', 'claude-code', 'codex', 'opencode']
 
 const KNOWN_REASONS: FailureReason[] = [
-  'session_limit', 'usage_limit', 'quota_exceeded', 'rate_limited', 'context_limit', 'auth_expired',
+  'session_limit', 'usage_limit', 'quota_exceeded', 'rate_limited', 'context_limit', 'auth_expired', 'command_not_found',
   'tests_failed', 'merge_conflict', 'repo_not_found', 'permission_denied', 'unknown_repo', 'invalid_task',
 ]
 

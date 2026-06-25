@@ -24,6 +24,10 @@ const RULES: Rule[] = [
   // auth_expired is recoverable (another backend may have valid auth) but is NOT in the
   // default switch set — see DEFAULT_SWITCH_ON. Must be opted in via --switch-on auth_expired.
   { reason: 'auth_expired', recoverable: true, patterns: [/all credential paths are exhausted/i, /authentication (?:failed|expired|required)/i, /\b401\b/, /invalid api key/i, /not (?:logged in|authenticated)/i] },
+  // Matches exec.ts's real spawn-ENOENT wording ("<label> CLI not found in PATH")
+  // as well as generic "command not found" / raw ENOENT text from a mock or any
+  // other adapter — a different agent's binary may exist, so this is recoverable.
+  { reason: 'command_not_found', recoverable: true, patterns: [/cli not found in path/i, /command not found/i, /\bENOENT\b/] },
 
   // ── Non-recoverable: the work or repo is the problem ──────────────────────
   // Repo gate / allowlist rejection (PR C1). Listed before auth_misconfigured so

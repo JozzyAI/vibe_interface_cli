@@ -35,6 +35,8 @@ export interface RunRecord {
   handoff_path?: string          // path to the handoff doc written on switch
   failure_reason?: string        // classified FailureReason on terminal failure
   recoverable?: boolean          // whether the terminal failure was classified recoverable
+  exit_code?: number             // process/adapter exit status on a terminal outcome (0 = completed; absent when the agent never produced one, e.g. a pre-spawn gate failure)
+  error?: string                 // human-readable terminal failure message (mirrors the adapter's diagnostic `error` event); absent on success
   event_aes_key?: string   // base64 AES-256 key for run_event decryption (HKDF 'vibe-run-event-v1'); stored locally
   stop_aes_key?: string     // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally
   approval_aes_key?: string // base64 AES-256 key for approval_response encryption (HKDF 'vibe-approval-response-v1')
@@ -148,6 +150,7 @@ export type VibeErrorCode =
   | 'read_only'
   | 'node_not_found'
   | 'agent_not_supported'
+  | 'no_runner_available'
 
 export interface VibeError {
   error: true
