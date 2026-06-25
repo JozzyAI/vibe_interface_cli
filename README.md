@@ -40,6 +40,7 @@ vibe run start  --agent <backend> --workspace-key <key> [--node auto|local|<id>]
 vibe run stream <run_id>
 vibe run status <run_id>
 vibe run stop   <run_id>
+vibe run attach <run_id>   # attach to a local run's live tmux session (see below)
 
 vibe symphony start  --issue-id <id> --agent <backend> [--node auto|local|<id>] [options]
 vibe symphony stream <run_id>
@@ -141,6 +142,33 @@ For exercising the run lifecycle without any real agent:
   missing — exit code 127, classified `command_not_found`, recoverable).
 - `VIBE_MOCK_RUN_MS=<ms>` — total time to a terminal outcome (default ~4.4s if unset). `0` completes
   immediately; a larger value is useful for testing "still running" / stop-mid-run behavior.
+
+### Local run sessions (`run attach`, optional tmux)
+
+A local run is backed by a detached supervisor process. Its `session_id` is a **stable reference**
+to that session, persisted in the run record:
+
+- **Default:** the supervisor is a plain detached process and `session_id` is its PID. Watch it with
+  `vibe run stream <run_id>`; terminal status stays readable via `vibe run status <run_id>` after exit.
+- **Opt-in tmux (`VIBE_USE_TMUX=1`):** the supervisor runs inside a tmux session named
+  `vibe-run-<run_id>`, and `session_id` is that name. You can then `vibe run attach <run_id>` to drop
+  into the live session and watch the runner directly. `vibe run stop` tears the tmux session down.
+
+```bash
+# Inspectable, attachable local mock run
+VIBE_USE_TMUX=1 VIBE_MOCK_RUN_MS=20000 vibe run start --agent mock --workspace-key demo --json
+vibe run attach <run_id>        # interactive: attaches to the vibe-run-<run_id> tmux session
+vibe run attach <run_id> --json # non-interactive: prints { mode, attach_command, ... }
+```
+
+`vibe run attach` returns a structured error rather than hanging when there is nothing to attach to:
+`session_not_found` for a finished run, `session_not_attachable` for an active run started without
+tmux (use `run stream` instead). tmux is optional — if it is not installed, runs transparently fall
+back to the detached-process model.
+
+> tmux env note: tmux-backed runs forward only a **non-secret** env allowlist (`VIBE_DIR`, `PATH`,
+> `VIBE_MOCK_*`) onto the `tmux new-session` argv, so relay tokens and other secrets are never exposed
+> in process arguments.
 
 ### Codex CLI setup
 
