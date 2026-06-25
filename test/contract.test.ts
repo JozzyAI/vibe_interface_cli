@@ -5,6 +5,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { fixturesFirstPath } from './helpers/agent-fixtures.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -16,6 +17,9 @@ const NODE = process.execPath
 // but spread ...process.env, so they inherit this too.
 const VIBE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-contract-'))
 process.env.VIBE_DIR = VIBE_DIR
+// Fixtures-first PATH so the claude-code contract test below spawns the FAKE
+// claude fixture, never a real (paid) claude install that may be on PATH.
+process.env.PATH = fixturesFirstPath()
 after(() => fs.rmSync(VIBE_DIR, { recursive: true, force: true }))
 
 function vibe(...args: string[]) {
@@ -60,7 +64,9 @@ test('run start rejects path traversal', () => {
 })
 
 test('run start claude-code: returns valid running RunRecord immediately', () => {
-  // claude-code now spawns a real runner; start itself always exits 0 with JSON
+  // claude-code spawns a detached runner; start itself always exits 0 with JSON.
+  // The fixtures-first PATH set at the top means this spawns the FAKE claude
+  // fixture, never a real (paid) claude.
   const r = vibe('run', 'start', '--agent', 'claude-code', '--workspace-key', uniqueKey('stub'))
   assert.equal(r.status, 0, `stderr: ${r.stderr}`)
   const record = JSON.parse(r.stdout.trim())
