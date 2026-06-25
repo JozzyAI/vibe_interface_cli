@@ -11,7 +11,7 @@ export function registerRunCommand(program: Command): void {
   run
     .command('start')
     .description('start a new run')
-    .option('--agent <backend>', 'agent backend (mock, claude-code, codex, opencode)', 'mock')
+    .option('--agent <backend>', 'agent backend (mock, claude-code, codex, opencode, auto — local runs only)', 'mock')
     .option('--fallback-agent <agents...>', 'fallback agent(s) to try on a recoverable failure (repeatable or comma-separated)')
     .option('--switch-on <reasons>', 'comma-separated failure reasons that trigger fallback (default: session_limit,usage_limit,quota_exceeded,rate_limited)')
     .option('--handoff-on-failure', 'write a handoff doc when switching agents (default: on)')
@@ -82,8 +82,26 @@ export function registerRunCommand(program: Command): void {
         return
       }
 
+      let localAgent: AgentBackend
+      if ((opts.agent as string) === 'auto') {
+        const { selectRunner, defaultAvailability } = await import('../runtime/router.js')
+        const picked = selectRunner('auto', defaultAvailability)
+        if (!picked.ok) {
+          process.stdout.write(JSON.stringify({
+            error: true,
+            code: picked.code,
+            message: picked.message,
+            ts: new Date().toISOString(),
+          }) + '\n')
+          process.exit(1)
+        }
+        localAgent = picked.agent
+      } else {
+        localAgent = opts.agent as AgentBackend
+      }
+
       const record = await startRun({
-        agent: opts.agent as AgentBackend,
+        agent: localAgent,
         node: nodeSelector,
         workspaceKey: opts.workspaceKey,
         repoUrl: opts.repoUrl,

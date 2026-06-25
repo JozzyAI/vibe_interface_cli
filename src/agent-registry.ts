@@ -1,6 +1,6 @@
 import { execSync } from 'child_process'
 
-function binaryExists(name: string): boolean {
+export function binaryExists(name: string): boolean {
   try {
     execSync(`which ${name}`, { stdio: 'ignore' })
     return true

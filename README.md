@@ -114,6 +114,33 @@ external:
 | `mock` | Internal fake runner. Emits synthetic events including `approval_required`. No network. |
 | `claude-code` | Spawns `claude` CLI in stream-json mode. Requires Claude Code installed. |
 | `codex` | Spawns `codex exec` non-interactively. Requires OpenAI Codex CLI + `VIBE_ENABLE_CODEX=1`. |
+| `opencode` | Reserved `AgentBackend` value; no adapter yet (`run start --agent opencode` fails fast — there is nothing to dispatch to). |
+
+### `--agent auto` (local runs only)
+
+`vibe run start --agent auto` picks a backend at start time instead of requiring one up front: it
+tries `claude-code` → `codex` → `opencode` → `mock`, in that order, and uses the first one whose CLI
+binary is actually on `PATH` (`mock` has no binary and is always available, so `auto` never fails to
+start something — see `src/runtime/router.ts`). This is independent of, and runs before, the
+Meta-Agent Runtime's mid-run `--fallback-agent` chain (below): the router picks what to *start*;
+the runtime decides whether to *switch* after a failure. `--agent auto` is not supported with
+`--relay` (remote dispatch) — pass an explicit backend there.
+
+> **Manual smoke tests: use `--agent mock`, not `--agent auto`.** On a machine where a real
+> `claude` / `codex` / `opencode` binary is on `PATH`, `auto` resolves to that real backend and
+> **spawns the real (paid) CLI**. For a local-only, no-cost smoke that exercises the full run
+> lifecycle, always pass `--agent mock` explicitly. Reserve `auto` for real work.
+
+### Mock runner test knobs
+
+For exercising the run lifecycle without any real agent:
+
+- `VIBE_MOCK_FAIL_REASON=<reason>` — fail with classifier-recognized text instead of completing.
+  Supported: `session_limit`, `usage_limit`, `quota_exceeded`, `rate_limited`, `context_limit`,
+  `auth_expired`, `tests_failed`, `command_not_found` (simulates the agent's CLI binary going
+  missing — exit code 127, classified `command_not_found`, recoverable).
+- `VIBE_MOCK_RUN_MS=<ms>` — total time to a terminal outcome (default ~4.4s if unset). `0` completes
+  immediately; a larger value is useful for testing "still running" / stop-mid-run behavior.
 
 ### Codex CLI setup
 

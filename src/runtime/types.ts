@@ -18,6 +18,12 @@ export type RecoverableReason =
   | 'rate_limited'
   | 'context_limit'
   | 'auth_expired'
+  // The configured agent's CLI binary is missing from PATH (real spawn ENOENT,
+  // or a mock simulating it). Recoverable: a different agent's binary may well
+  // exist, so a fallback is worth trying — unlike `auth_misconfigured` (below),
+  // this is not opted out of DEFAULT_SWITCH_ON for any reason, but is still not
+  // in it by default to keep existing callers byte-identical unless they opt in.
+  | 'command_not_found'
 
 /** Non-recoverable: switching agents would not help — the work or repo is the problem. */
 export type NonRecoverableReason =
@@ -83,6 +89,8 @@ export interface AgentOutcome {
   failureMessage?: string
   /** Bounded tail of the agent's stdout+stderr, used by the classifier. Never contains secrets (redacted upstream). */
   tailOutput?: string
+  /** Process/adapter exit status, when the adapter has one (e.g. a spawned CLI's real exit code, or a mock's simulated one). Projected onto the run record's `exit_code` on the terminal outcome. */
+  exitCode?: number
 }
 
 export interface AgentAdapterContext {

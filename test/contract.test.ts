@@ -1,12 +1,22 @@
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'child_process'
+import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
+
+// Isolate every run this suite creates into a throwaway VIBE_DIR so the
+// CLI children spawned below (which inherit process.env) never read or
+// write the real ~/.vibe. The two failure-path tests pass env explicitly
+// but spread ...process.env, so they inherit this too.
+const VIBE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-contract-'))
+process.env.VIBE_DIR = VIBE_DIR
+after(() => fs.rmSync(VIBE_DIR, { recursive: true, force: true }))
 
 function vibe(...args: string[]) {
   return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8' })
@@ -154,4 +164,55 @@ test('run stop stdout is valid JSON', () => {
   const r = vibe('run', 'stop', run_id)
   assert.equal(r.status, 0)
   JSON.parse(r.stdout.trim())
+})
+
+// ── run contract: exit_code / error on terminal outcomes ───────────────────
+
+test('completed run records exit_code: 0, no error', () => {
+  const start = vibe('run', 'start', '--agent', 'mock', '--workspace-key', uniqueKey('t'))
+  const { run_id } = JSON.parse(start.stdout.trim())
+
+  vibeTimeout('run', 'stream', run_id) // wait for terminal event
+
+  const r = vibe('run', 'status', run_id, '--json')
+  assert.equal(r.status, 0)
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.status, 'completed')
+  assert.equal(record.exit_code, 0)
+  assert.equal(record.error, undefined)
+})
+
+test('failed run records a non-zero exit_code and the human-readable error message', () => {
+  const start = spawnSync(NODE, [CLI, 'run', 'start', '--agent', 'mock', '--workspace-key', uniqueKey('t'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, VIBE_MOCK_FAIL_REASON: 'quota_exceeded' },
+  })
+  const { run_id } = JSON.parse(start.stdout.trim())
+
+  spawnSync(NODE, [CLI, 'run', 'stream', run_id], { encoding: 'utf8', timeout: 15000 }) // wait for terminal event
+
+  const r = vibe('run', 'status', run_id, '--json')
+  assert.equal(r.status, 0)
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.status, 'failed')
+  assert.equal(record.exit_code, 1)
+  assert.match(record.error, /quota exceeded/)
+  assert.equal(record.failure_reason, 'quota_exceeded')
+})
+
+test('command_not_found simulation: exit_code 127, classified recoverable', () => {
+  const start = spawnSync(NODE, [CLI, 'run', 'start', '--agent', 'mock', '--workspace-key', uniqueKey('t'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, VIBE_MOCK_FAIL_REASON: 'command_not_found' },
+  })
+  const { run_id } = JSON.parse(start.stdout.trim())
+
+  spawnSync(NODE, [CLI, 'run', 'stream', run_id], { encoding: 'utf8', timeout: 15000 })
+
+  const r = vibe('run', 'status', run_id, '--json')
+  const record = JSON.parse(r.stdout.trim())
+  assert.equal(record.status, 'failed')
+  assert.equal(record.exit_code, 127)
+  assert.equal(record.failure_reason, 'command_not_found')
+  assert.equal(record.recoverable, true)
 })

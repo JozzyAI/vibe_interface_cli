@@ -218,6 +218,7 @@ export async function runSupervisor(run_id: string): Promise<void> {
         status: 'completed', final_agent: agent, switched,
         ...(switchReason && { switch_reason: switchReason }),
         ...(handoffStr && { handoff_path: handoffStr }),
+        ...(outcome.exitCode !== undefined && { exit_code: outcome.exitCode }),
         child_pid: undefined,
       })
       appendEvent({ type: 'status', run_id, session_id, status: 'completed', ts: ts() })
@@ -237,6 +238,8 @@ export async function runSupervisor(run_id: string): Promise<void> {
         failure_reason: cls.reason, recoverable: cls.recoverable,
         ...(switchReason && { switch_reason: switchReason }),
         ...(handoffStr && { handoff_path: handoffStr }),
+        ...(outcome.exitCode !== undefined && { exit_code: outcome.exitCode }),
+        ...(outcome.failureMessage && { error: outcome.failureMessage }),
         child_pid: undefined,
       })
       appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
