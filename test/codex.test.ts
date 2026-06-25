@@ -11,16 +11,20 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import type { RunRecord, RunEvent, StatusEvent, LogEvent, PrCreatedEvent, VibeNode } from '../src/types.js'
+import { FIXTURES, freshVibeDir } from './helpers/agent-fixtures.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
-const FIXTURES = path.resolve(__dirname, '..', '..', 'test', 'fixtures')
+
+// Isolate run records into a throwaway VIBE_DIR so this suite never writes the
+// real ~/.vibe. Shared across the env objects below.
+const VIBE_DIR = freshVibeDir('vibe-codex-')
 
 // PATH with fake codex first (also keeps fake claude for other tests that run alongside)
-const fakeCodexPath = { ...process.env, PATH: FIXTURES + ':' + process.env.PATH }
+const fakeCodexPath = { ...process.env, VIBE_DIR, PATH: FIXTURES + ':' + process.env.PATH }
 // PATH without codex (but with claude so other agent paths are unaffected)
-const noCodexPath = { ...process.env, PATH: '/tmp' }
+const noCodexPath = { ...process.env, VIBE_DIR, PATH: '/tmp' }
 
 function vibe(env: NodeJS.ProcessEnv, ...args: string[]) {
   return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8', env })

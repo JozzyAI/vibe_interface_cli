@@ -10,17 +10,20 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import type { RunRecord, RunEvent, StatusEvent, LogEvent, PrCreatedEvent } from '../src/types.js'
+import { FIXTURES, freshVibeDir } from './helpers/agent-fixtures.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
-// fixtures live in test/fixtures/ (source), not in dist/test/fixtures/
-const FIXTURES = path.resolve(__dirname, '..', '..', 'test', 'fixtures')
 
-// PATH with fake claude first
-const fakeClaudePath = { ...process.env, PATH: FIXTURES + ':' + process.env.PATH }
+// Isolate run records into a throwaway VIBE_DIR so this suite never writes the
+// real ~/.vibe. Shared across the env objects below.
+const VIBE_DIR = freshVibeDir('vibe-claude-')
+
+// PATH with fake claude first (shadows any real claude install)
+const fakeClaudePath = { ...process.env, VIBE_DIR, PATH: FIXTURES + ':' + process.env.PATH }
 // PATH without any claude
-const noClaudePath = { ...process.env, PATH: '/tmp' }
+const noClaudePath = { ...process.env, VIBE_DIR, PATH: '/tmp' }
 
 function vibe(env: NodeJS.ProcessEnv, ...args: string[]) {
   return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8', env })

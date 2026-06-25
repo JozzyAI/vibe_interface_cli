@@ -8,10 +8,16 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { freshVibeDir } from './helpers/agent-fixtures.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
+
+// Isolate run records into a throwaway VIBE_DIR. Every test below spawns the CLI
+// with `{ ...process.env }`, so setting it here propagates to all children and
+// keeps these mock runs out of the real ~/.vibe.
+process.env.VIBE_DIR = freshVibeDir('vibe-mockadapter-')
 
 function vibe(env: NodeJS.ProcessEnv, ...args: string[]) {
   return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8', env })
