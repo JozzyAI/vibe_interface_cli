@@ -1,12 +1,22 @@
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'child_process'
+import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
+
+// Isolate every run this suite creates into a throwaway VIBE_DIR so the
+// CLI children spawned below (which inherit process.env) never read or
+// write the real ~/.vibe. The two failure-path tests pass env explicitly
+// but spread ...process.env, so they inherit this too.
+const VIBE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-contract-'))
+process.env.VIBE_DIR = VIBE_DIR
+after(() => fs.rmSync(VIBE_DIR, { recursive: true, force: true }))
 
 function vibe(...args: string[]) {
   return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8' })

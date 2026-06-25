@@ -126,6 +126,11 @@ Meta-Agent Runtime's mid-run `--fallback-agent` chain (below): the router picks 
 the runtime decides whether to *switch* after a failure. `--agent auto` is not supported with
 `--relay` (remote dispatch) — pass an explicit backend there.
 
+> **Manual smoke tests: use `--agent mock`, not `--agent auto`.** On a machine where a real
+> `claude` / `codex` / `opencode` binary is on `PATH`, `auto` resolves to that real backend and
+> **spawns the real (paid) CLI**. For a local-only, no-cost smoke that exercises the full run
+> lifecycle, always pass `--agent mock` explicitly. Reserve `auto` for real work.
+
 ### Mock runner test knobs
 
 For exercising the run lifecycle without any real agent:
