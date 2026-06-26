@@ -431,6 +431,37 @@ surfaces `node_offline` — the relay never invents a terminal status. Automated
 coverage of this contract (fake relay + real mock daemon, isolated `VIBE_DIR`,
 no token leakage) lives in `test/relay-transport-smoke.test.ts`.
 
+#### Against a real relay (manual, mock-only)
+
+To verify the same contract over a **real** relay (the automated test uses a
+fake in-process one), use `scripts/real-relay-smoke.sh`. A real relay needs a
+real token, so this is a manual runbook — never wired into CI.
+
+```bash
+npm run build && chmod +x dist/src/index.js
+I_CONFIRM_DISPATCH_PAUSED=1 \
+RELAY_URL=wss://vibe-relay.dynastylab.ai \
+VIBE_RELAY_TOKEN_FILE=/path/to/0600-token-file \
+  bash scripts/real-relay-smoke.sh
+```
+
+The script is safe by construction:
+
+- **Dispatch gate.** It refuses to run unless `I_CONFIRM_DISPATCH_PAUSED=1`.
+  A node daemon always advertises `claude-code` (there is no mock-only switch in
+  `resolveAgents`), so while the node is online a production orchestrator that is
+  actively dispatching could hand it a real, paid job. Only run this when
+  production dispatch is paused.
+- **Isolated.** It brings the node up under a throwaway `VIBE_DIR` and a
+  throwaway `node-id`, so it never disturbs this machine's real `~/.vibe` or the
+  persistent node identity.
+- **Token hygiene.** The token is taken from `--token-file` (or copied from
+  `VIBE_RELAY_TOKEN` into a private `0600` temp file); it is never passed as
+  `--token <value>`, never echoed, and the run asserts it never appears in any
+  command output.
+- **Mock only.** Every run it issues is `--agent mock`; it never uses
+  `--agent auto`. On exit it tears down the daemon and checks for stragglers.
+
 ### Remote Claude Code
 
 To run Claude Code on the remote node, add `--agent claude-code` to `run start` and optionally `--permission-mode unsafe-skip`. The CLI reads the prompt file locally and transmits its **text content** over the relay — the remote node never needs access to the controller's filesystem.
