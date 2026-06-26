@@ -12,11 +12,14 @@
 # ─ Safety model (read before running) ───────────────────────────────────────
 #  * MOCK ONLY. This script only ever issues `--agent mock`. It never uses
 #    `--agent auto` and never invokes a real claude/codex/opencode.
-#  * BUT a node daemon ALWAYS advertises `claude-code` (see resolveAgents in
-#    src/agent-registry.ts — there is no mock-only switch). So while this node
-#    is online, a production orchestrator/Symphony that is actively dispatching
-#    could send it a real claude-code job, which WOULD invoke the paid CLI.
-#    Therefore this script refuses to run unless you assert dispatch is paused:
+#  * MOCK-ONLY ADVERTISE (PR #23). This script sets VIBE_NODE_ADVERTISE_AGENTS=mock,
+#    so the daemon publishes EXACTLY `["mock"]` to the relay (resolveAdvertisedAgents
+#    in src/agent-registry.ts) — a production orchestrator/Symphony cannot dispatch
+#    a real claude-code job to this node because it never advertises that capability.
+#    The script verifies the advertised set is `["mock"]` right after registration
+#    and aborts otherwise.
+#  * DISPATCH-PAUSE GATE (defense-in-depth). Even with the mock-only valve, this
+#    script still refuses to run unless you assert production dispatch is paused:
 #        I_CONFIRM_DISPATCH_PAUSED=1
 #  * ISOLATION. The daemon runs against a throwaway VIBE_DIR and a throwaway
 #    node-id, so it does not disturb this machine's real ~/.vibe or the
@@ -53,8 +56,9 @@ WORKSPACE_KEY="real-relay-smoke-$$"
 # ── 1. Safety gate ───────────────────────────────────────────────────────────
 if [ "${I_CONFIRM_DISPATCH_PAUSED:-}" != "1" ]; then
   say "${YELLOW}Refusing to bring a node online on a real relay.${NC}"
-  say "A node daemon advertises ${CYAN}claude-code${NC}; if production dispatch is active it"
-  say "could send this node a real (paid) job. Re-run only when dispatch is paused:"
+  say "This node advertises ${CYAN}mock${NC} only (VIBE_NODE_ADVERTISE_AGENTS), but as a"
+  say "defense-in-depth gate we still require you to confirm production dispatch is paused"
+  say "before any node goes online on the real relay. Re-run only when dispatch is paused:"
   say "    ${DIM}I_CONFIRM_DISPATCH_PAUSED=1 RELAY_URL=$RELAY_URL VIBE_RELAY_TOKEN_FILE=... bash scripts/real-relay-smoke.sh${NC}"
   exit 2
 fi
@@ -77,8 +81,12 @@ fi
 # ── 3. Isolated, throwaway state ─────────────────────────────────────────────
 VIBE_DIR="$(mktemp -d -t vibe-real-smoke-XXXXXX)"
 export VIBE_DIR
+# Mock-only advertise valve (PR #23): the daemon publishes EXACTLY ["mock"] to the
+# relay, so no real claude-code job can ever be dispatched to this throwaway node.
+export VIBE_NODE_ADVERTISE_AGENTS=mock
 say "${CYAN}relay${NC}     $RELAY_URL"
 say "${CYAN}node-id${NC}   $NODE_ID  ${DIM}(throwaway)${NC}"
+say "${CYAN}advertise${NC} $VIBE_NODE_ADVERTISE_AGENTS  ${DIM}(mock-only — never claude-code)${NC}"
 say "${CYAN}VIBE_DIR${NC}  $VIBE_DIR  ${DIM}(throwaway — real ~/.vibe untouched)${NC}"
 
 DAEMON_PID=""
@@ -113,6 +121,14 @@ for _ in $(seq 1 20); do
 done
 [ "$registered" = "1" ] || { say "${DIM}daemon output:${NC}"; sed -E 's/(token[^ ]*)[[:alnum:]_.-]+/\1[REDACTED]/Ig' "$VIBE_DIR/daemon.out"; fail "node did not register within 20s"; }
 say "${GREEN}✓ 1. node registered and visible in \`node list --remote\`${NC}"
+
+# ── 4b. Verify the node advertises EXACTLY ["mock"] (PR #23 mock-only valve) ──
+# If this node ever advertised claude-code, an active production dispatcher could
+# assign it a real paid job — so abort hard unless the advertised set is mock-only.
+ADV_AGENTS="$(node "$CLI" node list --remote --relay "$RELAY_URL" --token-file "$TOKEN_FILE" --json 2>/dev/null \
+  | node -pe 'const ns=JSON.parse(require("fs").readFileSync(0));const me=(ns||[]).find(n=>n.node_id===process.argv[1]);JSON.stringify(me?me.agents:null)' "$NODE_ID")"
+[ "$ADV_AGENTS" = '["mock"]' ] || fail "node advertises ${ADV_AGENTS}, expected [\"mock\"] — aborting before any run"
+say "${GREEN}✓ 1b. node advertises exactly ${ADV_AGENTS}  ${DIM}(mock-only valve confirmed)${NC}"
 
 # ── 5. start ─────────────────────────────────────────────────────────────────
 START_JSON="$(node "$CLI" run start --node "$NODE_ID" --agent mock --workspace-key "$WORKSPACE_KEY" \
