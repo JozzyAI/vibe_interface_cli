@@ -10,13 +10,17 @@ import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import type { RunRecord, VibeNode } from '../src/types.js'
+import { freshVibeDir } from './helpers/agent-fixtures.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
 
+// Throwaway VIBE_DIR so run records / node state land in a temp dir, not ~/.vibe.
+const VIBE_DIR = freshVibeDir('vibe-node-test-')
+
 function vibe(...args: string[]) {
-  return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8' })
+  return spawnSync(NODE, [CLI, ...args], { encoding: 'utf8', env: { ...process.env, VIBE_DIR } })
 }
 
 function uniqueKey(prefix = 'n') {
