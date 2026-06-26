@@ -448,10 +448,15 @@ VIBE_RELAY_TOKEN_FILE=/path/to/0600-token-file \
 The script is safe by construction:
 
 - **Dispatch gate.** It refuses to run unless `I_CONFIRM_DISPATCH_PAUSED=1`.
-  A node daemon always advertises `claude-code` (there is no mock-only switch in
-  `resolveAgents`), so while the node is online a production orchestrator that is
-  actively dispatching could hand it a real, paid job. Only run this when
-  production dispatch is paused.
+  By default a node daemon advertises every agent it can run (including
+  `claude-code`), so while the node is online a production orchestrator that is
+  actively dispatching could hand it a real, paid job. Pair this gate with the
+  mock-only advertise valve below, and only run when dispatch is paused.
+- **Mock-only advertise.** Set `VIBE_NODE_ADVERTISE_AGENTS=mock` (or
+  `vibe node daemon --advertise-agent mock`) so the node publishes **exactly**
+  `["mock"]` to the relay. An orchestrator then can't dispatch `claude-code` to
+  it even if dispatch is live — the structural safety valve. This only changes
+  what the node advertises; local runs are unaffected.
 - **Isolated.** It brings the node up under a throwaway `VIBE_DIR` and a
   throwaway `node-id`, so it never disturbs this machine's real `~/.vibe` or the
   persistent node identity.
@@ -461,6 +466,37 @@ The script is safe by construction:
   command output.
 - **Mock only.** Every run it issues is `--agent mock`; it never uses
   `--agent auto`. On exit it tears down the daemon and checks for stragglers.
+
+##### Mock-only advertise allowlist
+
+Before any real-relay smoke, restrict what the node advertises so a production
+orchestrator can only ever dispatch the mock agent to it:
+
+```bash
+# Bring a throwaway node online advertising ONLY mock (token via env/file, never argv):
+VIBE_NODE_ADVERTISE_AGENTS=mock \
+VIBE_RELAY_TOKEN_FILE=/path/to/0600-token-file \
+  vibe node daemon --local \
+    --relay wss://vibe-relay.dynastylab.ai \
+    --node-id "smoke-$(date +%s)"          # throwaway node-id
+# equivalently: vibe node daemon --local --advertise-agent mock ...
+
+# Drive runs with the mock agent only — never --agent auto:
+vibe run start --node "<node-id>" --agent mock --json
+```
+
+Rules of the safe real-relay smoke:
+
+- **Advertise mock only** — `VIBE_NODE_ADVERTISE_AGENTS=mock` (or repeatable /
+  comma-separated `--advertise-agent`). The node publishes exactly `["mock"]`;
+  an empty or unknown allowlist fails fast with a structured error.
+- **Throwaway node-id** — never the machine's persistent identity.
+- **Token via `--token-file` or `VIBE_RELAY_TOKEN`** — never `--token <value>`.
+- **`--agent mock` for every run** — never `--agent auto` (it would pick a real,
+  paid CLI if one is installed).
+
+The valve only filters what is published to the relay; the node's local runner
+support (`resolveAgents`) and local runs are unchanged.
 
 ### Remote Claude Code
 

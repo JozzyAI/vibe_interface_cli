@@ -45,12 +45,15 @@ export interface DaemonOpts {
   token?: string
   /** Override node ID. Default: 'local' (file mode) or hostname (relay mode). */
   nodeId?: string
+  /** Allowlist of agents to ADVERTISE to the relay (CLI --advertise-agent /
+   *  VIBE_NODE_ADVERTISE_AGENTS). Relay mode only; does not affect local runs. */
+  advertiseAgents?: string[]
 }
 
 export async function runLocalDaemon(opts: DaemonOpts = {}): Promise<void> {
   if (opts.relay) {
     const { relayNodeDaemon } = await import('./relay/client.js')
-    return relayNodeDaemon(opts.relay, opts.token ?? '', opts.nodeId)
+    return relayNodeDaemon(opts.relay, opts.token ?? '', opts.nodeId, undefined, opts.advertiseAgents)
   }
   return runFileModeDaemon(opts.nodeId)
 }
