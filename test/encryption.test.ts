@@ -265,7 +265,9 @@ test('relay: encrypted run_start → node decrypts → returns run_start_ack', a
     const target = nodes.find(n => n.node_id === 'enc-daemon-node')
     assert.ok(target?.encryption_public_key, 'daemon should expose encryption_public_key')
 
-    // Send an encrypted run_start via remoteRunStart
+    // Send an encrypted run_start via remoteRunStart. Point the controller-side
+    // run record at the temp vibeDir so it never touches the real ~/.vibe.
+    process.env.VIBE_DIR = vibeDir
     const { remoteRunStart } = await import('../src/relay/client.js')
     const record = await remoteRunStart(
       `ws://localhost:${server.port}`,
@@ -282,6 +284,7 @@ test('relay: encrypted run_start → node decrypts → returns run_start_ack', a
     assert.equal(record.node_id, 'enc-daemon-node')
     assert.ok(record.run_id, 'should have run_id')
   } finally {
+    delete process.env.VIBE_DIR
     daemonProc.kill('SIGTERM')
     await new Promise(r => daemonProc.on('exit', r))
     await server.close()
@@ -309,6 +312,8 @@ test('relay: encrypted run_start with fake claude exits 0 → completed', async 
     const promptFile = path.join(vibeDir, 'prompt.md')
     fs.writeFileSync(promptFile, 'Say hello.')
 
+    // Controller-side run record → temp vibeDir, not the real ~/.vibe.
+    process.env.VIBE_DIR = vibeDir
     const record = await remoteRunStart(
       `ws://localhost:${server.port}`,
       TEST_TOKEN,
@@ -332,6 +337,7 @@ test('relay: encrypted run_start with fake claude exits 0 → completed', async 
       process.env.PATH = origPath
     }
   } finally {
+    delete process.env.VIBE_DIR
     daemonProc.kill('SIGTERM')
     await new Promise(r => daemonProc.on('exit', r))
     await server.close()

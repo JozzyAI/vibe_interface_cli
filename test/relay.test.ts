@@ -17,6 +17,7 @@ import type { RunRecord, VibeNode } from '../src/types.js'
 import type { RelayMessage } from '../src/relay/types.js'
 import { startRelayServer } from '../src/relay/server.js'
 import { remoteRunStart, remoteStop, remoteStream } from '../src/relay/client.js'
+import { freshVibeDir } from './helpers/agent-fixtures.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -26,13 +27,18 @@ const FIXTURES = path.resolve(__dirname, '..', '..', 'test', 'fixtures')
 
 const TEST_TOKEN = `tok-${Date.now()}`
 
+// Throwaway VIBE_DIR shared by every spawned daemon and CLI in this suite, so
+// node identity / run records / events go to a temp dir instead of the real
+// ~/.vibe. Run/event reads below also resolve against this dir.
+const VIBE_DIR = freshVibeDir('vibe-relay-test-')
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /** Async CLI invocation — does NOT block the event loop, so in-process relay stays live. */
 async function vibeAsync(args: string[], env?: Record<string, string>, timeoutMs?: number): Promise<{ status: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const proc = spawn(NODE, [CLI, ...args], {
-      env: { ...process.env, ...env },
+      env: { ...process.env, VIBE_DIR, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = '', stderr = ''
@@ -322,7 +328,7 @@ test('vibe node daemon --relay: registers with relay and sends heartbeats', asyn
     '--token', TEST_TOKEN,
     '--node-id', 'daemon-test-node',
   ], {
-    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250' },
+    env: { ...process.env, VIBE_DIR, VIBE_NODE_HEARTBEAT_MS: '250' },
     stdio: 'pipe',
   })
 
@@ -376,7 +382,7 @@ test('vibe node daemon --relay: node removed from relay after daemon exits', asy
     '--token', TEST_TOKEN,
     '--node-id', 'daemon-exit-node',
   ], {
-    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250' },
+    env: { ...process.env, VIBE_DIR, VIBE_NODE_HEARTBEAT_MS: '250' },
     stdio: 'pipe',
   })
 
@@ -486,7 +492,7 @@ test('vibe run start --node remote-node --relay ...: returns queued RunRecord JS
     '--token', TEST_TOKEN,
     '--node-id', 'run-start-node',
   ], {
-    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250' },
+    env: { ...process.env, VIBE_DIR, VIBE_NODE_HEARTBEAT_MS: '250' },
     stdio: 'pipe',
   })
 
@@ -546,7 +552,7 @@ async function spawnAndWaitForDaemon(
     '--token', TEST_TOKEN,
     '--node-id', nodeId,
   ], {
-    env: { ...process.env, VIBE_NODE_HEARTBEAT_MS: '250', ...extraEnv },
+    env: { ...process.env, VIBE_DIR, VIBE_NODE_HEARTBEAT_MS: '250', ...extraEnv },
     stdio: 'pipe',
   })
 
@@ -581,8 +587,8 @@ test('relay daemon: remote mock run spawns runner — running → completed, eve
     assert.ok(record.session_id, 'session_id set (runner PID)')
 
     // Poll RunRecord until completed (mock runner takes ~6s)
-    const runPath = path.join(os.homedir(), '.vibe', 'runs', `${record.run_id}.json`)
-    const eventsPath = path.join(os.homedir(), '.vibe', 'events', `${record.run_id}.jsonl`)
+    const runPath = path.join(VIBE_DIR, 'runs', `${record.run_id}.json`)
+    const eventsPath = path.join(VIBE_DIR, 'events', `${record.run_id}.jsonl`)
     let completed = false
     const deadline = Date.now() + 15000
     while (Date.now() < deadline) {
@@ -1293,7 +1299,7 @@ test('vibe symphony status --relay: returns authoritative completed RunRecord fr
     assert.equal(record.status, 'running', 'run starts running')
 
     // Wait until the node's authoritative local record reaches completed.
-    const runPath = path.join(os.homedir(), '.vibe', 'runs', `${record.run_id}.json`)
+    const runPath = path.join(VIBE_DIR, 'runs', `${record.run_id}.json`)
     let completed = false
     const deadline = Date.now() + 15000
     while (Date.now() < deadline) {
