@@ -104,10 +104,36 @@ export function registerNodeCommand(program: Command): void {
     .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
     .option('--token-file <path>', 'read relay auth token from a file (kept out of process args)')
     .option('--node-id <id>', 'override node ID (default: hostname or "local")')
+    .option(
+      '--advertise-agent <agent>',
+      'restrict the agents advertised to the relay (repeatable or comma-separated, e.g. "mock"); also settable via VIBE_NODE_ADVERTISE_AGENTS',
+      (val: string, prev: string[]) => prev.concat(val),
+      [] as string[],
+    )
     .action(async (opts) => {
       if (!opts.local) {
         process.stderr.write('error: --local flag is required (remote nodes not yet supported without --relay)\n')
         process.exit(1)
+      }
+      // Validate the advertise allowlist up front so a bad value (or env) fails
+      // fast with a structured error, before any relay connection is attempted.
+      // Thread an explicit allowlist down only when the flag was given; when it
+      // isn't, resolveAdvertisedAgents() falls back to VIBE_NODE_ADVERTISE_AGENTS
+      // (or the default), so unset behaviour is untouched.
+      const advertiseAgents = (opts.advertiseAgent as string[]).length ? (opts.advertiseAgent as string[]) : undefined
+      {
+        const { resolveAdvertisedAgents, AdvertiseAllowlistError } = await import('../agent-registry.js')
+        try {
+          // Validate up front (flag > env) so a bad value fails fast with a
+          // structured error before any relay connection is attempted.
+          resolveAdvertisedAgents(advertiseAgents)
+        } catch (err) {
+          if (err instanceof AdvertiseAllowlistError) {
+            process.stderr.write(JSON.stringify({ error: true, code: err.code, message: err.message, ts: new Date().toISOString() }) + '\n')
+            process.exit(1)
+          }
+          throw err
+        }
       }
       // Relay mode needs a token, but it must not have to come from argv: resolve
       // it from --token-file / --token / VIBE_RELAY_TOKEN so the long-running
@@ -128,6 +154,7 @@ export function registerNodeCommand(program: Command): void {
         relay: opts.relay as string | undefined,
         token,
         nodeId: opts.nodeId as string | undefined,
+        advertiseAgents,
       })
     })
 }

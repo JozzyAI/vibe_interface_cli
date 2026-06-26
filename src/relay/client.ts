@@ -13,7 +13,7 @@ import { appendEvent } from '../events.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { codexBackend } from '../backends/codex.js'
-import { resolveAgents } from '../agent-registry.js'
+import { resolveAgents, resolveAdvertisedAgents } from '../agent-registry.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import type { RelayMessage, RunStartMsg, RunStopRequestMsg, RunStatusRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
@@ -304,9 +304,15 @@ export async function relayNodeDaemon(
   token: string,
   nodeIdOverride?: string,
   control?: RelayDaemonControl,
+  advertiseAgents?: string[] | string,
 ): Promise<void> {
   const config = resolveConfig()
   const heartbeatMs = getHeartbeatMs()
+
+  // What this node publishes to the relay. Resolved ONCE up front so an invalid
+  // allowlist fails fast (before connecting) rather than throwing inside the
+  // per-connection buildNode and risking a reconnect busy-loop.
+  const advertisedAgents = resolveAdvertisedAgents(advertiseAgents)
 
   // Load identity; if available and no --node-id override, use identity id as node_id.
   let identity: IdentityFile | null = null
@@ -320,7 +326,7 @@ export async function relayNodeDaemon(
     status: 'online',
     transport: 'relay',
     capabilities: ['run', 'stream', 'stop', 'workspace'],
-    agents: resolveAgents(),
+    agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
     workspace_roots: [config.workspace_root],
