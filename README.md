@@ -392,6 +392,45 @@ Token auth is enforced at the HTTP upgrade level — wrong or missing token gets
 
 Remote nodes appear with `transport: "relay"` in the node list. Local node list (`vibe node list` without `--remote`) is unaffected by relay state.
 
+### Remote relay transport smoke (mock only, secure token)
+
+The same `start → status → stream → stop` contract you run locally also works over
+the relay. The snippet below is a copy-paste smoke that keeps the **token out of
+process args** (no `--token <value>`): the CLI reads it from a `0600` file via
+`--token-file`, and the daemon reads it from the `VIBE_RELAY_TOKEN` env. Use the
+**mock** agent only — never `--agent auto` — so no paid CLI is invoked.
+
+```bash
+# Throwaway state + a 0600 token file (token never lands in argv).
+export VIBE_DIR="$(mktemp -d)"
+tokfile="$VIBE_DIR/relay.token"
+printf 'dev-smoke-token' > "$tokfile" && chmod 600 "$tokfile"
+
+# Terminal 1 — relay (dev mode, loopback only).
+vibe relay dev --port 7433 --token dev-smoke-token
+
+# Terminal 2 — node daemon; token via env, not argv.
+VIBE_RELAY_TOKEN=dev-smoke-token \
+  vibe node daemon --local --relay ws://127.0.0.1:7433 --node-id smoke-node
+
+# Terminal 3 — drive the contract with --token-file.
+relay=ws://127.0.0.1:7433
+vibe node list --remote --relay "$relay" --token-file "$tokfile" --json
+# → [{"node_id":"smoke-node","transport":"relay",...}]
+
+run_id=$(vibe run start --node smoke-node --agent mock --workspace-key demo \
+  --relay "$relay" --token-file "$tokfile" --json | jq -r .run_id)
+
+vibe run status "$run_id" --json          # node-authoritative record (local source of truth)
+vibe run stream "$run_id" --relay "$relay" --token-file "$tokfile"   # JSONL until completed
+vibe run stop   "$run_id" --relay "$relay" --token-file "$tokfile"   # → {"status":"stopped",...}
+```
+
+Unknown runs surface `run_not_found`, and a run whose owning node has gone offline
+surfaces `node_offline` — the relay never invents a terminal status. Automated
+coverage of this contract (fake relay + real mock daemon, isolated `VIBE_DIR`,
+no token leakage) lives in `test/relay-transport-smoke.test.ts`.
+
 ### Remote Claude Code
 
 To run Claude Code on the remote node, add `--agent claude-code` to `run start` and optionally `--permission-mode unsafe-skip`. The CLI reads the prompt file locally and transmits its **text content** over the relay — the remote node never needs access to the controller's filesystem.
