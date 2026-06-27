@@ -39,6 +39,10 @@
 #   I_CONFIRM_DISPATCH_PAUSED=1 RELAY_URL=... VIBE_RELAY_TOKEN=... \
 #     bash scripts/real-relay-smoke.sh
 #
+#   # optional: how long to wait for the relay to mark the node offline/absent
+#   # after the daemon stops (default 90s, ≈6× the relay's 15s default stale window):
+#   SMOKE_OFFLINE_TIMEOUT_SEC=120 ... bash scripts/real-relay-smoke.sh
+#
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; DIM='\033[2m'; NC='\033[0m'
@@ -152,12 +156,45 @@ say "${GREEN}✓ 4. run status (from node record): ${STATUS}${NC}"
 STOP_JSON="$(node "$CLI" run stop "$RUN_ID" --relay "$RELAY_URL" --token-file "$TOKEN_FILE" 2>/dev/null || true)"
 say "${GREEN}✓ 5. stop path exercised${NC}  ${DIM}$(printf '%s' "$STOP_JSON" | head -c 120)${NC}"
 
+# ── 8b. Stop the daemon, then verify the node goes offline/absent on the relay ─
+# Cleanup must be observable from the relay's side, not just locally. Stop the
+# daemon here (so it stops heartbeating) and poll `node list --remote` with the
+# SAME --token-file until the relay reports this node absent, or present but
+# offline/stale. We do this in the main flow — BEFORE the EXIT trap — so the temp
+# token file is still alive for the poll (it is removed only on exit; req 6/7).
+say "\n${DIM}stopping daemon; waiting for relay to drop/offline the node…${NC}"
+if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+  kill -TERM "$DAEMON_PID" 2>/dev/null
+  for _ in $(seq 1 10); do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 1; done
+  kill -KILL "$DAEMON_PID" 2>/dev/null || true
+fi
+DAEMON_PID=""   # reaped here; keep the EXIT trap from re-killing a dead pid
+
+# Default ≈6× the relay's 15s default stale window; override w/ SMOKE_OFFLINE_TIMEOUT_SEC.
+OFFLINE_TIMEOUT="${SMOKE_OFFLINE_TIMEOUT_SEC:-90}"
+POLL_OUT=""
+node_state="online"
+deadline=$(( $(date +%s) + OFFLINE_TIMEOUT ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  NODE_JSON="$(node "$CLI" node list --remote --relay "$RELAY_URL" --token-file "$TOKEN_FILE" --json 2>/dev/null || echo '[]')"
+  POLL_OUT="$POLL_OUT$NODE_JSON"   # folded into the token-leak scan below
+  node_state="$(printf '%s' "$NODE_JSON" | node -pe 'const ns=JSON.parse(require("fs").readFileSync(0))||[];const me=(ns||[]).find(n=>n.node_id===process.argv[1]);me?(me.status||"present"):"absent"' "$NODE_ID" 2>/dev/null || echo "unknown")"
+  case "$node_state" in absent|offline|stale) break ;; esac
+  sleep 3
+done
+case "$node_state" in
+  absent|offline|stale)
+    say "${GREEN}✓ 6. throwaway node is '${node_state}' on the relay after cleanup${NC}" ;;
+  *)
+    fail "cleanup verification failed: node $NODE_ID still '${node_state}' after ${OFFLINE_TIMEOUT}s" ;;
+esac
+
 # ── 9. token-leak check across everything this run printed ───────────────────
 SECRET="$(tr -d '\n' < "$TOKEN_FILE")"
-if printf '%s' "$START_JSON$STREAM_OUT$STATUS_JSON$STOP_JSON" | grep -qF "$SECRET"; then
+if printf '%s' "$START_JSON$STREAM_OUT$STATUS_JSON$STOP_JSON$POLL_OUT" | grep -qF "$SECRET"; then
   fail "token leaked into command output"
 else
-  say "${GREEN}✓ 6. token absent from all command output${NC}"
+  say "${GREEN}✓ 7. token absent from all command output${NC}"
 fi
 
-say "\n${GREEN}real-relay smoke complete — start/status/stream/stop verified over $RELAY_URL (mock only).${NC}"
+say "\n${GREEN}real-relay smoke complete — start/status/stream/stop + offline-after-cleanup verified over $RELAY_URL (mock only).${NC}"
