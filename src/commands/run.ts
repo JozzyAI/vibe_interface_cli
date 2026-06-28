@@ -335,15 +335,20 @@ async function serveRemoteWebViewer(
     return
   }
 
-  // 4. Background subscription fills the buffer the viewer serves. A stream error
-  //    just ends the buffer — the viewer keeps serving the last snapshot.
+  // 4. Background subscription fills the buffer the viewer serves. Connection
+  //    state feeds the UI's live/reconnecting/disconnected chip; when the stream
+  //    settles the buffer is finalized either way, so the viewer keeps serving the
+  //    last snapshot and clearly shows ended vs disconnected.
   const buffer = new RemoteRunBuffer(run_id, node_id, record.status)
   const controller = new AbortController()
   void remoteStream(opts.relay as string, token, run_id, {
     onRunEvent: (ev) => buffer.push(ev),
+    onEvent: (s) => buffer.setStreamState(s),
     suppressStdout: true,
     signal: controller.signal,
-  }).catch(() => buffer.markEnded())
+  })
+    .then(() => buffer.markEnded())
+    .catch(() => buffer.markEnded('disconnected'))
 
   // 5. Start the read-only HTTP viewer.
   const port = Number.parseInt(opts.port as string, 10) || 0

@@ -135,9 +135,15 @@ export function viewerHtml(run_id: string, opts: { subtitle?: string } = {}): st
 <title>vibe run ${run_id}</title>
 <style>
   body { margin: 0; background: #0b0f14; color: #d6deeb; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  header { padding: 8px 12px; background: #11161d; border-bottom: 1px solid #1f2730; display: flex; gap: 12px; align-items: center; }
+  header { padding: 8px 12px; background: #11161d; border-bottom: 1px solid #1f2730; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   header .id { color: #7fdbca; }
   header .status { padding: 1px 8px; border-radius: 10px; background: #1f2730; }
+  header .meta { color: #8a99a8; font-size: 11px; }
+  header .conn { padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #1f2730; color: #8a99a8; }
+  header .conn.live { color: #0b0f14; background: #7fdbca; }
+  header .conn.reconnecting { color: #0b0f14; background: #ecc48d; }
+  header .conn.disconnected { color: #0b0f14; background: #ef6f6f; }
+  header .conn.ended { color: #d6deeb; background: #2d3a45; }
   header .ro { margin-left: auto; color: #637777; font-size: 11px; }
   pre#pane { margin: 0; padding: 12px; white-space: pre-wrap; word-break: break-word; }
 </style>
@@ -146,27 +152,59 @@ export function viewerHtml(run_id: string, opts: { subtitle?: string } = {}): st
 <header>
   <span class="id">${run_id}</span>
   <span class="status" id="status">…</span>
+  <span class="meta" id="node"></span>
+  <span class="meta" id="source"></span>
+  <span class="conn" id="conn"></span>
+  <span class="meta" id="updated"></span>
   <span class="ro">${subtitle}</span>
 </header>
 <pre id="pane">connecting…</pre>
 <script>
+  // Read-only poller. Pure fetch — no input channel, no live socket. Values are
+  // written via textContent only, so streamed output can never inject markup.
   const pane = document.getElementById('pane');
-  const statusEl = document.getElementById('status');
-  let timer = null;
-  async function tick() {
+  const el = (id) => document.getElementById(id);
+  const statusEl = el('status'), nodeEl = el('node'), sourceEl = el('source'),
+        connEl = el('conn'), updatedEl = el('updated');
+  let lastTs = null, stopped = false, errDelay = 1000;
+  const POLL_MS = 1000, MAX_ERR_MS = 8000;
+
+  function setConn(state) { connEl.textContent = state; connEl.className = 'conn ' + state; }
+  function rel(ts) {
+    if (!ts) return '';
+    const s = Math.max(0, Math.round((Date.now() - new Date(ts).getTime()) / 1000));
+    return 'updated ' + s + 's ago';
+  }
+  // Tick the relative time every second even between polls.
+  setInterval(() => { if (lastTs) updatedEl.textContent = rel(lastTs); }, 1000);
+
+  async function loop() {
+    if (stopped) return;
+    let delay = POLL_MS;
     try {
       const res = await fetch('/api/pane', { cache: 'no-store' });
-      const data = await res.json();
-      statusEl.textContent = data.ended ? (data.status + ' · session ended') : data.status;
-      if (data.content) pane.textContent = data.content;
-      if (data.ended) { clearInterval(timer); }
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      statusEl.textContent = d.status || '…';
+      nodeEl.textContent = d.node_id ? ('node ' + d.node_id) : '';
+      sourceEl.textContent = d.source ? ('source ' + d.source) : '';
+      lastTs = d.ts; updatedEl.textContent = rel(lastTs);
+      if (d.content) pane.textContent = d.content;
+      // Connection chip: prefer the server's stream state; fall back to ended/live.
+      if (d.ended) setConn(d.stream === 'disconnected' ? 'disconnected' : 'ended');
+      else setConn(d.stream || 'live');
+      errDelay = POLL_MS;            // recovered
+      if (d.ended) { stopped = true; return; }   // run finished — stop polling
     } catch (e) {
-      statusEl.textContent = 'viewer disconnected';
-      clearInterval(timer);
+      // Keep-alive: a transient fetch failure must not kill the viewer. Show
+      // reconnecting and retry with capped backoff instead of giving up.
+      setConn('reconnecting');
+      errDelay = Math.min(errDelay * 2, MAX_ERR_MS);
+      delay = errDelay;
     }
+    if (!stopped) setTimeout(loop, delay);
   }
-  tick();
-  timer = setInterval(tick, 1000);
+  loop();
 </script>
 </body>
 </html>`

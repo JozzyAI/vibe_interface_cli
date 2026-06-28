@@ -62,7 +62,40 @@ test('RemoteRunBuffer renders events, tracks status, redacts, and flips ended on
 
 test('RemoteRunBuffer seeds ended=true when the run was already finished', () => {
   const buf = new RemoteRunBuffer('run_x', 'node_abc', 'completed')
-  assert.equal(buf.snapshot().ended, true)
+  const snap = buf.snapshot()
+  assert.equal(snap.ended, true)
+  assert.equal(snap.stream, 'ended')
+})
+
+test('RemoteRunBuffer tracks connection state via setStreamState', () => {
+  const buf = new RemoteRunBuffer('run_x', 'node_abc', 'running')
+  assert.equal(buf.snapshot().stream, 'connecting')
+  buf.setStreamState('subscribed')
+  assert.equal(buf.snapshot().stream, 'live')
+  buf.setStreamState('reconnect_scheduled')
+  assert.equal(buf.snapshot().stream, 'reconnecting')
+  buf.setStreamState('gave_up')
+  assert.equal(buf.snapshot().stream, 'disconnected')
+})
+
+test('RemoteRunBuffer: a stream-disconnect give-up reads as disconnected + ended', () => {
+  // Mirrors what remoteStream now delivers through onRunEvent on give-up.
+  const buf = new RemoteRunBuffer('run_x', 'node_abc', 'running')
+  buf.setStreamState('subscribed')
+  buf.push(logEv('working…'))
+  buf.push({ type: 'error', code: 'stream_disconnected', message: 'relay event stream closed — the run may still be active on the node', run_id: 'run_x', ts: new Date().toISOString() } as RunEvent)
+  buf.push(statusEv('failed'))
+  const snap = buf.snapshot()
+  assert.equal(snap.ended, true, 'give-up flips ended')
+  assert.equal(snap.stream, 'disconnected', 'distinct from a clean finish')
+  assert.match(snap.content, /the run may still be active on the node/)
+})
+
+test('RemoteRunBuffer.markEnded(reason) finalizes with the right stream state', () => {
+  const a = new RemoteRunBuffer('run_x', 'node_abc', 'running'); a.markEnded()
+  assert.deepEqual([a.snapshot().ended, a.snapshot().stream], [true, 'ended'])
+  const b = new RemoteRunBuffer('run_y', 'node_abc', 'running'); b.markEnded('disconnected')
+  assert.deepEqual([b.snapshot().ended, b.snapshot().stream], [true, 'disconnected'])
 })
 
 // ── 1b. server: private bind, read-only, GET 200 / non-GET 405 / 404 ────────
@@ -80,11 +113,17 @@ test('startRemoteViewerServer: 127.0.0.1, GET 200 (shows output), POST 405, unkn
     assert.match(html, /read-only/, 'advertises read-only')
     assert.match(html, /node_abc/, 'shows the node label')
     assert.doesNotMatch(html, /xterm|websocket|sendKeys|send-keys|\/bin\/sh/i, 'no input/shell affordance')
+    // Polished header fields + keep-alive reconnect poller are present.
+    assert.match(html, /id="conn"/, 'has a connection-state chip')
+    assert.match(html, /id="updated"/, 'has a last-updated field')
+    assert.match(html, /reconnecting/, 'browser poller has a reconnect path')
 
     const api = await fetch(`${server.url}/api/pane`)
     assert.equal(api.status, 200)
-    const snap = await api.json() as { content: string; ended: boolean; source: string }
+    const snap = await api.json() as { content: string; ended: boolean; source: string; stream: string; node_id: string }
     assert.equal(snap.source, 'events')
+    assert.equal(snap.node_id, 'node_abc')
+    assert.equal(snap.stream, 'connecting', 'fresh buffer reports connecting')
     assert.match(snap.content, /remote-mock-line-42/, 'serves the remote mock output')
 
     const post = await fetch(`${server.url}/`, { method: 'POST' })

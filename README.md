@@ -214,24 +214,35 @@ stream instead of a local tmux pane.
   buffer the browser polls; events are passed through secret-redaction before display.
 - **Token hygiene:** the relay token comes from `--token-file <path>` or `VIBE_RELAY_TOKEN` —
   never `--token <value>` (which would leak into process args).
+- **Live connection state:** the page header shows `run_id`, `node_id`, `status`, the event
+  `source`, and a colour-coded connection chip — `live` → `reconnecting` (transient relay
+  blip; the browser keeps polling with backoff, it never gives up on the first hiccup) →
+  `ended` (run finished) or `disconnected` (relay stream gave up — *the run may still be
+  active on the node*), plus an "updated Ns ago" freshness indicator.
 - **Structured errors:** an offline node returns `node_offline`, an unknown run `run_not_found`,
-  a missing/invalid token `auth_token_error`; a public bind is refused with `public_bind_refused`.
+  a missing/invalid token `auth_token_error`, a missing relay `relay_required`; a public bind is
+  refused with `public_bind_refused`.
 
 ```
 vibe run web <run_id> --node <node_id> --relay <url> [--token-file <path>] \
   [--port <port>] [--host 127.0.0.1] [--allow-public-bind] [--json]
 ```
 
+**Quickstart** (against the production relay, with a paired node — token via file, never argv):
+
 ```bash
-# Manual smoke against a FAKE relay + a mock node (no production relay, no paid agent):
-# 1. start an in-process relay + a `vibe node daemon --local --relay ws://… ` (mock-capable)
-# 2. start a remote mock run, then point the viewer at it:
-vibe run start --node <node_id> --agent mock --workspace-key demo --relay ws://127.0.0.1:PORT \
-  --token-file /path/to/0600-token --json
-vibe run web <run_id> --node <node_id> --relay ws://127.0.0.1:PORT \
-  --token-file /path/to/0600-token --json   # prints { url, node_id, mode:"read-only", remote:true }
-# open the printed http://127.0.0.1:… — read-only; POST returns 405
+vibe run start --node <node_id> --agent mock --workspace-key demo \
+  --relay wss://vibe-relay.dynastylab.ai --token-file ~/.config/vibe/relay-token --json
+# → { "run_id": "run_…", … }
+vibe run web run_… --node <node_id> \
+  --relay wss://vibe-relay.dynastylab.ai --token-file ~/.config/vibe/relay-token
+# → opens a read-only viewer at http://127.0.0.1:<port> — watch live events in the browser
+vibe run stop run_… --node <node_id> \
+  --relay wss://vibe-relay.dynastylab.ai --token-file ~/.config/vibe/relay-token   # stop is CLI-only
 ```
+
+For a fully offline check, point the same commands at an in-process `startRelayServer` + a local
+`vibe node daemon --local --relay ws://…` (mock-capable) — no production relay, no paid agent.
 
 ### Codex CLI setup
 

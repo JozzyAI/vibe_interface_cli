@@ -15,7 +15,11 @@
 import http from 'http'
 import { redact } from '../redact.js'
 import { isTerminal, TERMINAL_STATUSES, type RunEvent, type RunStatus } from '../types.js'
+import type { StreamConnEvent } from '../relay/client.js'
 import { renderEventLine, viewerHtml } from './run-web.js'
+
+/** Live connection state of the background relay subscription, shown in the UI. */
+export type StreamState = 'connecting' | 'live' | 'reconnecting' | 'ended' | 'disconnected'
 
 export interface RemotePaneSnapshot {
   run_id: string
@@ -25,7 +29,9 @@ export interface RemotePaneSnapshot {
   content: string
   /** Always 'events' for the remote viewer (it has no local tmux pane). */
   source: 'events'
-  /** True once a terminal event has been observed. */
+  /** Connection state of the relay subscription feeding this buffer. */
+  stream: StreamState
+  /** True once a terminal event has been observed (run finished or stream gave up). */
   ended: boolean
   ts: string
 }
@@ -39,6 +45,7 @@ export class RemoteRunBuffer {
   private lines: string[] = []
   private status: RunStatus | 'unknown'
   private terminated = false
+  private streamState: StreamState = 'connecting'
   private readonly limit: number
 
   constructor(
@@ -51,20 +58,45 @@ export class RemoteRunBuffer {
     this.limit = limit
     // A run that was already finished when the viewer attached gets no further
     // terminal event over the live stream, so seed `ended` from its status.
-    this.terminated = initialStatus !== 'unknown' && TERMINAL_STATUSES.includes(initialStatus)
+    if (initialStatus !== 'unknown' && TERMINAL_STATUSES.includes(initialStatus)) {
+      this.terminated = true
+      this.streamState = 'ended'
+    }
   }
 
   /** Ingest one decoded run event. Updates status, content, and ended-state. */
   push(event: RunEvent): void {
     if (event.type === 'status') this.status = event.status
+    // A give-up disconnect arrives as this synthetic error (see remoteStream);
+    // surface it distinctly from a clean finish.
+    if (event.type === 'error' && event.code === 'stream_disconnected') this.streamState = 'disconnected'
     // redact() again as defence in depth, then bound the retained history.
     this.lines.push(redact(renderEventLine(event)))
     if (this.lines.length > this.limit) this.lines = this.lines.slice(-this.limit)
-    if (isTerminal(event)) this.terminated = true
+    if (isTerminal(event)) {
+      this.terminated = true
+      if (this.streamState !== 'disconnected') this.streamState = 'ended'
+    }
   }
 
-  /** Mark the stream ended without a terminal event (e.g. node went away). */
-  markEnded(): void { this.terminated = true }
+  /** Track the relay subscription's connection state (from remoteStream onEvent). */
+  setStreamState(ev: StreamConnEvent): void {
+    if (this.terminated) return // a finished run's state is sticky
+    switch (ev) {
+      case 'connecting': this.streamState = 'connecting'; break
+      case 'subscribed': this.streamState = 'live'; break
+      case 'reconnect_scheduled': this.streamState = 'reconnecting'; break
+      case 'gave_up': this.streamState = 'disconnected'; break
+      case 'closed': break // transient; the reconnect loop reports the real next state
+    }
+  }
+
+  /** Finalize the buffer when the stream settles (terminal resolve or error). */
+  markEnded(reason: 'completed' | 'disconnected' | 'stream_closed' = 'stream_closed'): void {
+    this.terminated = true
+    if (reason === 'disconnected') this.streamState = 'disconnected'
+    else if (this.streamState !== 'disconnected') this.streamState = 'ended'
+  }
 
   snapshot(): RemotePaneSnapshot {
     return {
@@ -73,6 +105,7 @@ export class RemoteRunBuffer {
       status: this.status,
       content: this.lines.join('\n'),
       source: 'events',
+      stream: this.streamState,
       ended: this.terminated,
       ts: new Date().toISOString(),
     }
