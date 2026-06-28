@@ -128,10 +128,11 @@ cleanup() {
     kill -TERM "$DAEMON_PID" 2>/dev/null; sleep 1; kill -KILL "$DAEMON_PID" 2>/dev/null
   fi
   [ -n "$TMP_TOKEN_FILE" ] && rm -f "$TMP_TOKEN_FILE"
-  # Prune ONLY transient run state. Preserve identity.json + paired_relays.json so
-  # the dedicated identity (and its relay pairing) is reused on the next run; never
+  # Prune ONLY transient run state (incl. per-run workspaces, which otherwise
+  # accumulate one dir per run). Preserve identity.json + paired_relays.json so the
+  # dedicated identity (and its relay pairing) is reused on the next run; never
   # rm -rf the whole VIBE_DIR (that would drop the pairing and re-break registration).
-  rm -rf "$VIBE_DIR/events" "$VIBE_DIR/runs" "$VIBE_DIR/handoff"
+  rm -rf "$VIBE_DIR/events" "$VIBE_DIR/runs" "$VIBE_DIR/handoff" "$VIBE_DIR/workspaces"
   # Verify no lingering daemon for this node-id.
   if pgrep -f "node daemon .*$NODE_ID" >/dev/null 2>&1; then
     say "${RED}! lingering daemon process for $NODE_ID — investigate${NC}"

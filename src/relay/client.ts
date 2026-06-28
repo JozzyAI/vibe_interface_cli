@@ -1072,14 +1072,16 @@ export async function remoteStream(
     if (stopped) return
 
     // Give up: emit an explicit, structured terminal so the caller gets a clear
-    // failure instead of silent inactivity. Never silently stop forwarding.
+    // failure instead of silent inactivity. Routed through printEvent (not raw
+    // safeWrite) so an in-process consumer (onRunEvent) also learns the stream
+    // died and the events respect suppressStdout. Never silently stop forwarding.
     emit('gave_up')
     const ts = t()
-    safeWrite(JSON.stringify({
+    printEvent({
       run_id: runId, ts, type: 'error', code: 'stream_disconnected',
       message: `${lastReason} — the run may still be active on the node`,
-    } satisfies RunEvent) + '\n')
-    safeWrite(JSON.stringify({ run_id: runId, ts, type: 'status', status: 'failed' } satisfies RunEvent) + '\n')
+    } satisfies RunEvent)
+    printEvent({ run_id: runId, ts, type: 'status', status: 'failed' } satisfies RunEvent)
     finished = true
   } finally {
     process.stdout.removeListener('error', onStdoutError)
