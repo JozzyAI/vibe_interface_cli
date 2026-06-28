@@ -161,9 +161,14 @@ if [ "$registered" != "1" ]; then
   sed -E 's/(token[^ ]*)[[:alnum:]_.-]+/\1[REDACTED]/Ig' "$VIBE_DIR/daemon.out" >&2
   # If the relay rejected registration for pairing, print the exact one-time step.
   if grep -qiE 'pair|"ok":false|require-pairing|unpaired' "$VIBE_DIR/daemon.out" 2>/dev/null; then
+    # Show a copy-pasteable pair command with a concrete token-file path: the
+    # operator's own VIBE_RELAY_TOKEN_FILE when they supplied one (it's a path, not
+    # the secret), else the documented default install location. We never print a
+    # temp file made from VIBE_RELAY_TOKEN (it is deleted on exit).
+    PAIR_TOKEN_FILE="${VIBE_RELAY_TOKEN_FILE:-$HOME/.config/vibe/relay-token}"
     say "\n${YELLOW}This smoke identity is not paired with $RELAY_URL.${NC}"
     say "Pair it ONCE (writes the relay's pairing store; this script never pairs):"
-    say "    ${DIM}VIBE_DIR=$VIBE_DIR node $CLI node pair --relay $RELAY_URL --token-file <0600-token-file>${NC}"
+    say "    ${DIM}VIBE_DIR=$VIBE_DIR node $CLI node pair --relay $RELAY_URL --token-file $PAIR_TOKEN_FILE${NC}"
     say "Then re-run this smoke — the identity (node_id=$NODE_ID) is reused and stays paired."
   fi
   fail "node did not register within 20s"
