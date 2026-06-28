@@ -51,19 +51,21 @@ export function tmuxAvailable(): boolean {
   return spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0
 }
 
+/** Render a single run event into one readable line. Shared by the local and
+ *  remote viewers so both present the same output. */
+export function renderEventLine(e: RunEvent): string {
+  switch (e.type) {
+    case 'log': return e.message
+    case 'error': return `ERROR: ${e.message}`
+    case 'status': return `── status: ${e.status} ──`
+    case 'approval_required': return `APPROVAL: ${e.message}`
+    default: return e.type
+  }
+}
+
 /** Render a run's persisted (already-redacted) events into readable lines. */
 function renderEventLog(run_id: string, limit = 400): string {
-  const events = readEvents(run_id)
-  const lines = events.map((e: RunEvent) => {
-    switch (e.type) {
-      case 'log': return e.message
-      case 'error': return `ERROR: ${e.message}`
-      case 'status': return `── status: ${e.status} ──`
-      case 'approval_required': return `APPROVAL: ${e.message}`
-      default: return e.type
-    }
-  })
-  return lines.slice(-limit).join('\n')
+  return readEvents(run_id).map(renderEventLine).slice(-limit).join('\n')
 }
 
 export interface PaneSnapshot {
@@ -121,9 +123,10 @@ export function validateBind(host: string, allowPublicBind: boolean): BindDecisi
   }
 }
 
-function viewerHtml(run_id: string): string {
+export function viewerHtml(run_id: string, opts: { subtitle?: string } = {}): string {
   // Self-contained, no external assets. Pane text is injected via textContent
   // (never innerHTML), so captured content cannot inject markup/script.
+  const subtitle = opts.subtitle ?? 'read-only · 127.0.0.1 · personal'
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -143,7 +146,7 @@ function viewerHtml(run_id: string): string {
 <header>
   <span class="id">${run_id}</span>
   <span class="status" id="status">…</span>
-  <span class="ro">read-only · 127.0.0.1 · personal</span>
+  <span class="ro">${subtitle}</span>
 </header>
 <pre id="pane">connecting…</pre>
 <script>

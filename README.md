@@ -200,6 +200,39 @@ vibe run web <run_id> --port 7681 --json   # prints { url, host, port, mode:"rea
 vibe run stop <run_id>                     # viewer then shows the session as ended
 ```
 
+### Personal Remote Web Viewer
+
+Pass `--node <node_id>` to view a run owned by **another node**, reached over the relay. Same
+private, read-only guarantees as the local viewer — it just sources its data from the relay
+stream instead of a local tmux pane.
+
+- **Private by default:** binds `127.0.0.1` only; non-loopback bind refused without
+  `--allow-public-bind`. No public share URL, no E2E capability link.
+- **Read-only:** only `GET` is served (`405` otherwise); no keyboard input, no shell. Stop a
+  remote run with `vibe run stop <run_id> --node <id> --relay <url>` — never from the browser.
+- **Reuses the relay APIs:** one background subscription (`remoteStream`) fills an in-memory
+  buffer the browser polls; events are passed through secret-redaction before display.
+- **Token hygiene:** the relay token comes from `--token-file <path>` or `VIBE_RELAY_TOKEN` —
+  never `--token <value>` (which would leak into process args).
+- **Structured errors:** an offline node returns `node_offline`, an unknown run `run_not_found`,
+  a missing/invalid token `auth_token_error`; a public bind is refused with `public_bind_refused`.
+
+```
+vibe run web <run_id> --node <node_id> --relay <url> [--token-file <path>] \
+  [--port <port>] [--host 127.0.0.1] [--allow-public-bind] [--json]
+```
+
+```bash
+# Manual smoke against a FAKE relay + a mock node (no production relay, no paid agent):
+# 1. start an in-process relay + a `vibe node daemon --local --relay ws://… ` (mock-capable)
+# 2. start a remote mock run, then point the viewer at it:
+vibe run start --node <node_id> --agent mock --workspace-key demo --relay ws://127.0.0.1:PORT \
+  --token-file /path/to/0600-token --json
+vibe run web <run_id> --node <node_id> --relay ws://127.0.0.1:PORT \
+  --token-file /path/to/0600-token --json   # prints { url, node_id, mode:"read-only", remote:true }
+# open the printed http://127.0.0.1:… — read-only; POST returns 405
+```
+
 ### Codex CLI setup
 
 **Install:**
