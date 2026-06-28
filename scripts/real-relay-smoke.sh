@@ -21,10 +21,20 @@
 #  * DISPATCH-PAUSE GATE (defense-in-depth). Even with the mock-only valve, this
 #    script still refuses to run unless you assert production dispatch is paused:
 #        I_CONFIRM_DISPATCH_PAUSED=1
-#  * ISOLATION. The daemon runs against a throwaway VIBE_DIR and a throwaway
-#    node-id, so it does not disturb this machine's real ~/.vibe or the
-#    persistent node identity (e.g. node_f7cedd3b6590aff9). Nothing is paired or
-#    written under the real ~/.vibe.
+#  * DEDICATED REUSABLE IDENTITY. The relay runs with `--require-pairing`, which
+#    rejects any node whose key-derived identity it has not paired. A throwaway
+#    identity per run can therefore never register. This script instead uses one
+#    persistent, dedicated smoke identity under its own VIBE_DIR
+#    (default ~/.config/vibe/smoke-node, NEVER the real ~/.vibe). Its node_id is
+#    the identity's own key-derived id (a node_<hash>) — it MUST be, because the
+#    relay looks pairings up by node_id == identity.id. The friendly label
+#    "smoke-wsl-lijoe" is carried as the display name (VIBE_NODE_DISPLAY_NAME).
+#  * PAIR ONCE (operator step — this script never pairs). Before the first run,
+#    pair the smoke identity with the relay ONCE (writes the relay's pairing
+#    store). The identity is reused and stays paired thereafter:
+#        VIBE_DIR=~/.config/vibe/smoke-node \
+#          node dist/src/index.js node pair --relay "$RELAY_URL" --token-file <file>
+#    If registration below fails as unpaired, the script prints this exact command.
 #  * TOKEN HYGIENE. The token is read from --token-file (preferred) or the
 #    VIBE_RELAY_TOKEN env. It is NEVER passed as `--token <value>` (which would
 #    leak it into process args), never echoed, and never written to a log.
@@ -39,9 +49,10 @@
 #   I_CONFIRM_DISPATCH_PAUSED=1 RELAY_URL=... VIBE_RELAY_TOKEN=... \
 #     bash scripts/real-relay-smoke.sh
 #
-#   # optional: how long to wait for the relay to mark the node offline/absent
-#   # after the daemon stops (default 90s, ≈6× the relay's 15s default stale window):
-#   SMOKE_OFFLINE_TIMEOUT_SEC=120 ... bash scripts/real-relay-smoke.sh
+#   # optional overrides:
+#   SMOKE_VIBE_DIR=/path/to/smoke-node   # dedicated identity dir (default ~/.config/vibe/smoke-node)
+#   SMOKE_DISPLAY_NAME=smoke-wsl-lijoe   # friendly label shown in `node list`
+#   SMOKE_OFFLINE_TIMEOUT_SEC=120        # wait for relay to mark node offline/absent (default 90s)
 #
 set -euo pipefail
 
@@ -54,8 +65,9 @@ CLI="$REPO_ROOT/dist/src/index.js"
 [ -f "$CLI" ] || fail "CLI not built: $CLI (run: npm run build && chmod +x dist/src/index.js)"
 
 RELAY_URL="${RELAY_URL:-wss://vibe-relay.dynastylab.ai}"
-NODE_ID="smoke-$(date +%s)-$$"           # throwaway node-id; never the persistent one
 WORKSPACE_KEY="real-relay-smoke-$$"
+SMOKE_VIBE_DIR="${SMOKE_VIBE_DIR:-$HOME/.config/vibe/smoke-node}"  # dedicated, reused, paired identity
+SMOKE_DISPLAY_NAME="${SMOKE_DISPLAY_NAME:-smoke-wsl-lijoe}"        # friendly label in `node list`
 
 # ── 1. Safety gate ───────────────────────────────────────────────────────────
 if [ "${I_CONFIRM_DISPATCH_PAUSED:-}" != "1" ]; then
@@ -82,16 +94,32 @@ else
   fail "no token: set VIBE_RELAY_TOKEN_FILE=<0600 path> or VIBE_RELAY_TOKEN=<value> (never --token)"
 fi
 
-# ── 3. Isolated, throwaway state ─────────────────────────────────────────────
-VIBE_DIR="$(mktemp -d -t vibe-real-smoke-XXXXXX)"
+# ── 3. Dedicated, reusable, paired identity (NOT throwaway) ───────────────────
+# A persistent VIBE_DIR holds one stable identity.json (created 0600 on first run).
+# Its key-derived id is the node_id we register and pair — reused across runs so a
+# `--require-pairing` relay accepts it. This dir is separate from the real ~/.vibe.
+mkdir -p "$SMOKE_VIBE_DIR"; chmod 700 "$SMOKE_VIBE_DIR" 2>/dev/null || true
+VIBE_DIR="$SMOKE_VIBE_DIR"
 export VIBE_DIR
+# Friendly display name (bites only on first-ever identity creation; persisted after).
+export VIBE_NODE_DISPLAY_NAME="$SMOKE_DISPLAY_NAME"
 # Mock-only advertise valve (PR #23): the daemon publishes EXACTLY ["mock"] to the
-# relay, so no real claude-code job can ever be dispatched to this throwaway node.
+# relay, so no real claude-code job can ever be dispatched to this node.
 export VIBE_NODE_ADVERTISE_AGENTS=mock
+
+# Derive the node_id from the identity — purely local (ensureIdentity, create-if-
+# missing, 0600). No relay contact. The daemon registers as this same identity.id,
+# so we DO NOT pass --node-id (an arbitrary id could never match the relay pairing,
+# which is keyed by identity.id).
+NODE_ID="$(node "$CLI" node identity --json 2>/dev/null \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')"
+[ -n "$NODE_ID" ] || fail "could not derive node identity id from $VIBE_DIR"
+
 say "${CYAN}relay${NC}     $RELAY_URL"
-say "${CYAN}node-id${NC}   $NODE_ID  ${DIM}(throwaway)${NC}"
+say "${CYAN}node-id${NC}   $NODE_ID  ${DIM}(stable identity.id — paired once)${NC}"
+say "${CYAN}name${NC}      $SMOKE_DISPLAY_NAME  ${DIM}(display label)${NC}"
 say "${CYAN}advertise${NC} $VIBE_NODE_ADVERTISE_AGENTS  ${DIM}(mock-only — never claude-code)${NC}"
-say "${CYAN}VIBE_DIR${NC}  $VIBE_DIR  ${DIM}(throwaway — real ~/.vibe untouched)${NC}"
+say "${CYAN}VIBE_DIR${NC}  $VIBE_DIR  ${DIM}(dedicated — identity reused, real ~/.vibe untouched)${NC}"
 
 DAEMON_PID=""
 cleanup() {
@@ -100,8 +128,11 @@ cleanup() {
     kill -TERM "$DAEMON_PID" 2>/dev/null; sleep 1; kill -KILL "$DAEMON_PID" 2>/dev/null
   fi
   [ -n "$TMP_TOKEN_FILE" ] && rm -f "$TMP_TOKEN_FILE"
-  rm -rf "$VIBE_DIR"
-  # Verify no lingering daemon for this throwaway node-id.
+  # Prune ONLY transient run state. Preserve identity.json + paired_relays.json so
+  # the dedicated identity (and its relay pairing) is reused on the next run; never
+  # rm -rf the whole VIBE_DIR (that would drop the pairing and re-break registration).
+  rm -rf "$VIBE_DIR/events" "$VIBE_DIR/runs" "$VIBE_DIR/handoff"
+  # Verify no lingering daemon for this node-id.
   if pgrep -f "node daemon .*$NODE_ID" >/dev/null 2>&1; then
     say "${RED}! lingering daemon process for $NODE_ID — investigate${NC}"
   else
@@ -112,7 +143,9 @@ trap cleanup EXIT
 
 # ── 4. Bring the node online (token via --token-file, never argv) ────────────
 say "\n${DIM}starting node daemon…${NC}"
-node "$CLI" node daemon --local --relay "$RELAY_URL" --token-file "$TOKEN_FILE" --node-id "$NODE_ID" \
+# No --node-id: the daemon registers as its own identity.id (== $NODE_ID), which is
+# the only id the --require-pairing relay can match against its pairing store.
+node "$CLI" node daemon --local --relay "$RELAY_URL" --token-file "$TOKEN_FILE" \
   > "$VIBE_DIR/daemon.out" 2>&1 &
 DAEMON_PID=$!
 
@@ -123,7 +156,23 @@ for _ in $(seq 1 20); do
   if node "$CLI" node list --remote --relay "$RELAY_URL" --token-file "$TOKEN_FILE" --json 2>/dev/null \
        | grep -q "\"$NODE_ID\""; then registered=1; break; fi
 done
-[ "$registered" = "1" ] || { say "${DIM}daemon output:${NC}"; sed -E 's/(token[^ ]*)[[:alnum:]_.-]+/\1[REDACTED]/Ig' "$VIBE_DIR/daemon.out"; fail "node did not register within 20s"; }
+if [ "$registered" != "1" ]; then
+  say "${DIM}daemon output (token redacted):${NC}"
+  sed -E 's/(token[^ ]*)[[:alnum:]_.-]+/\1[REDACTED]/Ig' "$VIBE_DIR/daemon.out" >&2
+  # If the relay rejected registration for pairing, print the exact one-time step.
+  if grep -qiE 'pair|"ok":false|require-pairing|unpaired' "$VIBE_DIR/daemon.out" 2>/dev/null; then
+    # Show a copy-pasteable pair command with a concrete token-file path: the
+    # operator's own VIBE_RELAY_TOKEN_FILE when they supplied one (it's a path, not
+    # the secret), else the documented default install location. We never print a
+    # temp file made from VIBE_RELAY_TOKEN (it is deleted on exit).
+    PAIR_TOKEN_FILE="${VIBE_RELAY_TOKEN_FILE:-$HOME/.config/vibe/relay-token}"
+    say "\n${YELLOW}This smoke identity is not paired with $RELAY_URL.${NC}"
+    say "Pair it ONCE (writes the relay's pairing store; this script never pairs):"
+    say "    ${DIM}VIBE_DIR=$VIBE_DIR node $CLI node pair --relay $RELAY_URL --token-file $PAIR_TOKEN_FILE${NC}"
+    say "Then re-run this smoke — the identity (node_id=$NODE_ID) is reused and stays paired."
+  fi
+  fail "node did not register within 20s"
+fi
 say "${GREEN}✓ 1. node registered and visible in \`node list --remote\`${NC}"
 
 # ── 4b. Verify the node advertises EXACTLY ["mock"] (PR #23 mock-only valve) ──
@@ -184,7 +233,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 case "$node_state" in
   absent|offline|stale)
-    say "${GREEN}✓ 6. throwaway node is '${node_state}' on the relay after cleanup${NC}" ;;
+    say "${GREEN}✓ 6. smoke node is '${node_state}' on the relay after cleanup${NC}" ;;
   *)
     fail "cleanup verification failed: node $NODE_ID still '${node_state}' after ${OFFLINE_TIMEOUT}s" ;;
 esac
