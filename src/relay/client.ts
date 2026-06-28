@@ -201,15 +201,34 @@ async function handleEncryptedRunStart(
  * Poll the run's JSONL event log and forward each new event to the relay.
  * If eventAesKey is provided (encrypted run), encrypts each event before sending
  * as encrypted_run_event. Otherwise sends plaintext run_event (backward-compatible).
- * Resolves after a terminal event or a 2-minute safety timeout.
+ * Resolves after a terminal event or after IDLE_TIMEOUT_MS with no new events.
  */
 function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey?: string): Promise<void> {
   const eventsFile = path.join(vibeDir(), 'events', `${runId}.jsonl`)
   let offset = 0
 
+  // Stop tailing only after IDLE_TIMEOUT_MS with NO new events. A fixed wall-clock
+  // cap (the previous 120s safety timeout) truncated forwarding mid-run for any
+  // agent run longer than the cap: later events — including the terminal
+  // completed/failed event — were never forwarded, so a remote controller saw the
+  // run go quiet and false-stalled it. The timer is reset on every batch of new
+  // bytes, so an active run forwards indefinitely until it emits a terminal event.
+  // The idle window is comfortably larger than typical controller stall windows.
+  const IDLE_TIMEOUT_MS = 600_000
+
   return new Promise<void>((resolve) => {
     let timer: ReturnType<typeof setInterval>
-    let safetyTimer: ReturnType<typeof setTimeout>
+    let idleTimer: ReturnType<typeof setTimeout>
+
+    const finish = () => {
+      clearInterval(timer)
+      clearTimeout(idleTimer)
+      resolve()
+    }
+    const armIdle = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(finish, IDLE_TIMEOUT_MS)
+    }
 
     const flush = (): boolean => {
       try {
@@ -221,6 +240,7 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
         fs.readSync(fd, buf, 0, buf.length, offset)
         fs.closeSync(fd)
         offset = stat.size
+        armIdle() // new bytes => run still active; extend the idle deadline
 
         const lines = buf.toString('utf8').split('\n').filter(Boolean)
         for (const line of lines) {
@@ -248,9 +268,7 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
               })
             }
             if (isTerminal(event)) {
-              clearInterval(timer)
-              clearTimeout(safetyTimer)
-              resolve()
+              finish()
               return true
             }
           } catch {}
@@ -262,7 +280,7 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
     if (flush()) return
 
     timer = setInterval(() => { if (flush()) clearInterval(timer) }, 250)
-    safetyTimer = setTimeout(() => { clearInterval(timer); resolve() }, 120_000)
+    armIdle()
   })
 }
 
