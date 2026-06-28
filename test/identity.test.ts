@@ -21,10 +21,21 @@ const TEST_TOKEN = `tok-id-${Date.now()}`
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /** Run CLI command in an isolated VIBE_DIR (temp dir), return stdout/stderr. */
-async function vibeWithHome(args: string[], vibeHome: string): Promise<{ status: number; stdout: string; stderr: string }> {
+async function vibeWithHome(
+  args: string[],
+  vibeHome: string,
+  extraEnv: Record<string, string | undefined> = {},
+): Promise<{ status: number; stdout: string; stderr: string }> {
+  const env: NodeJS.ProcessEnv = { ...process.env, VIBE_DIR: vibeHome }
+  // Apply overrides; an explicit `undefined` removes an inherited var so a test
+  // can exercise the unset case even if the parent env happens to define it.
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (v === undefined) delete env[k]
+    else env[k] = v
+  }
   return new Promise((resolve) => {
     const proc = spawn(NODE, [CLI, ...args], {
-      env: { ...process.env, VIBE_DIR: vibeHome },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = '', stderr = ''
@@ -116,6 +127,37 @@ test('identity: node_id derived from public key (not hostname)', async () => {
   const pub = JSON.parse(stdout)
   // The id must be node_ + first 16 hex chars of SHA256(signing_public_key)
   assert.match(pub.id, /^node_[0-9a-f]{16}$/, `id format: ${pub.id}`)
+  fs.rmSync(home, { recursive: true })
+})
+
+test('identity: VIBE_NODE_DISPLAY_NAME sets the display name at creation', async () => {
+  const home = tmpDir()
+  const { status, stdout } = await vibeWithHome(['node', 'identity', '--json'], home, { VIBE_NODE_DISPLAY_NAME: 'smoke-wsl-lijoe' })
+  assert.equal(status, 0)
+  const pub = JSON.parse(stdout)
+  assert.equal(pub.display_name, 'smoke-wsl-lijoe', 'display_name should honour VIBE_NODE_DISPLAY_NAME')
+  // The friendly label must not perturb the key-derived id (pairing key).
+  assert.match(pub.id, /^node_[0-9a-f]{16}$/, `id format: ${pub.id}`)
+  fs.rmSync(home, { recursive: true })
+})
+
+test('identity: display name falls back to hostname when VIBE_NODE_DISPLAY_NAME is unset/blank', async () => {
+  const home = tmpDir()
+  // Blank/whitespace is treated as unset → host name.
+  const { stdout } = await vibeWithHome(['node', 'identity', '--json'], home, { VIBE_NODE_DISPLAY_NAME: '   ' })
+  const pub = JSON.parse(stdout)
+  assert.equal(pub.display_name, os.hostname(), 'blank display name should fall back to hostname')
+  fs.rmSync(home, { recursive: true })
+})
+
+test('identity: display name is fixed at creation, ignoring later env changes', async () => {
+  const home = tmpDir()
+  // Create with one label…
+  await vibeWithHome(['node', 'identity', '--json'], home, { VIBE_NODE_DISPLAY_NAME: 'first-label' })
+  // …a later call with a different label must not rewrite the persisted identity.
+  const { stdout } = await vibeWithHome(['node', 'identity', '--json'], home, { VIBE_NODE_DISPLAY_NAME: 'second-label' })
+  const pub = JSON.parse(stdout)
+  assert.equal(pub.display_name, 'first-label', 'display_name is set once at creation and persists')
   fs.rmSync(home, { recursive: true })
 })
 

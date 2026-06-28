@@ -73,7 +73,11 @@ export function createIdentity(kind: IdentityKind = 'node'): IdentityFile {
     version: 1,
     kind,
     id: deriveIdFromPublicKey(sigPub),
-    display_name: os.hostname(),
+    // Friendly label shown in `node list` (via buildNode → VibeNode.name). Settable
+    // at creation only — it persists in identity.json thereafter — so a dedicated
+    // identity (e.g. the real-relay smoke node) can be recognised without changing
+    // its key-derived id. Unset/blank falls back to the host name (prior behaviour).
+    display_name: process.env.VIBE_NODE_DISPLAY_NAME?.trim() || os.hostname(),
     created_at: new Date().toISOString(),
     signing: {
       alg: 'Ed25519',

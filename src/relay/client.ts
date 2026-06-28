@@ -340,7 +340,10 @@ export async function relayNodeDaemon(
   // Built fresh per connection so active_runs / updated_at reflect current state.
   const buildNode = (): VibeNode => ({
     node_id: nodeId,
-    name: os.hostname(),
+    // Prefer the identity's persisted display name so a dedicated identity surfaces
+    // under its friendly label in `node list`; falls back to the host name for nodes
+    // without an identity (identity.display_name itself defaults to the host name).
+    name: identity?.display_name ?? os.hostname(),
     status: 'online',
     transport: 'relay',
     capabilities: ['run', 'stream', 'stop', 'workspace'],
