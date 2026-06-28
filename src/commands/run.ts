@@ -225,7 +225,11 @@ export function registerRunCommand(program: Command): void {
 
   run
     .command('web <run_id>')
-    .description('serve a personal, local, read-only web viewer for a run (local tmux runs only)')
+    .description('serve a personal, local, read-only web viewer for a run (local tmux runs, or a remote run with --node)')
+    .option('--node <node_id>', 'view a REMOTE run owned by this node over the relay (read-only)')
+    .option('--relay <url>', 'relay WebSocket URL (required with --node)')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
     .option('--port <port>', 'port to bind (default: an ephemeral free port)', '0')
     .option('--host <host>', 'host to bind (default: 127.0.0.1 — private)', '127.0.0.1')
     .option('--allow-public-bind', 'permit binding a non-loopback host (exposes the session on the network)')
@@ -234,6 +238,12 @@ export function registerRunCommand(program: Command): void {
       const fail = (code: string, message: string, extra: Record<string, unknown> = {}) => {
         process.stdout.write(JSON.stringify({ error: true, code, run_id, message, ...extra, ts: new Date().toISOString() }) + '\n')
         process.exit(1)
+      }
+
+      // Remote viewer branch: --node => view a run on another node over the relay.
+      if (opts.node) {
+        await serveRemoteWebViewer(run_id, opts, fail)
+        return
       }
 
       // 1. Refuse a public bind unless explicitly allowed.
@@ -278,4 +288,82 @@ export function registerRunCommand(program: Command): void {
       process.on('SIGINT', shutdown)
       process.on('SIGTERM', shutdown)
     })
+}
+
+/**
+ * Read-only personal web viewer for a REMOTE run (owned by another node, reached
+ * over the relay). Private by default (127.0.0.1); reuses the existing
+ * remoteRunStatus/remoteStream relay APIs; stop stays a CLI op (no browser
+ * control). Token comes from --token-file/env (never echoed).
+ */
+async function serveRemoteWebViewer(
+  run_id: string,
+  opts: Record<string, unknown>,
+  fail: (code: string, message: string, extra?: Record<string, unknown>) => void,
+): Promise<void> {
+  const node_id = opts.node as string
+  if (!opts.relay) { fail('relay_required', '--relay <url> is required with --node', { node_id }); return }
+
+  // 1. Refuse a public bind unless explicitly allowed (same rule as the local viewer).
+  const bind = validateBind(opts.host as string, Boolean(opts.allowPublicBind))
+  if (!bind.ok) { fail(bind.code, bind.message, { node_id }); return }
+  if (opts.allowPublicBind && !['127.0.0.1', 'localhost', '::1'].includes(opts.host as string)) {
+    process.stderr.write(`warning: binding ${opts.host} exposes this remote run's viewer on the network. It is read-only, but anyone who can reach this host can watch it.\n`)
+  }
+
+  // 2. Resolve the relay token without putting it in argv.
+  const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+  let token: string
+  try {
+    token = resolveRelayToken({ tokenFile: opts.tokenFile as string | undefined, token: opts.token as string | undefined })
+  } catch (err) {
+    fail('auth_token_error', (err as Error).message, { node_id })
+    return
+  }
+  warnIfTokenArg({ tokenFile: opts.tokenFile as string | undefined, token: opts.token as string | undefined })
+
+  const { remoteRunStatus, remoteStream } = await import('../relay/client.js')
+  const { RemoteRunBuffer, mapRemoteStatusError, startRemoteViewerServer } = await import('../lib/run-web-remote.js')
+
+  // 3. Pre-flight: confirm the node is online and the run exists (structured codes).
+  let record
+  try {
+    record = await remoteRunStatus(opts.relay as string, token, run_id)
+  } catch (err) {
+    const mapped = mapRemoteStatusError(err)
+    fail(mapped.code, mapped.message, { node_id })
+    return
+  }
+
+  // 4. Background subscription fills the buffer the viewer serves. A stream error
+  //    just ends the buffer — the viewer keeps serving the last snapshot.
+  const buffer = new RemoteRunBuffer(run_id, node_id, record.status)
+  const controller = new AbortController()
+  void remoteStream(opts.relay as string, token, run_id, {
+    onRunEvent: (ev) => buffer.push(ev),
+    suppressStdout: true,
+    signal: controller.signal,
+  }).catch(() => buffer.markEnded())
+
+  // 5. Start the read-only HTTP viewer.
+  const port = Number.parseInt(opts.port as string, 10) || 0
+  let server
+  try {
+    server = await startRemoteViewerServer({ run_id, node_id, host: bind.host, port, buffer })
+  } catch (err) {
+    controller.abort()
+    fail('web_viewer_start_failed', `failed to bind ${bind.host}:${port}: ${(err as Error).message}`, { node_id })
+    return
+  }
+
+  const info = { run_id, node_id, url: server.url, host: server.host, port: server.port, mode: 'read-only', remote: true, ts: new Date().toISOString() }
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(info) + '\n')
+  } else {
+    process.stdout.write(`vibe run web: read-only REMOTE viewer for ${run_id} (node ${node_id}) at ${server.url}  (Ctrl-C to stop)\n`)
+  }
+
+  const shutdown = () => { controller.abort(); server!.close().finally(() => process.exit(0)) }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }

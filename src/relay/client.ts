@@ -887,6 +887,13 @@ export interface RemoteStreamControl {
   pingMs?: number
   /** Lifecycle observer (test hook). */
   onEvent?: (ev: StreamConnEvent) => void
+  /** Called with each decoded run event (plaintext or decrypted), in addition to
+   *  the normal stdout forwarding. Lets an in-process consumer (e.g. the remote
+   *  web viewer) buffer events without re-implementing the WS/decrypt plumbing. */
+  onRunEvent?: (event: RunEvent) => void
+  /** When true, do not write events to process.stdout — the consumer takes them
+   *  via {@link onRunEvent} instead. Unset preserves the CLI stdout behaviour. */
+  suppressStdout?: boolean
 }
 
 /** Outcome of a single subscriber connection attempt. */
@@ -945,9 +952,11 @@ export async function remoteStream(
     if (finished || stopped) return
     try { process.stdout.write(line) } catch { /* downstream gone; onStdoutError handles it */ }
   }
-  /** Print one event; returns true if it was terminal. */
+  /** Forward one event; returns true if it was terminal. Delivers to an in-process
+   *  consumer via onRunEvent (if set) and to stdout unless suppressed. */
   const printEvent = (event: RunEvent): boolean => {
-    safeWrite(JSON.stringify(event) + '\n')
+    try { control?.onRunEvent?.(event) } catch { /* a buggy consumer must not kill the stream */ }
+    if (!control?.suppressStdout) safeWrite(JSON.stringify(event) + '\n')
     return isTerminal(event)
   }
 
