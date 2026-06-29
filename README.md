@@ -56,6 +56,28 @@ vibe node daemon --local [--relay <url> --token <token>]
 vibe relay dev   --port <port> --token <token> [--require-pairing]
 ```
 
+## Connect a machine — `vibe connect`
+
+One guided command to onboard a machine to a relay — it hides VIBE_DIR, node identity, pairing,
+relay token, node_id, and advertised agents behind a single step. It creates or reuses a node
+identity, writes a **reusable local profile** (`~/.config/vibe/profile.json`; honors
+`$XDG_CONFIG_HOME`), and pairs with the relay **only after you confirm**. It **never starts a
+daemon** (it prints the command) and **never stores or prints the relay token** — only the
+token-file path.
+
+```bash
+# Preview first — shows exactly what would be created/written/paired, changes nothing:
+vibe connect --name work-laptop --relay wss://… --token-file ~/.config/vibe/relay-token --dry-run
+
+# Then connect for real (prompts before it pairs; --yes skips the prompt). Mock-only by default:
+vibe connect --name work-laptop --relay wss://… --token-file ~/.config/vibe/relay-token
+# → creates/reuses identity, writes the profile, pairs (after y/N), and prints:
+#     VIBE_DIR=… VIBE_NODE_ADVERTISE_AGENTS=mock vibe node daemon --local --relay … --token-file …
+```
+
+Re-running `vibe connect` reuses the saved profile, so you don't repeat `--relay`/`--token-file`/
+`--name`. Advertised agents default to `["mock"]` (or pass `--mock-only` / `--advertise-agent`).
+
 ## 5-minute quickstart
 
 ```bash
