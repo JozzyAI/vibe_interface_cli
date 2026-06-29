@@ -74,13 +74,20 @@ vibe connect --relay wss://… --token-file ~/.config/vibe/relay-token --yes
 
 # After connecting, just start the node — it reads relay/token/VIBE_DIR/agents from the profile:
 vibe node daemon
+
+# Remote run commands read the same profile, so you can drop --relay/--token-file too:
+vibe run start  --node <node_id> --agent mock --workspace-key demo
+vibe run stream <run_id>
+vibe run stop   <run_id>
 ```
 
-`vibe node daemon` fills missing settings from the profile (`vibe_dir`, `relay_url`, `token_file`,
+Both `vibe node daemon` and the remote run commands (`run start` / `run stream` / `run stop`) fill
+missing settings from the profile (`vibe_dir`, `relay_url`, `token_file`; the daemon also fills
 `advertise_agents`), so you don't repeat them. Precedence is **CLI flag > env var > profile >
-default**, so explicit flags/env still override the profile; with **no profile**, `vibe node daemon`
-behaves exactly as before (and still requires `--local`). Re-running `vibe connect` also reuses the
-saved profile. The profile stores only the **token-file path** — never the token value.
+default**, so explicit flags/env still override the profile; with **no profile**, everything behaves
+exactly as before (`vibe node daemon` still requires `--local`). Re-running `vibe connect` also
+reuses the saved profile. The profile stores only the **token-file path** — never the token value.
+(`vibe run web` is unaffected — it still takes `--relay`/`--token-file` explicitly.)
 
 ## 5-minute quickstart
 
