@@ -111,21 +111,43 @@ export function registerNodeCommand(program: Command): void {
       [] as string[],
     )
     .action(async (opts) => {
-      if (!opts.local) {
+      // Fill missing daemon settings from the `vibe connect` profile so a connected
+      // machine can just run `vibe node daemon`. Precedence: CLI flag > env > profile
+      // > default. A profile also implies local mode (the machine was onboarded as a
+      // local node); without a profile, --local stays required (back-compat).
+      const { loadProfile, resolveDaemonDefaults } = await import('../lib/node-config.js')
+      const defaults = resolveDaemonDefaults(
+        {
+          local: opts.local as boolean | undefined,
+          relay: opts.relay as string | undefined,
+          token: opts.token as string | undefined,
+          tokenFile: opts.tokenFile as string | undefined,
+          advertiseAgent: opts.advertiseAgent as string[],
+        },
+        loadProfile(),
+        {
+          VIBE_DIR: process.env.VIBE_DIR,
+          VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN,
+          VIBE_NODE_ADVERTISE_AGENTS: process.env.VIBE_NODE_ADVERTISE_AGENTS,
+        },
+      )
+
+      if (!defaults.local) {
         process.stderr.write('error: --local flag is required (remote nodes not yet supported without --relay)\n')
         process.exit(1)
       }
+      // Apply the profile's VIBE_DIR only when the env var is unset (env > profile),
+      // before any identity/daemon work reads vibeDir().
+      if (defaults.vibeDir) process.env.VIBE_DIR = defaults.vibeDir
+
       // Validate the advertise allowlist up front so a bad value (or env) fails
       // fast with a structured error, before any relay connection is attempted.
-      // Thread an explicit allowlist down only when the flag was given; when it
-      // isn't, resolveAdvertisedAgents() falls back to VIBE_NODE_ADVERTISE_AGENTS
-      // (or the default), so unset behaviour is untouched.
-      const advertiseAgents = (opts.advertiseAgent as string[]).length ? (opts.advertiseAgent as string[]) : undefined
+      // `advertiseAgents` is undefined unless a flag (or, via the profile, an
+      // explicit value) was set, so resolveAdvertisedAgents still applies env/default.
+      const advertiseAgents = defaults.advertiseAgents
       {
         const { resolveAdvertisedAgents, AdvertiseAllowlistError } = await import('../agent-registry.js')
         try {
-          // Validate up front (flag > env) so a bad value fails fast with a
-          // structured error before any relay connection is attempted.
           resolveAdvertisedAgents(advertiseAgents)
         } catch (err) {
           if (err instanceof AdvertiseAllowlistError) {
@@ -136,22 +158,22 @@ export function registerNodeCommand(program: Command): void {
         }
       }
       // Relay mode needs a token, but it must not have to come from argv: resolve
-      // it from --token-file / --token / VIBE_RELAY_TOKEN so the long-running
-      // daemon can be launched without the token in `ps` output.
+      // it from --token-file (CLI or profile) / --token / VIBE_RELAY_TOKEN so the
+      // long-running daemon can be launched without the token in `ps` output.
       let token: string | undefined
-      if (opts.relay) {
+      if (defaults.relay) {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile as string | undefined, token: opts.token as string | undefined })
+          token = resolveRelayToken({ tokenFile: defaults.tokenFile, token: opts.token as string | undefined })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile as string | undefined, token: opts.token as string | undefined })
+        warnIfTokenArg({ tokenFile: defaults.tokenFile, token: opts.token as string | undefined })
       }
       const { runLocalDaemon } = await import('../node-daemon.js')
       await runLocalDaemon({
-        relay: opts.relay as string | undefined,
+        relay: defaults.relay,
         token,
         nodeId: opts.nodeId as string | undefined,
         advertiseAgents,
