@@ -12,6 +12,7 @@
  *     ever reaches the browser, so a secret echoed into the pane is scrubbed.
  */
 import http from 'http'
+import crypto from 'crypto'
 import { spawnSync } from 'child_process'
 import { tryReadRun } from '../store.js'
 import { readEvents } from '../events.js'
@@ -123,6 +124,54 @@ export function validateBind(host: string, allowPublicBind: boolean): BindDecisi
   }
 }
 
+// ── Public-bind access gate ──────────────────────────────────────────────────
+// The viewer is private (loopback) by default and needs no auth. When it is
+// public-bound (--allow-public-bind), the command generates a one-time access
+// token; the server then requires it so the read-only viewer is not exposed to
+// the whole network unauthenticated. This token is LOCAL-only: it gates this one
+// HTTP process and is never sent to the relay (it is NOT the relay token).
+
+const ACCESS_COOKIE = 'vibe_access'
+
+/** Generate a local viewer access token (used only when public-binding). */
+export function generateAccessToken(): string {
+  return crypto.randomBytes(32).toString('base64url')
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a), bb = Buffer.from(b)
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb)
+}
+
+function cookieValue(header: string | undefined, name: string): string | undefined {
+  if (!header) return undefined
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq === -1) continue
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim()
+  }
+  return undefined
+}
+
+export type AccessDecision = { ok: true; setCookie?: string } | { ok: false }
+
+/**
+ * Authorize a viewer request. When `accessToken` is undefined the gate is off
+ * (loopback default — frictionless). Otherwise the request must carry the token
+ * via the `?access=` query (first hit also sets an HttpOnly cookie so later polls
+ * need no query) or the `vibe_access` cookie. Constant-time compared.
+ */
+export function checkViewerAccess(req: http.IncomingMessage, accessToken?: string): AccessDecision {
+  if (!accessToken) return { ok: true }
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams.get('access')
+  if (query && safeEqual(query, accessToken)) {
+    return { ok: true, setCookie: `${ACCESS_COOKIE}=${accessToken}; HttpOnly; SameSite=Strict; Path=/` }
+  }
+  const cookie = cookieValue(req.headers.cookie, ACCESS_COOKIE)
+  if (cookie && safeEqual(cookie, accessToken)) return { ok: true }
+  return { ok: false }
+}
+
 export function viewerHtml(run_id: string, opts: { subtitle?: string } = {}): string {
   // Self-contained, no external assets. Pane text is injected via textContent
   // (never innerHTML), so captured content cannot inject markup/script.
@@ -222,6 +271,8 @@ export interface ViewerOptions {
   tmux_session: string
   host: string
   port: number
+  /** When set (public bind), requests must carry this token; else 401. */
+  accessToken?: string
 }
 
 /**
@@ -231,6 +282,13 @@ export interface ViewerOptions {
  */
 export function startViewerServer(opts: ViewerOptions): Promise<ViewerServer> {
   const server = http.createServer((req, res) => {
+    const access = checkViewerAccess(req, opts.accessToken)
+    if (!access.ok) {
+      res.writeHead(401, { 'content-type': 'text/plain' })
+      res.end('unauthorized\n')
+      return
+    }
+    if (access.setCookie) res.setHeader('set-cookie', access.setCookie)
     if (req.method !== 'GET') {
       res.writeHead(405, { 'content-type': 'text/plain', allow: 'GET' })
       res.end('method not allowed (viewer is read-only)\n')

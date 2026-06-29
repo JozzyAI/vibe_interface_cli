@@ -16,7 +16,7 @@ import http from 'http'
 import { redact } from '../redact.js'
 import { isTerminal, TERMINAL_STATUSES, type RunEvent, type RunStatus } from '../types.js'
 import type { StreamConnEvent } from '../relay/client.js'
-import { renderEventLine, viewerHtml } from './run-web.js'
+import { renderEventLine, viewerHtml, checkViewerAccess } from './run-web.js'
 
 /** Live connection state of the background relay subscription, shown in the UI. */
 export type StreamState = 'connecting' | 'live' | 'reconnecting' | 'ended' | 'disconnected'
@@ -145,6 +145,8 @@ export interface RemoteViewerOptions {
   host: string
   port: number
   buffer: RemoteRunBuffer
+  /** When set (public bind), requests must carry this token; else 401. */
+  accessToken?: string
 }
 
 /**
@@ -154,6 +156,13 @@ export interface RemoteViewerOptions {
  */
 export function startRemoteViewerServer(opts: RemoteViewerOptions): Promise<RemoteViewerServer> {
   const server = http.createServer((req, res) => {
+    const access = checkViewerAccess(req, opts.accessToken)
+    if (!access.ok) {
+      res.writeHead(401, { 'content-type': 'text/plain' })
+      res.end('unauthorized\n')
+      return
+    }
+    if (access.setCookie) res.setHeader('set-cookie', access.setCookie)
     if (req.method !== 'GET') {
       res.writeHead(405, { 'content-type': 'text/plain', allow: 'GET' })
       res.end('method not allowed (viewer is read-only)\n')

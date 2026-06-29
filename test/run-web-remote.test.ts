@@ -18,7 +18,7 @@ import { fileURLToPath } from 'url'
 import { freshVibeDir } from './helpers/agent-fixtures.js'
 import { startRelayServer } from '../src/relay/server.js'
 import { remoteStream, remoteRunStatus } from '../src/relay/client.js'
-import { validateBind } from '../src/lib/run-web.js'
+import { validateBind, generateAccessToken } from '../src/lib/run-web.js'
 import { RemoteRunBuffer, mapRemoteStatusError, startRemoteViewerServer } from '../src/lib/run-web-remote.js'
 import type { RunEvent, RunStatus, VibeNode } from '../src/types.js'
 
@@ -148,6 +148,57 @@ test('startRemoteViewerServer: reports ended after a terminal event', async () =
   } finally {
     await server.close()
   }
+})
+
+// ── 1d. public-bind access gate ─────────────────────────────────────────────
+
+test('access gate: 401 without token, 200 with token (+ HttpOnly cookie), 200 with cookie', async () => {
+  const buf = new RemoteRunBuffer('run_x', 'node_abc', 'running')
+  buf.push(logEv('secret-pane-line'))
+  const TOKEN = generateAccessToken()
+  const server = await startRemoteViewerServer({ run_id: 'run_x', node_id: 'node_abc', host: '127.0.0.1', port: 0, buffer: buf, accessToken: TOKEN })
+  try {
+    // No / wrong token → 401 (before any routing).
+    assert.equal((await fetch(`${server.url}/`)).status, 401, 'no token → 401')
+    assert.equal((await fetch(`${server.url}/api/pane`)).status, 401, 'no token on api → 401')
+    assert.equal((await fetch(`${server.url}/?access=wrong`)).status, 401, 'wrong token → 401')
+
+    // Correct token in query → 200 and an HttpOnly cookie is set.
+    const ok = await fetch(`${server.url}/?access=${TOKEN}`)
+    assert.equal(ok.status, 200)
+    const setCookie = ok.headers.get('set-cookie') ?? ''
+    assert.match(setCookie, /vibe_access=/, 'sets the access cookie')
+    assert.match(setCookie, /HttpOnly/, 'cookie is HttpOnly')
+
+    // Cookie alone authorizes subsequent polls (no query needed).
+    const viaCookie = await fetch(`${server.url}/api/pane`, { headers: { cookie: `vibe_access=${TOKEN}` } })
+    assert.equal(viaCookie.status, 200, 'cookie authorizes /api/pane')
+    const paneText = await viaCookie.text()
+    assert.ok(!paneText.includes(TOKEN), 'access token never echoed into the pane payload')
+
+    // Read-only is preserved even when authorized.
+    assert.equal((await fetch(`${server.url}/?access=${TOKEN}`, { method: 'POST' })).status, 405, 'POST still 405')
+  } finally {
+    await server.close()
+  }
+})
+
+test('access gate off (loopback default): no token ⇒ frictionless 200s', async () => {
+  const buf = new RemoteRunBuffer('run_x', 'node_abc', 'running')
+  const server = await startRemoteViewerServer({ run_id: 'run_x', node_id: 'node_abc', host: '127.0.0.1', port: 0, buffer: buf })
+  try {
+    assert.equal((await fetch(`${server.url}/`)).status, 200)
+    assert.equal((await fetch(`${server.url}/api/pane`)).status, 200)
+  } finally {
+    await server.close()
+  }
+})
+
+test('generateAccessToken: distinct, high-entropy, independent of the relay token', () => {
+  const a = generateAccessToken(), b = generateAccessToken()
+  assert.notEqual(a, b, 'tokens are unique per call')
+  assert.ok(a.length >= 32, 'base64url of 32 bytes')
+  assert.notEqual(a, TEST_TOKEN, 'not the relay token')
 })
 
 // ── 1c. bind policy + structured error mapping ──────────────────────────────
