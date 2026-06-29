@@ -208,6 +208,10 @@ vibe run stop <run_id>                     # viewer then shows the session as en
 
 ### Personal Remote Web Viewer
 
+> **Full guide:** [docs/private-remote-viewer.md](docs/private-remote-viewer.md) — the end-to-end
+> private remote viewer workflow (paired mock-only node setup, quickstart, `run viewers`,
+> public-bind access token, troubleshooting, and the security model).
+
 Pass `--node <node_id>` to view a run owned by **another node**, reached over the relay. Same
 private, read-only guarantees as the local viewer — it just sources its data from the relay
 stream instead of a local tmux pane.
