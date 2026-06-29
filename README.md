@@ -61,9 +61,9 @@ vibe relay dev   --port <port> --token <token> [--require-pairing]
 One guided command to onboard a machine to a relay — it hides VIBE_DIR, node identity, pairing,
 relay token, node_id, and advertised agents behind a single step. It creates or reuses a node
 identity, writes a **reusable local profile** (`~/.config/vibe/profile.json`; honors
-`$XDG_CONFIG_HOME`), and pairs with the relay **only after you confirm**. It **never starts a
-daemon** (it prints the command) and **never stores or prints the relay token** — only the
-token-file path.
+`$XDG_CONFIG_HOME`), and pairs with the relay **only after you confirm**. It **does not start a
+daemon** — you start the node afterward with a bare `vibe node daemon` (it reads the profile). It
+**never stores or prints the relay token** — only the token-file path.
 
 ```bash
 # Preview first — shows exactly what would be created/written/paired, changes nothing:
