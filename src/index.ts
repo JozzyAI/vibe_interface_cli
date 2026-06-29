@@ -6,6 +6,7 @@ import { registerNodeCommand } from './commands/node.js'
 import { registerRelayCommand } from './commands/relay.js'
 import { registerApprovalCommand } from './commands/approval.js'
 import { registerMonitorCommand } from './commands/monitor.js'
+import { registerConnectCommand } from './commands/connect.js'
 import { runSupervisor } from './runtime/supervisor.js'
 
 const program = new Command()
@@ -30,6 +31,7 @@ program.command('_mock-runner <run_id>', { hidden: true }).action(runSupervised)
 program.command('_claude-runner <run_id>', { hidden: true }).action(runSupervised)
 program.command('_codex-runner <run_id>', { hidden: true }).action(runSupervised)
 
+registerConnectCommand(program)
 registerRunCommand(program)
 registerSymphonyCommand(program)
 registerNodeCommand(program)
