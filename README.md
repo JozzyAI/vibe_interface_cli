@@ -178,6 +178,12 @@ It is intentionally minimal and private:
 - **Private by default:** binds `127.0.0.1` only. No relay, no public share links, no E2E capability
   links. Binding a non-loopback host is refused unless you pass `--allow-public-bind` (which prints a
   warning).
+- **Public-bind auth gate:** loopback needs no auth (frictionless). When you `--allow-public-bind`,
+  the viewer generates a **one-time local access token** and prints it in the URL
+  (`http://<host>:<port>/?access=<token>`); requests without it get `401`. The first authorized
+  request sets an `HttpOnly` cookie so the browser's polls don't carry the token thereafter. This is a
+  **local gate only** — the token never touches the relay (it is not the relay token) and it is not a
+  shareable capability link.
 - **Read-only:** only `GET` is served (any other method returns `405`); there is no keyboard/terminal
   input and no shell is exposed. The single tmux interaction is the read-only `tmux capture-pane -p`.
 - **tmux-backed runs:** the run must have a live tmux session (start it with `VIBE_USE_TMUX=1`). A
@@ -208,6 +214,10 @@ stream instead of a local tmux pane.
 
 - **Private by default:** binds `127.0.0.1` only; non-loopback bind refused without
   `--allow-public-bind`. No public share URL, no E2E capability link.
+- **Public-bind auth gate:** loopback is frictionless; a `--allow-public-bind` viewer requires a
+  one-time local access token (printed in the URL as `?access=<token>`, then carried via an
+  `HttpOnly` cookie), returning `401` otherwise. Local gate only — never the relay token, not a
+  shareable link.
 - **Read-only:** only `GET` is served (`405` otherwise); no keyboard input, no shell. Stop a
   remote run with `vibe run stop <run_id> --node <id> --relay <url>` — never from the browser.
 - **Reuses the relay APIs:** one background subscription (`remoteStream`) fills an in-memory

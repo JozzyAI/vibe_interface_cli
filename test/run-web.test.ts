@@ -12,7 +12,7 @@ import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { freshVibeDir } from './helpers/agent-fixtures.js'
-import { validateBind, resolveWebTarget, startViewerServer } from '../src/lib/run-web.js'
+import { validateBind, resolveWebTarget, startViewerServer, generateAccessToken } from '../src/lib/run-web.js'
 import { appendEvent } from '../src/events.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -80,6 +80,30 @@ test('run web refuses a public bind unless --allow-public-bind is given', () => 
   const out = JSON.parse(r.stdout.trim())
   assert.equal(out.code, 'public_bind_refused')
   vibe(env, 'run', 'stop', record.run_id) // cleanup
+})
+
+// ── public-bind access gate (shared helper; no tmux needed) ─────────────────
+
+test('local viewer access gate: 401 without token, 200 + HttpOnly cookie with token', async () => {
+  const TOKEN = generateAccessToken()
+  const server = await startViewerServer({ run_id: 'run_gate_x', tmux_session: 'no-such-session', host: '127.0.0.1', port: 0, accessToken: TOKEN })
+  try {
+    assert.equal((await fetch(`${server.url}/`)).status, 401, 'no token → 401')
+    const ok = await fetch(`${server.url}/?access=${TOKEN}`)
+    assert.equal(ok.status, 200, 'correct token → 200')
+    assert.match(ok.headers.get('set-cookie') ?? '', /vibe_access=.*HttpOnly/, 'sets HttpOnly cookie')
+  } finally {
+    await server.close()
+  }
+})
+
+test('local viewer without an access token stays frictionless (gate off)', async () => {
+  const server = await startViewerServer({ run_id: 'run_gate_y', tmux_session: 'no-such-session', host: '127.0.0.1', port: 0 })
+  try {
+    assert.equal((await fetch(`${server.url}/`)).status, 200, 'loopback default needs no token')
+  } finally {
+    await server.close()
+  }
 })
 
 // ── in-process server: read-only, private, redacted (tmux-gated) ────────────

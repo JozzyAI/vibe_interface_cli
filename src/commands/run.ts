@@ -3,9 +3,21 @@ import { spawnSync } from 'child_process'
 import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
 import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
-import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer } from '../lib/run-web.js'
+import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer, generateAccessToken } from '../lib/run-web.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
+
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1']
+
+/** A one-time viewer access token for a non-loopback (public) bind; none for loopback. */
+function viewerAccessToken(host: string): string | undefined {
+  return LOOPBACK_HOSTS.includes(host) ? undefined : generateAccessToken()
+}
+
+/** Operator-facing URL: carries the access token as a query when one is required. */
+function accessUrl(baseUrl: string, accessToken?: string): string {
+  return accessToken ? `${baseUrl}/?access=${accessToken}` : baseUrl
+}
 
 export function registerRunCommand(program: Command): void {
   const run = program.command('run').description('manage runs')
@@ -251,7 +263,7 @@ export function registerRunCommand(program: Command): void {
       if (!bind.ok) fail(bind.code, bind.message)
       if (!('ok' in bind) || !bind.ok) return
       if (opts.allowPublicBind && !['127.0.0.1', 'localhost', '::1'].includes(opts.host)) {
-        process.stderr.write(`warning: binding ${opts.host} exposes this run's session on the network. The viewer is read-only, but anyone who can reach this host can watch it.\n`)
+        process.stderr.write(`warning: binding ${opts.host} exposes this run's session on the network. The viewer is read-only and now gated by a one-time access token (in the printed URL); only someone with that URL can watch it.\n`)
       }
 
       // 2. The viewer's only hard dependency is tmux.
@@ -267,21 +279,24 @@ export function registerRunCommand(program: Command): void {
         return
       }
 
-      // 4. Start the read-only server.
+      // 4. Start the read-only server. A non-loopback (public) bind is gated by a
+      //    one-time access token; loopback stays frictionless (no token).
       const port = Number.parseInt(opts.port as string, 10) || 0
+      const accessToken = viewerAccessToken(bind.host)
       let server
       try {
-        server = await startViewerServer({ run_id, tmux_session: target.tmux_session, host: bind.host, port })
+        server = await startViewerServer({ run_id, tmux_session: target.tmux_session, host: bind.host, port, accessToken })
       } catch (err) {
         fail('web_viewer_start_failed', `failed to bind ${bind.host}:${port}: ${(err as Error).message}`)
         return
       }
 
-      const info = { run_id, session_id: target.tmux_session, url: server.url, host: server.host, port: server.port, mode: 'read-only', ts: new Date().toISOString() }
+      const url = accessUrl(server.url, accessToken)
+      const info = { run_id, session_id: target.tmux_session, url, host: server.host, port: server.port, mode: 'read-only', auth: accessToken ? 'token' : 'none', ts: new Date().toISOString() }
       if (opts.json) {
         process.stdout.write(JSON.stringify(info) + '\n')
       } else {
-        process.stdout.write(`vibe run web: read-only viewer for ${run_id} at ${server.url}  (Ctrl-C to stop)\n`)
+        process.stdout.write(`vibe run web: read-only viewer for ${run_id} at ${url}  (Ctrl-C to stop)\n`)
       }
 
       const shutdown = () => { server!.close().finally(() => process.exit(0)) }
@@ -308,7 +323,7 @@ async function serveRemoteWebViewer(
   const bind = validateBind(opts.host as string, Boolean(opts.allowPublicBind))
   if (!bind.ok) { fail(bind.code, bind.message, { node_id }); return }
   if (opts.allowPublicBind && !['127.0.0.1', 'localhost', '::1'].includes(opts.host as string)) {
-    process.stderr.write(`warning: binding ${opts.host} exposes this remote run's viewer on the network. It is read-only, but anyone who can reach this host can watch it.\n`)
+    process.stderr.write(`warning: binding ${opts.host} exposes this remote run's viewer on the network. It is read-only and now gated by a one-time access token (in the printed URL); only someone with that URL can watch it.\n`)
   }
 
   // 2. Resolve the relay token without putting it in argv.
@@ -350,22 +365,25 @@ async function serveRemoteWebViewer(
     .then(() => buffer.markEnded())
     .catch(() => buffer.markEnded('disconnected'))
 
-  // 5. Start the read-only HTTP viewer.
+  // 5. Start the read-only HTTP viewer. A non-loopback (public) bind is gated by a
+  //    one-time access token; loopback stays frictionless (no token).
   const port = Number.parseInt(opts.port as string, 10) || 0
+  const accessToken = viewerAccessToken(bind.host)
   let server
   try {
-    server = await startRemoteViewerServer({ run_id, node_id, host: bind.host, port, buffer })
+    server = await startRemoteViewerServer({ run_id, node_id, host: bind.host, port, buffer, accessToken })
   } catch (err) {
     controller.abort()
     fail('web_viewer_start_failed', `failed to bind ${bind.host}:${port}: ${(err as Error).message}`, { node_id })
     return
   }
 
-  const info = { run_id, node_id, url: server.url, host: server.host, port: server.port, mode: 'read-only', remote: true, ts: new Date().toISOString() }
+  const url = accessUrl(server.url, accessToken)
+  const info = { run_id, node_id, url, host: server.host, port: server.port, mode: 'read-only', remote: true, auth: accessToken ? 'token' : 'none', ts: new Date().toISOString() }
   if (opts.json) {
     process.stdout.write(JSON.stringify(info) + '\n')
   } else {
-    process.stdout.write(`vibe run web: read-only REMOTE viewer for ${run_id} (node ${node_id}) at ${server.url}  (Ctrl-C to stop)\n`)
+    process.stdout.write(`vibe run web: read-only REMOTE viewer for ${run_id} (node ${node_id}) at ${url}  (Ctrl-C to stop)\n`)
   }
 
   const shutdown = () => { controller.abort(); server!.close().finally(() => process.exit(0)) }
