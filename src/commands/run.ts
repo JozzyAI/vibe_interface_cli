@@ -4,10 +4,50 @@ import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
 import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
 import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer, generateAccessToken } from '../lib/run-web.js'
+import { addViewer, removeViewer, generateViewerId, listActiveViewers, findViewer } from '../lib/viewer-registry.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1']
+
+/**
+ * Record an active viewer in the local registry (best-effort — a registry failure
+ * must never break the viewer). Stores base URL + pid only: never the relay token
+ * or the access token. Returns the viewer_id for later removal.
+ */
+function recordViewer(args: {
+  run_id: string
+  node_id?: string
+  mode: 'local' | 'remote'
+  server: { url: string; host: string; port: number }
+  accessToken?: string
+}): string | undefined {
+  try {
+    const now = new Date().toISOString()
+    const viewer_id = generateViewerId()
+    addViewer({
+      viewer_id,
+      run_id: args.run_id,
+      ...(args.node_id ? { node_id: args.node_id } : {}),
+      mode: args.mode,
+      url: args.server.url, // base host:port — no ?access token
+      host: args.server.host,
+      port: args.server.port,
+      pid: process.pid,
+      auth: args.accessToken ? 'token' : 'none',
+      created_at: now,
+      updated_at: now,
+    })
+    return viewer_id
+  } catch {
+    return undefined
+  }
+}
+
+function safeRemoveViewer(viewer_id: string | undefined): void {
+  if (!viewer_id) return
+  try { removeViewer(viewer_id) } catch { /* best-effort */ }
+}
 
 /** A one-time viewer access token for a non-loopback (public) bind; none for loopback. */
 function viewerAccessToken(host: string): string | undefined {
@@ -292,16 +332,86 @@ export function registerRunCommand(program: Command): void {
       }
 
       const url = accessUrl(server.url, accessToken)
-      const info = { run_id, session_id: target.tmux_session, url, host: server.host, port: server.port, mode: 'read-only', auth: accessToken ? 'token' : 'none', ts: new Date().toISOString() }
+      const viewer_id = recordViewer({ run_id, mode: 'local', server, accessToken })
+      const info = { run_id, viewer_id, session_id: target.tmux_session, url, host: server.host, port: server.port, mode: 'read-only', auth: accessToken ? 'token' : 'none', ts: new Date().toISOString() }
       if (opts.json) {
         process.stdout.write(JSON.stringify(info) + '\n')
       } else {
         process.stdout.write(`vibe run web: read-only viewer for ${run_id} at ${url}  (Ctrl-C to stop)\n`)
       }
 
-      const shutdown = () => { server!.close().finally(() => process.exit(0)) }
+      const shutdown = () => { safeRemoveViewer(viewer_id); server!.close().finally(() => process.exit(0)) }
       process.on('SIGINT', shutdown)
       process.on('SIGTERM', shutdown)
+    })
+
+  // ── run viewers: manage the local registry of active web viewers ────────────
+  const viewers = run
+    .command('viewers')
+    .description('list / open / stop active personal web viewers (local registry)')
+
+  viewers
+    .command('list')
+    .description('list active viewers (dead-pid records are pruned)')
+    .option('--json', 'output machine-readable JSON')
+    .action((opts) => {
+      const { live, pruned } = listActiveViewers()
+      if (opts.json) {
+        process.stdout.write(JSON.stringify({ viewers: live, pruned }) + '\n')
+        return
+      }
+      if (live.length === 0) {
+        process.stdout.write('no active viewers\n')
+        return
+      }
+      for (const v of live) {
+        const ageS = Math.max(0, Math.round((Date.now() - new Date(v.created_at).getTime()) / 1000))
+        const node = v.node_id ? `  node ${v.node_id}` : ''
+        process.stdout.write(`${v.run_id}  ${v.viewer_id}  ${v.mode}  ${v.url}  pid ${v.pid}  auth:${v.auth}  ${ageS}s${node}\n`)
+      }
+    })
+
+  viewers
+    .command('open <target>')
+    .description('print the URL of an active viewer (by run_id or viewer_id)')
+    .option('--json', 'output machine-readable JSON')
+    .action((target: string, opts) => {
+      const v = findViewer(target)
+      if (!v) {
+        process.stdout.write(JSON.stringify({ error: true, code: 'viewer_not_found', target, message: `no active viewer for ${target}`, ts: new Date().toISOString() }) + '\n')
+        process.exit(1)
+      }
+      // The access token is never stored, so a public-bind viewer's full ?access=
+      // URL cannot be reconstructed — print the base URL and say so. Loopback URLs
+      // need no token and work as-is.
+      const note = v.auth === 'token'
+        ? 'this viewer requires its one-time access token, shown only in the output when it started'
+        : undefined
+      if (opts.json) {
+        process.stdout.write(JSON.stringify({ viewer_id: v.viewer_id, run_id: v.run_id, mode: v.mode, url: v.url, auth: v.auth, ...(note ? { note } : {}) }) + '\n')
+      } else {
+        process.stdout.write(`${v.url}${note ? `  (${note})` : ''}\n`)
+      }
+    })
+
+  viewers
+    .command('stop <target>')
+    .description('stop a LOCAL viewer process (by run_id or viewer_id) — does NOT stop the remote run')
+    .option('--json', 'output machine-readable JSON')
+    .action((target: string, opts) => {
+      const v = findViewer(target)
+      if (!v) {
+        process.stdout.write(JSON.stringify({ error: true, code: 'viewer_not_found', target, message: `no active viewer for ${target}`, ts: new Date().toISOString() }) + '\n')
+        process.exit(1)
+      }
+      try { process.kill(v.pid, 'SIGTERM') } catch { /* already gone */ }
+      removeViewer(v.viewer_id)
+      const out = { stopped: true, viewer_id: v.viewer_id, run_id: v.run_id, pid: v.pid, ts: new Date().toISOString() }
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(out) + '\n')
+      } else {
+        process.stdout.write(`stopped viewer ${v.viewer_id} (run ${v.run_id}, pid ${v.pid})\n`)
+      }
     })
 }
 
@@ -379,14 +489,15 @@ async function serveRemoteWebViewer(
   }
 
   const url = accessUrl(server.url, accessToken)
-  const info = { run_id, node_id, url, host: server.host, port: server.port, mode: 'read-only', remote: true, auth: accessToken ? 'token' : 'none', ts: new Date().toISOString() }
+  const viewer_id = recordViewer({ run_id, node_id, mode: 'remote', server, accessToken })
+  const info = { run_id, viewer_id, node_id, url, host: server.host, port: server.port, mode: 'read-only', remote: true, auth: accessToken ? 'token' : 'none', ts: new Date().toISOString() }
   if (opts.json) {
     process.stdout.write(JSON.stringify(info) + '\n')
   } else {
     process.stdout.write(`vibe run web: read-only REMOTE viewer for ${run_id} (node ${node_id}) at ${url}  (Ctrl-C to stop)\n`)
   }
 
-  const shutdown = () => { controller.abort(); server!.close().finally(() => process.exit(0)) }
+  const shutdown = () => { safeRemoveViewer(viewer_id); controller.abort(); server!.close().finally(() => process.exit(0)) }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 }
