@@ -69,14 +69,18 @@ token-file path.
 # Preview first — shows exactly what would be created/written/paired, changes nothing:
 vibe connect --name work-laptop --relay wss://… --token-file ~/.config/vibe/relay-token --dry-run
 
-# Then connect for real (prompts before it pairs; --yes skips the prompt). Mock-only by default:
-vibe connect --name work-laptop --relay wss://… --token-file ~/.config/vibe/relay-token
-# → creates/reuses identity, writes the profile, pairs (after y/N), and prints:
-#     VIBE_DIR=… VIBE_NODE_ADVERTISE_AGENTS=mock vibe node daemon --local --relay … --token-file …
+# Then connect (prompts before it pairs; --yes skips the prompt). Mock-only by default:
+vibe connect --relay wss://… --token-file ~/.config/vibe/relay-token --yes
+
+# After connecting, just start the node — it reads relay/token/VIBE_DIR/agents from the profile:
+vibe node daemon
 ```
 
-Re-running `vibe connect` reuses the saved profile, so you don't repeat `--relay`/`--token-file`/
-`--name`. Advertised agents default to `["mock"]` (or pass `--mock-only` / `--advertise-agent`).
+`vibe node daemon` fills missing settings from the profile (`vibe_dir`, `relay_url`, `token_file`,
+`advertise_agents`), so you don't repeat them. Precedence is **CLI flag > env var > profile >
+default**, so explicit flags/env still override the profile; with **no profile**, `vibe node daemon`
+behaves exactly as before (and still requires `--local`). Re-running `vibe connect` also reuses the
+saved profile. The profile stores only the **token-file path** — never the token value.
 
 ## 5-minute quickstart
 
