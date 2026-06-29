@@ -71,6 +71,40 @@ export interface ResolvedDaemonDefaults {
   vibeDir?: string
 }
 
+export interface ClientFlagInput {
+  relay?: string
+  token?: string
+  tokenFile?: string
+}
+export interface ResolvedClientDefaults {
+  relay?: string
+  /** token-file PATH to hand to resolveRelayToken; undefined lets it fall back to
+   *  --token / VIBE_RELAY_TOKEN. NEVER a token value. */
+  tokenFile?: string
+  /** VIBE_DIR to apply only when the env var is unset; undefined = leave as-is. */
+  vibeDir?: string
+}
+
+/**
+ * Pure precedence resolver for client-side relay/token/vibe-dir (CLI flag > env >
+ * profile > default). No fs/env reads — caller passes them — so it is fully
+ * unit-testable. Only ever surfaces a token-file PATH, never a token value.
+ * Shared by `vibe run start/stream/stop` and (for relay/token) the node daemon.
+ */
+export function resolveClientDefaults(
+  flags: ClientFlagInput,
+  profile: NodeProfile | null,
+  env: DaemonEnvInput,
+): ResolvedClientDefaults {
+  const relay = flags.relay ?? profile?.relay_url ?? undefined
+  // flag (--token-file/--token) > env (VIBE_RELAY_TOKEN) > profile token-file path.
+  const tokenFile = flags.tokenFile
+    ?? ((!flags.token && !env.VIBE_RELAY_TOKEN) ? (profile?.token_file ?? undefined) : undefined)
+  // env VIBE_DIR > profile.vibe_dir (existing default ~/.vibe applies when neither).
+  const vibeDir = !env.VIBE_DIR ? (profile?.vibe_dir ?? undefined) : undefined
+  return { relay, tokenFile, vibeDir }
+}
+
 /**
  * Pure precedence resolver (no fs/env reads — caller passes them) so it is fully
  * unit-testable. Only ever surfaces a token-file PATH, never a token value.
@@ -81,20 +115,13 @@ export function resolveDaemonDefaults(
   env: DaemonEnvInput,
 ): ResolvedDaemonDefaults {
   const local = Boolean(flags.local) || profile !== null
-  const relay = flags.relay ?? profile?.relay_url ?? undefined
+  const { relay, tokenFile, vibeDir } = resolveClientDefaults(flags, profile, env)
 
   const advFlag = flags.advertiseAgent && flags.advertiseAgent.length ? flags.advertiseAgent : undefined
   // flag > env > profile > default: inject the profile list only when there is no
   // flag and no env (undefined then lets resolveAdvertisedAgents apply env/default).
   const advertiseAgents = advFlag
     ?? ((!env.VIBE_NODE_ADVERTISE_AGENTS && profile?.advertise_agents?.length) ? profile.advertise_agents : undefined)
-
-  // flag (--token-file/--token) > env (VIBE_RELAY_TOKEN) > profile token-file path.
-  const tokenFile = flags.tokenFile
-    ?? ((!flags.token && !env.VIBE_RELAY_TOKEN) ? (profile?.token_file ?? undefined) : undefined)
-
-  // env VIBE_DIR > profile.vibe_dir (existing default ~/.vibe applies when neither).
-  const vibeDir = !env.VIBE_DIR ? (profile?.vibe_dir ?? undefined) : undefined
 
   return { local, relay, tokenFile, advertiseAgents, vibeDir }
 }

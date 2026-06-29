@@ -5,6 +5,7 @@ import { streamEvents } from '../events.js'
 import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
 import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer, generateAccessToken } from '../lib/run-web.js'
 import { addViewer, removeViewer, generateViewerId, listActiveViewers, findViewer } from '../lib/viewer-registry.js'
+import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
@@ -62,6 +63,19 @@ function accessUrl(baseUrl: string, accessToken?: string): string {
 export function registerRunCommand(program: Command): void {
   const run = program.command('run').description('manage runs')
 
+  // After `vibe connect`, every run subcommand reads VIBE_DIR from the profile so a
+  // custom `connect --vibe-dir` stays consistent across the namespace: `run start`
+  // writes records into it and `run stream/stop/status/attach` (and the viewer
+  // registry) read from the same place. Precedence: env VIBE_DIR > profile.vibe_dir
+  // > default ~/.vibe. This only sets a state directory — no viewer behavior changes.
+  // (relay/token-file defaults are applied per-command in start/stream/stop only.)
+  run.hook('preAction', () => {
+    if (!process.env.VIBE_DIR) {
+      const vibeDir = loadProfile()?.vibe_dir
+      if (vibeDir) process.env.VIBE_DIR = vibeDir
+    }
+  })
+
   run
     .command('start')
     .description('start a new run')
@@ -84,7 +98,13 @@ export function registerRunCommand(program: Command): void {
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
       const nodeSelector: string = opts.node ?? 'auto'
-      const isRemote = opts.relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      const isRemote = relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
 
       const agentPolicy = buildAgentPolicyMetadata({
         fallbackAgents: opts.fallbackAgent,
@@ -97,18 +117,18 @@ export function registerRunCommand(program: Command): void {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
           const { remoteRunStart, fetchRemoteNodes } = await import('../relay/client.js')
 
           let encryptionPublicKey: string | undefined
           if (opts.encrypt) {
-            const nodes = await fetchRemoteNodes(opts.relay as string, token)
+            const nodes = await fetchRemoteNodes(relay as string, token)
             const target = nodes.find(n => n.node_id === nodeSelector)
             if (!target?.encryption_public_key) {
               process.stderr.write(`error: --encrypt requires the target node to have an identity (node ${nodeSelector} has no encryption_public_key)\n`)
@@ -118,7 +138,7 @@ export function registerRunCommand(program: Command): void {
             encryptionPublicKey = target.encryption_public_key
           }
 
-          const record = await remoteRunStart(opts.relay as string, token, nodeSelector, {
+          const record = await remoteRunStart(relay as string, token, nodeSelector, {
             agent: opts.agent as AgentBackend,
             workspaceKey: opts.workspaceKey,
             repoUrl: opts.repoUrl,
@@ -176,19 +196,25 @@ export function registerRunCommand(program: Command): void {
     .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
     .option('--token-file <path>', 'read relay auth token from a file')
     .action(async (run_id: string, opts) => {
-      if (opts.relay) {
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (relay) {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
           const { remoteStream } = await import('../relay/client.js')
-          await remoteStream(opts.relay as string, token, run_id)
+          await remoteStream(relay, token, run_id)
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
@@ -216,19 +242,25 @@ export function registerRunCommand(program: Command): void {
     .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
     .option('--token-file <path>', 'read relay auth token from a file')
     .action(async (run_id: string, opts) => {
-      if (opts.relay) {
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (relay) {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
           const { remoteStop } = await import('../relay/client.js')
-          const record = await remoteStop(opts.relay as string, token, run_id)
+          const record = await remoteStop(relay, token, run_id)
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
