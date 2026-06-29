@@ -9,7 +9,9 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { spawnSync } from 'child_process'
 import { startRelayServer } from '../src/relay/server.js'
+import { shellQuote } from '../src/commands/connect.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -31,6 +33,36 @@ function connect(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: numb
     setTimeout(() => { proc.kill('SIGTERM'); resolve({ status: 124, stdout, stderr: stderr + '\n[timeout]' }) }, 15000)
   })
 }
+
+// ── shell-safe quoting of the printed daemon command ─────────────────────────
+
+const BASH_OK = spawnSync('bash', ['-c', 'true']).status === 0
+
+test('shellQuote round-trips through a real shell for nasty values', { skip: !BASH_OK }, () => {
+  for (const value of ['/tmp/dir with space', "a'b", 'a$b', 'a&b', 'a(b)c', 'a"b', 'a;b|c', 'wss://h/p?x=1&y=2']) {
+    // Assign the quoted token in bash and echo it back — must equal the original.
+    const r = spawnSync('bash', ['-c', `v=${shellQuote(value)}; printf %s "$v"`], { encoding: 'utf8' })
+    assert.equal(r.status, 0)
+    assert.equal(r.stdout, value, `shellQuote did not round-trip for: ${value}`)
+  }
+})
+
+test('connect daemon command is copy-paste safe with spaces/specials in paths', { skip: !BASH_OK }, async () => {
+  const vibeDir = path.join(tmp(), 'dir with space (paren)')
+  const tokenFile = '/tmp/tok dir/relay token'
+  const profile = path.join(tmp(), 'profile.json')
+  const env = { ...process.env, VIBE_DIR: vibeDir, VIBE_PROFILE: profile }
+  const out = JSON.parse((await connect(['--name', 'x', '--relay', 'wss://h/p?a=1&b=2', '--token-file', tokenFile, '--vibe-dir', vibeDir, '--dry-run', '--json'], env)).stdout.trim())
+  const cmd: string = out.would.daemon_command
+
+  // Spaced/special values appear single-quoted (not bare, which would word-split).
+  assert.ok(cmd.includes(shellQuote(vibeDir)), 'vibe_dir is quoted')
+  assert.ok(cmd.includes(shellQuote(tokenFile)), 'token-file is quoted')
+  assert.ok(cmd.includes(shellQuote('wss://h/p?a=1&b=2')), 'relay url is quoted')
+
+  // A real shell parses the whole command without a syntax error (no executing it).
+  assert.equal(spawnSync('bash', ['-n', '-c', cmd]).status, 0, 'daemon command is valid shell syntax')
+})
 
 // ── dry-run: zero side effects, no token ──────────────────────────────────────
 
@@ -85,7 +117,7 @@ test('connect --yes creates identity, writes a token-free profile, and pairs (fa
   assert.deepEqual(out.advertise_agents, ['mock'])
   assert.equal(out.paired?.status, 'paired', 'node paired on the fake relay')
   assert.equal(server.pairedCount(), 1)
-  assert.match(out.daemon_command, /VIBE_NODE_ADVERTISE_AGENTS=mock/)
+  assert.match(out.daemon_command, /VIBE_NODE_ADVERTISE_AGENTS='mock'/)
   assert.doesNotMatch(out.daemon_command, /--token [^-]/, 'daemon cmd uses --token-file, never --token <value>')
 
   // Identity + profile exist; profile is 0600 and TOKEN-FREE.

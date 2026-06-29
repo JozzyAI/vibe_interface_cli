@@ -19,14 +19,23 @@ import { loadProfile, saveProfile, profilePath, type NodeProfile } from '../lib/
 
 const LOOPBACK_DEFAULT_VIBE_DIR = () => process.env.VIBE_DIR ?? path.join(os.homedir(), '.vibe')
 
+/**
+ * POSIX-shell-quote a value so the printed daemon command is copy-paste safe even
+ * when a path/URL contains spaces, parentheses, `$`, `&`, quotes, etc. Wraps in
+ * single quotes and escapes embedded single quotes via the `'\''` idiom.
+ */
+export function shellQuote(s: string): string {
+  return `'` + s.replace(/'/g, `'\\''`) + `'`
+}
+
 function daemonCommand(vibeDir: string, agents: string[], relay?: string, tokenFile?: string): string {
   const parts = [
-    `VIBE_DIR=${vibeDir}`,
-    `VIBE_NODE_ADVERTISE_AGENTS=${agents.join(',')}`,
+    `VIBE_DIR=${shellQuote(vibeDir)}`,
+    `VIBE_NODE_ADVERTISE_AGENTS=${shellQuote(agents.join(','))}`,
     'vibe node daemon --local',
   ]
-  if (relay) parts.push(`--relay ${relay}`)
-  if (tokenFile) parts.push(`--token-file ${tokenFile}`)
+  if (relay) parts.push(`--relay ${shellQuote(relay)}`)
+  if (tokenFile) parts.push(`--token-file ${shellQuote(tokenFile)}`)
   return parts.join(' ')
 }
 
