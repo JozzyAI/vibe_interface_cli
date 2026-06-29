@@ -254,6 +254,27 @@ vibe run stop run_… --node <node_id> \
 For a fully offline check, point the same commands at an in-process `startRelayServer` + a local
 `vibe node daemon --local --relay ws://…` (mock-capable) — no production relay, no paid agent.
 
+### Active Viewer Registry
+
+Viewers bind ephemeral ports, so the URL is easy to lose. Every `vibe run web …` (local or remote)
+records itself in a small local registry (`~/.vibe/viewers.json`, `0600`) so you can rediscover
+and manage active viewers — no daemon, no service:
+
+```
+vibe run viewers list                 # active viewers: run_id, viewer_id, mode, url, pid, auth, age
+vibe run viewers open <run_id|vw_id>  # print the viewer's URL again
+vibe run viewers stop <run_id|vw_id>  # stop the LOCAL viewer process (NOT the remote run)
+```
+
+- **No secrets stored:** the registry holds only the **base URL** (`http://host:port`) and pid —
+  never the relay token and never the public-bind access token. `open` on a loopback viewer prints
+  the full working URL; on a token-gated (public-bind) viewer it prints the base URL and notes that
+  the one-time access token was shown only when the viewer started.
+- **Self-pruning:** liveness is the recorded pid (`process.kill(pid, 0)`), so a crashed viewer's
+  record is dropped on the next `list`/`open`/`stop` — no stale entries pile up.
+- `vibe run viewers stop` signals only the local viewer HTTP process; the run itself keeps going
+  (use `vibe run stop` for that).
+
 ### Codex CLI setup
 
 **Install:**
