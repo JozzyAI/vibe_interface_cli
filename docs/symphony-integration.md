@@ -5,92 +5,27 @@ Symphony dispatches work to Vibe; Vibe never polls Symphony.
 
 ---
 
-## Contract
+## CLI contract
+
+For the authoritative CLI contract — the canonical command path, profile/default
+behavior, success outputs, the JSONL event schema, the structured error
+envelope, and exit codes — see **[`docs/orchestrator-contract.md`](orchestrator-contract.md)**.
+
+That document is the single source of truth; this guide keeps only
+Symphony-specific notes and does not restate the schema (to avoid drift).
+
+In short, Symphony dispatches and observes a run with:
 
 ```
-Symphony
-  → vibe run start   → returns RunRecord JSON (run_id, status: running)
-  → vibe run stream  → JSONL event stream until terminal state
-  → vibe run status  → current RunRecord JSON
-  → vibe run stop    → kill run, emit stopped event
+vibe run start   -> RunRecord JSON (run_id, status)
+vibe run status  -> RunRecord JSON
+vibe run stream  -> RunEvent JSONL until a terminal status
+vibe run stop    -> updated RunRecord JSON
 ```
 
----
-
-## Shell Integration
-
-```bash
-# 1. Start a run
-result=$(vibe run start \
-  --agent claude-code \
-  --repo-url https://github.com/org/repo \
-  --branch main \
-  --workspace-key ISSUE-123 \
-  --prompt-file /tmp/task.txt)
-
-run_id=$(echo "$result" | jq -r .run_id)
-echo "started: $run_id"
-
-# 2. Stream events until terminal state
-vibe run stream "$run_id" | while IFS= read -r line; do
-  type=$(echo "$line" | jq -r .type)
-  echo "[event] $type"
-  case "$type" in
-    approval_required)
-      msg=$(echo "$line" | jq -r '.data.message')
-      echo "[approval needed] $msg"
-      # Symphony handles approval decision here (MVP 5: vibe run approve)
-      ;;
-    completed)
-      echo "[done] exit_code=$(echo "$line" | jq -r '.data.exit_code')"
-      break
-      ;;
-    failed|stopped)
-      echo "[terminal] $type"
-      break
-      ;;
-  esac
-done
-
-# 3. Final status
-vibe run status "$run_id"
-```
-
----
-
-## JSONL Event Types
-
-| type | when | data fields |
-|------|------|-------------|
-| `session_started` | agent process launched | — |
-| `output` | log line from agent | `text` |
-| `status_change` | internal state transition | `status` |
-| `approval_required` | agent needs a decision | `message` |
-| `completed` | run finished successfully | `exit_code` |
-| `failed` | run exited with error | `exit_code` |
-| `stopped` | run was stopped via `vibe run stop` | — |
-
-Terminal events: `completed`, `failed`, `stopped` — stream ends after any of these.
-
----
-
-## RunRecord JSON
-
-```json
-{
-  "run_id": "run_m0abc1_f3a9b2",
-  "session_id": "mock_run_m0abc1_f3a9b2",
-  "node_id": "local",
-  "agent": "claude-code",
-  "status": "running",
-  "workspace_path": "/home/user/.vibe/workspaces/ISSUE-123",
-  "repo_url": "https://github.com/org/repo",
-  "branch": "main",
-  "prompt_file": "/tmp/task.txt",
-  "created_at": "2026-06-01T10:00:00.000Z",
-  "updated_at": "2026-06-01T10:00:01.000Z"
-}
-```
+Terminal completion/failure/stop is a `status` event with a terminal `status`
+value — not a `completed`/`failed`/`stopped` event type, and there is no
+`.data.*` envelope. See the orchestrator contract for the exact event shapes.
 
 ---
 

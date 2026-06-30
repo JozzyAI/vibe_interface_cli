@@ -24,7 +24,7 @@ The relay is E2E encrypted.
 
 **What is working:**
 
-- `vibe run start / stream / status / stop` — stable CLI contract any orchestrator can call
+- `vibe run start / stream / status / stop` — stable CLI contract any orchestrator can call (see [`docs/orchestrator-contract.md`](docs/orchestrator-contract.md) for the canonical command path, JSONL event schema, structured error envelope, and exit codes)
 - `vibe symphony start / stream / status / stop / approval respond` — Symphony-specific surface
 - `vibe node daemon` — long-lived worker node, local or relay-connected
 - `vibe relay dev` — dev relay with identity-based pairing and token auth
