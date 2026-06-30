@@ -104,3 +104,17 @@ export function buildRunErrorEnvelope(
 export function runErrorExitCode(code: RunErrorCode): 1 | 3 {
   return code === 'run_not_found' ? 3 : 1
 }
+
+/**
+ * Render a remote run failure (shared by `vibe run` and `vibe symphony`):
+ * the stable, machine-readable error envelope to stdout (the contract an
+ * orchestrator branches on) plus a short human line to stderr, then exit with
+ * the mapped code (3 for run_not_found, else 1). Never prints a token. Never
+ * returns.
+ */
+export function failRemote(err: unknown, run_id?: string): never {
+  const env = buildRunErrorEnvelope(err, run_id ? { run_id } : {})
+  process.stdout.write(JSON.stringify(env) + '\n')
+  process.stderr.write(`error: ${env.code}: ${env.message}\n`)
+  process.exit(runErrorExitCode(env.code))
+}

@@ -741,12 +741,16 @@ vibe symphony status "$run_id" --json
 
 ### Remote dispatch over relay
 
+After `vibe connect`, `vibe symphony start/status/stream/stop` read the same
+profile defaults as `vibe run` (relay / token-file / VIBE_DIR; precedence
+**CLI flag > env var > profile > default**), so you don't repeat `--relay` /
+`--token-file`. Remote failures emit the same structured error envelope as
+`vibe run` — see [`docs/orchestrator-contract.md`](docs/orchestrator-contract.md).
+
 ```bash
 result=$(vibe symphony start \
   --agent claude-code \
   --node my-node \
-  --relay ws://localhost:7433 \
-  --token dev \
   --issue-id ISSUE-123 \
   --issue-title "Fix auth bug" \
   --workspace-key ISSUE-123 \
@@ -755,10 +759,9 @@ result=$(vibe symphony start \
 
 run_id=$(echo "$result" | jq -r .run_id)
 
-vibe symphony stream "$run_id" \
-  --relay ws://localhost:7433 \
-  --token dev \
-  --jsonl
+vibe symphony stream "$run_id" --jsonl
+
+# (Without a profile, pass --relay ws://localhost:7433 --token-file <path> explicitly.)
 ```
 
 See [`docs/VIBE_RELAY_DEMO.md`](docs/VIBE_RELAY_DEMO.md) for a step-by-step 3-terminal walkthrough (mock and Claude Code variants).
