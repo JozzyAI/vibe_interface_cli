@@ -78,10 +78,11 @@ vibe node daemon
 # Remote run commands read the same profile, so you can drop --relay/--token-file too:
 vibe run start  --node <node_id> --agent mock --workspace-key demo
 vibe run stream <run_id>
+vibe run status <run_id>
 vibe run stop   <run_id>
 ```
 
-Both `vibe node daemon` and the remote run commands (`run start` / `run stream` / `run stop`) fill
+Both `vibe node daemon` and the remote run commands (`run start` / `run stream` / `run status` / `run stop`) fill
 missing settings from the profile (`vibe_dir`, `relay_url`, `token_file`; the daemon also fills
 `advertise_agents`), so you don't repeat them. Precedence is **CLI flag > env var > profile >
 default**, so explicit flags/env still override the profile; with **no profile**, everything behaves
@@ -533,7 +534,7 @@ vibe node list --remote --relay "$relay" --token-file "$tokfile" --json
 run_id=$(vibe run start --node smoke-node --agent mock --workspace-key demo \
   --relay "$relay" --token-file "$tokfile" --json | jq -r .run_id)
 
-vibe run status "$run_id" --json          # node-authoritative record (local source of truth)
+vibe run status "$run_id" --relay "$relay" --token-file "$tokfile" --json   # node-authoritative record (or drop the flags after `vibe connect`)
 vibe run stream "$run_id" --relay "$relay" --token-file "$tokfile"   # JSONL until completed
 vibe run stop   "$run_id" --relay "$relay" --token-file "$tokfile"   # → {"status":"stopped",...}
 ```
