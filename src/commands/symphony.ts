@@ -13,11 +13,23 @@ import type { Command } from 'commander'
 import { readRun } from '../store.js'
 import { streamEvents } from '../events.js'
 import { startRun, stopRun } from '../lib/run-actions.js'
+import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
+import { failRemote } from '../lib/run-error.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
 export function registerSymphonyCommand(program: Command): void {
   const sym = program.command('symphony').description('Symphony orchestrator integration')
+
+  // Mirror `vibe run`: after `vibe connect`, every symphony subcommand reads
+  // VIBE_DIR from the profile so local run-record lookup is consistent across
+  // the namespace. Precedence: env VIBE_DIR > profile.vibe_dir > default ~/.vibe.
+  sym.hook('preAction', () => {
+    if (!process.env.VIBE_DIR) {
+      const vibeDir = loadProfile()?.vibe_dir
+      if (vibeDir) process.env.VIBE_DIR = vibeDir
+    }
+  })
 
   sym
     .command('start')
@@ -43,7 +55,13 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (opts) => {
       const nodeSelector: string = opts.node ?? 'auto'
-      const isRemote = opts.relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      const isRemote = relay && nodeSelector !== 'auto' && nodeSelector !== 'local'
 
       const agentPolicy = buildAgentPolicyMetadata({
         fallbackAgents: opts.fallbackAgent,
@@ -56,18 +74,18 @@ export function registerSymphonyCommand(program: Command): void {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
           const { remoteRunStart, fetchRemoteNodes } = await import('../relay/client.js')
 
           let encryptionPublicKey: string | undefined
           if (opts.encrypt) {
-            const nodes = await fetchRemoteNodes(opts.relay as string, token)
+            const nodes = await fetchRemoteNodes(relay as string, token)
             const target = nodes.find(n => n.node_id === nodeSelector)
             if (!target?.encryption_public_key) {
               process.stderr.write(`error: --encrypt requires the target node to have an identity (node ${nodeSelector} has no encryption_public_key)\n`)
@@ -81,7 +99,7 @@ export function registerSymphonyCommand(program: Command): void {
           if (opts.issueId) extraMetadata.issue_id = opts.issueId
           if (opts.issueTitle) extraMetadata.issue_title = opts.issueTitle
           if (agentPolicy) extraMetadata.agent_policy = agentPolicy
-          const record = await remoteRunStart(opts.relay as string, token, nodeSelector, {
+          const record = await remoteRunStart(relay as string, token, nodeSelector, {
             agent: opts.agent as AgentBackend,
             workspaceKey: opts.workspaceKey ?? opts.issueId,
             repoUrl: opts.repoUrl,
@@ -93,8 +111,7 @@ export function registerSymphonyCommand(program: Command): void {
           })
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err)
         }
         return
       }
@@ -128,22 +145,32 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
     .option('--token-file <path>', 'read relay auth token from a file')
     .action(async (run_id: string, opts) => {
-      if (opts.relay) {
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (relay) {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
-          const { remoteStream } = await import('../relay/client.js')
-          await remoteStream(opts.relay as string, token, run_id)
+          const { remoteRunStatus, remoteStream } = await import('../relay/client.js')
+          // Pre-flight existence/reachability check (same as `vibe run stream`):
+          // the stream swallows a fatal run_not_found into a graceful
+          // `stream_disconnected` event, so confirming status first lets an
+          // unknown run surface a structured run_not_found envelope (exit 3).
+          await remoteRunStatus(relay, token, run_id)
+          await remoteStream(relay, token, run_id)
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err, run_id)
         }
         return
       }
@@ -159,23 +186,28 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--token-file <path>', 'read relay auth token from a file')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (run_id: string, opts) => {
-      if (opts.relay) {
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (relay) {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
           const { remoteRunStatus } = await import('../relay/client.js')
-          const record = await remoteRunStatus(opts.relay as string, token, run_id)
+          const record = await remoteRunStatus(relay, token, run_id)
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err, run_id)
         }
         return
       }
@@ -192,23 +224,28 @@ export function registerSymphonyCommand(program: Command): void {
     .option('--token-file <path>', 'read relay auth token from a file')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
     .action(async (run_id: string, opts) => {
-      if (opts.relay) {
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (relay) {
         const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
         let token: string
         try {
-          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+          token = resolveRelayToken({ tokenFile, token: opts.token })
         } catch (err) {
           process.stderr.write(`error: ${(err as Error).message}\n`)
           process.exit(1)
         }
-        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        warnIfTokenArg({ tokenFile, token: opts.token })
         try {
           const { remoteStop } = await import('../relay/client.js')
-          const record = await remoteStop(opts.relay as string, token, run_id)
+          const record = await remoteStop(relay, token, run_id)
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err, run_id)
         }
         return
       }

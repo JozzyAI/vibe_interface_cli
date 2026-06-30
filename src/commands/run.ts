@@ -6,7 +6,7 @@ import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
 import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer, generateAccessToken } from '../lib/run-web.js'
 import { addViewer, removeViewer, generateViewerId, listActiveViewers, findViewer } from '../lib/viewer-registry.js'
 import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
-import { buildRunErrorEnvelope, runErrorExitCode, classifyRunError } from '../lib/run-error.js'
+import { failRemote, classifyRunError } from '../lib/run-error.js'
 import { evaluateNodeReadiness, relayFailureReport } from '../lib/run-doctor.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
@@ -60,19 +60,6 @@ function viewerAccessToken(host: string): string | undefined {
 /** Operator-facing URL: carries the access token as a query when one is required. */
 function accessUrl(baseUrl: string, accessToken?: string): string {
   return accessToken ? `${baseUrl}/?access=${accessToken}` : baseUrl
-}
-
-/**
- * Render a remote run failure for `run start/stream/stop`: a stable,
- * machine-readable error envelope to stdout (the contract an orchestrator
- * branches on) plus a short human line to stderr, then exit with the mapped
- * code (3 for run_not_found, else 1). Never prints a token. Never returns.
- */
-function failRemote(err: unknown, run_id?: string): never {
-  const env = buildRunErrorEnvelope(err, run_id ? { run_id } : {})
-  process.stdout.write(JSON.stringify(env) + '\n')
-  process.stderr.write(`error: ${env.code}: ${env.message}\n`)
-  process.exit(runErrorExitCode(env.code))
 }
 
 export function registerRunCommand(program: Command): void {
