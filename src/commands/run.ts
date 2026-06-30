@@ -6,6 +6,7 @@ import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
 import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer, generateAccessToken } from '../lib/run-web.js'
 import { addViewer, removeViewer, generateViewerId, listActiveViewers, findViewer } from '../lib/viewer-registry.js'
 import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
+import { buildRunErrorEnvelope, runErrorExitCode } from '../lib/run-error.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
@@ -58,6 +59,19 @@ function viewerAccessToken(host: string): string | undefined {
 /** Operator-facing URL: carries the access token as a query when one is required. */
 function accessUrl(baseUrl: string, accessToken?: string): string {
   return accessToken ? `${baseUrl}/?access=${accessToken}` : baseUrl
+}
+
+/**
+ * Render a remote run failure for `run start/stream/stop`: a stable,
+ * machine-readable error envelope to stdout (the contract an orchestrator
+ * branches on) plus a short human line to stderr, then exit with the mapped
+ * code (3 for run_not_found, else 1). Never prints a token. Never returns.
+ */
+function failRemote(err: unknown, run_id?: string): never {
+  const env = buildRunErrorEnvelope(err, run_id ? { run_id } : {})
+  process.stdout.write(JSON.stringify(env) + '\n')
+  process.stderr.write(`error: ${env.code}: ${env.message}\n`)
+  process.exit(runErrorExitCode(env.code))
 }
 
 export function registerRunCommand(program: Command): void {
@@ -150,8 +164,7 @@ export function registerRunCommand(program: Command): void {
           })
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err)
         }
         return
       }
@@ -213,11 +226,17 @@ export function registerRunCommand(program: Command): void {
         }
         warnIfTokenArg({ tokenFile, token: opts.token })
         try {
-          const { remoteStream } = await import('../relay/client.js')
+          const { remoteRunStatus, remoteStream } = await import('../relay/client.js')
+          // Pre-flight existence/reachability check (same pattern as the remote
+          // web viewer): the stream itself swallows a fatal run_not_found into a
+          // graceful `stream_disconnected` event, so without this an unknown run
+          // would exit 0. Confirming status first lets an unknown run surface a
+          // structured run_not_found envelope (exit 3) — and node_offline /
+          // unauthorized / relay_unavailable up front — before streaming.
+          await remoteRunStatus(relay, token, run_id)
           await remoteStream(relay, token, run_id)
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err, run_id)
         }
         return
       }
@@ -263,8 +282,7 @@ export function registerRunCommand(program: Command): void {
           const record = await remoteStop(relay, token, run_id)
           process.stdout.write(JSON.stringify(record) + '\n')
         } catch (err) {
-          process.stderr.write(`error: ${(err as Error).message}\n`)
-          process.exit(1)
+          failRemote(err, run_id)
         }
         return
       }
