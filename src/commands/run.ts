@@ -6,7 +6,8 @@ import { startRun, stopRun, resolveAttach } from '../lib/run-actions.js'
 import { resolveWebTarget, tmuxAvailable, validateBind, startViewerServer, generateAccessToken } from '../lib/run-web.js'
 import { addViewer, removeViewer, generateViewerId, listActiveViewers, findViewer } from '../lib/viewer-registry.js'
 import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
-import { buildRunErrorEnvelope, runErrorExitCode } from '../lib/run-error.js'
+import { buildRunErrorEnvelope, runErrorExitCode, classifyRunError } from '../lib/run-error.js'
+import { evaluateNodeReadiness, relayFailureReport } from '../lib/run-doctor.js'
 import { buildAgentPolicyMetadata } from '../runtime/policy.js'
 import type { AgentBackend, PermissionMode } from '../types.js'
 
@@ -279,6 +280,56 @@ export function registerRunCommand(program: Command): void {
       }
       const record = readRun(run_id) // local path: exits 3 if not found
       process.stdout.write(JSON.stringify(record) + '\n')
+    })
+
+  run
+    .command('doctor')
+    .description('read-only readiness preflight for the remote run path (checks relay/auth/node[/agent]; starts nothing)')
+    .requiredOption('--node <node_id>', 'node to check readiness for')
+    .option('--agent <agent>', 'also check the node advertises this agent')
+    .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
+    .option('--relay <url>', 'relay WebSocket URL (required for remote nodes)')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
+    .action(async (opts) => {
+      const ts = new Date().toISOString()
+      const emit = (report: { ok: boolean }) => {
+        process.stdout.write(JSON.stringify(report) + '\n')
+        process.exit(report.ok ? 0 : 1)
+      }
+
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (!relay) {
+        emit(relayFailureReport('relay_unavailable', 'no relay configured (run `vibe connect` or pass --relay)', ts))
+        return
+      }
+
+      const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+      let token: string
+      try {
+        token = resolveRelayToken({ tokenFile, token: opts.token })
+      } catch (err) {
+        // No usable credential — an authorization-readiness failure (never prints
+        // the value; resolveRelayToken's message is token-free).
+        emit(relayFailureReport('unauthorized', (err as Error).message, ts))
+        return
+      }
+      warnIfTokenArg({ tokenFile, token: opts.token })
+
+      try {
+        const { fetchRemoteNodes } = await import('../relay/client.js')
+        const nodes = await fetchRemoteNodes(relay, token)
+        emit(evaluateNodeReadiness(nodes, opts.node as string, opts.agent as string | undefined, ts))
+      } catch (err) {
+        // Relay unreachable or token rejected: classify into the stable code set
+        // and report only the checks we have evidence for.
+        emit(relayFailureReport(classifyRunError(err), (err as Error).message, ts))
+      }
     })
 
   run
