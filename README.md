@@ -76,11 +76,14 @@ vibe connect --relay wss://… --token-file ~/.config/vibe/relay-token --yes
 vibe node daemon
 
 # Remote run commands read the same profile, so you can drop --relay/--token-file too:
+vibe run doctor --node <node_id> --agent mock   # read-only readiness preflight (relay/auth/node/agent)
 vibe run start  --node <node_id> --agent mock --workspace-key demo
 vibe run stream <run_id>
 vibe run status <run_id>
 vibe run stop   <run_id>
 ```
+
+`vibe run doctor` reports a readiness envelope (`{ ok, checks, code? }`, exit `0` ready / `1` not) — see [`docs/orchestrator-contract.md`](docs/orchestrator-contract.md#8-readiness-preflight-vibe-run-doctor).
 
 Both `vibe node daemon` and the remote run commands (`run start` / `run stream` / `run status` / `run stop`) fill
 missing settings from the profile (`vibe_dir`, `relay_url`, `token_file`; the daemon also fills

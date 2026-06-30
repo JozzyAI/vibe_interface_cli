@@ -198,6 +198,59 @@ an `error` event with `code:"stream_disconnected"` followed by a
 
 ---
 
+## 8. Readiness preflight (`vibe run doctor`)
+
+A **read-only** check an orchestrator can run *before* dispatching, to confirm
+the remote path is usable. It starts nothing and stops nothing.
+
+```bash
+vibe run doctor --node <node_id> --agent mock
+```
+
+- `--node <node_id>` is **required**.
+- `--agent <agent>` is **optional**; when given, the node's agent advertisement
+  is checked and an `agent` entry is added to `checks`. When omitted, only
+  `relay` / `auth` / `node` are checked.
+- `--relay` / `--token-file` (and `--token`) follow the same profile/default
+  resolution and precedence as the other remote run commands, so after
+  `vibe connect` they can be dropped.
+
+Output is a **readiness envelope** (distinct from the [error envelope](#4-remote-error-contract)
+above) — it reports a list of checks, not a single fatal error:
+
+```json
+{
+  "ok": false,
+  "checks": [
+    { "name": "relay", "ok": true },
+    { "name": "auth", "ok": true },
+    { "name": "node", "ok": false, "detail": "node my-node is offline" }
+  ],
+  "code": "node_offline",
+  "ts": "2026-06-30T10:00:00.000Z"
+}
+```
+
+- `ok` — overall readiness.
+- `checks[]` — ordered `relay` -> `auth` -> `node` -> (`agent` when requested);
+  each `{ name, ok, detail? }`.
+- `code` — present only when `ok:false`; it **reuses the stable code vocabulary**
+  from the [error contract](#4-remote-error-contract): `relay_unavailable`,
+  `unauthorized`, `node_offline`, `agent_not_supported`. It is the code of the
+  first failing check.
+
+Exit codes (binary):
+
+| exit | meaning |
+|---|---|
+| `0` | ready (`ok:true`) |
+| `1` | not ready (`ok:false`) |
+
+The token value never appears in the output; only the token-file **path** is
+read (see [Token secrecy](#6-token-secrecy)).
+
+---
+
 ## See also
 
 - `README.md` — installation, backends, the relay demos, and safety notes.
