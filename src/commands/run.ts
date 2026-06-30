@@ -248,8 +248,36 @@ export function registerRunCommand(program: Command): void {
     .command('status <run_id>')
     .description('get current status of a run')
     .option('--json', 'output machine-readable JSON to stdout (default behaviour)')
-    .action((run_id: string) => {
-      const record = readRun(run_id)
+    .option('--relay <url>', 'relay WebSocket URL: query the owning node for authoritative remote status')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file')
+    .action(async (run_id: string, opts) => {
+      // Fill relay/token-file from the connect profile when not given on CLI/env.
+      const { relay, tokenFile } = resolveClientDefaults(
+        { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      if (relay) {
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        let token: string
+        try {
+          token = resolveRelayToken({ tokenFile, token: opts.token })
+        } catch (err) {
+          process.stderr.write(`error: ${(err as Error).message}\n`)
+          process.exit(1)
+        }
+        warnIfTokenArg({ tokenFile, token: opts.token })
+        try {
+          const { remoteRunStatus } = await import('../relay/client.js')
+          const record = await remoteRunStatus(relay, token, run_id)
+          process.stdout.write(JSON.stringify(record) + '\n')
+        } catch (err) {
+          failRemote(err, run_id)
+        }
+        return
+      }
+      const record = readRun(run_id) // local path: exits 3 if not found
       process.stdout.write(JSON.stringify(record) + '\n')
     })
 

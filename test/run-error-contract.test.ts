@@ -159,6 +159,18 @@ test('remote stop of an unknown run ⇒ run_not_found envelope, exit 3', { timeo
   assert.equal(r.status, 3)
 })
 
+test('remote status of an unknown run ⇒ run_not_found envelope, exit 3, no token leak', { timeout: 20000 }, async () => {
+  assert.ok(live, 'fake relay + mock node must be up'); if (!live) return
+  const env = { ...process.env, VIBE_DIR: tmpDir() }
+  const r = await vibe(['run', 'status', 'run_does_not_exist', '--relay', live.relayUrl, '--token-file', live.tokenFile, '--json'], env)
+  const out = JSON.parse(r.stdout.trim())
+  assert.equal(out.error, true)
+  assert.equal(out.code, 'run_not_found')
+  assert.equal(out.run_id, 'run_does_not_exist', 'envelope carries the run_id')
+  assert.equal(r.status, 3, 'remote run_not_found exits 3 (matches local missing-run)')
+  assert.ok(!(r.stdout + r.stderr).includes(TEST_TOKEN), 'token value absent from output')
+})
+
 test('success paths unchanged: start ⇒ RunRecord+exit0, stream ⇒ JSONL, stop ⇒ RunRecord+exit0', { timeout: 25000 }, async () => {
   assert.ok(live, 'fake relay + mock node must be up'); if (!live) return
   const env = { ...process.env, VIBE_DIR: live.vibeDir }

@@ -143,7 +143,7 @@ after(async () => {
   if (live) { if (!live.daemon.killed) live.daemon.kill('SIGTERM'); await delay(300); await live.server.close() }
 })
 
-test('run start/stream/stop use the profile relay+token (no --relay on the CLI)', { timeout: 25000 }, async () => {
+test('run start/stream/status/stop use the profile relay+token (no --relay on the CLI)', { timeout: 25000 }, async () => {
   assert.ok(live, 'fake relay + mock node must be up')
   if (!live) return
   // Profile supplies relay_url + token_file; client env sets VIBE_DIR (env > profile).
@@ -158,6 +158,14 @@ test('run start/stream/stop use the profile relay+token (no --relay on the CLI)'
   const stream = await vibe(['run', 'stream', run_id, '--jsonl'], env, 20000)
   assert.ok(/"type":"(log|status)"/.test(stream.stdout), 'run stream delivered remote events via the profile relay')
 
+  // `run status` over the profile relay (no --relay on the CLI) returns the
+  // node-authoritative record. The controller never wrote this run locally, so a
+  // matching record proves the status was fetched remotely via the profile.
+  const status = await vibe(['run', 'status', run_id, '--json'], env)
+  assert.equal(status.status, 0, `run status via profile relay failed: ${status.stdout}${status.stderr}`)
+  const statusRec = JSON.parse(status.stdout.trim())
+  assert.equal(statusRec.run_id, run_id, 'run status returned the node-authoritative record for the run')
+
   // `run stop` on a fresh, still-running remote run (mock lasts ~4s) — succeeds over
   // the profile relay. (A local stop could not reach the node; success proves remote.)
   const startB = await vibe(['run', 'start', '--node', 'rp-node', '--agent', 'mock', '--workspace-key', `rp-stop-${Date.now()}`, '--json'], env)
@@ -166,7 +174,7 @@ test('run start/stream/stop use the profile relay+token (no --relay on the CLI)'
   assert.equal(stop.status, 0, `run stop via profile relay failed: ${stop.stdout}${stop.stderr}`)
 
   // No token value anywhere in the client output, and the profile holds only the path.
-  const all = start.stdout + start.stderr + stream.stdout + stream.stderr + startB.stdout + stop.stdout + stop.stderr
+  const all = start.stdout + start.stderr + stream.stdout + stream.stderr + status.stdout + status.stderr + startB.stdout + stop.stdout + stop.stderr
   assert.ok(!all.includes(TEST_TOKEN), 'relay token value never appears in run output')
   assert.ok(!fs.readFileSync(profile, 'utf8').includes(TEST_TOKEN), 'profile holds the token-file path, never the value')
 })
