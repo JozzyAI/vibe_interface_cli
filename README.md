@@ -316,6 +316,36 @@ vibe run viewers stop <run_id|vw_id>  # stop the LOCAL viewer process (NOT the r
 - `vibe run viewers stop` signals only the local viewer HTTP process; the run itself keeps going
   (use `vibe run stop` for that).
 
+### Web terminal (`vibe terminal`) — interactive, write-capable
+
+`vibe run web` is **read-only**. `vibe terminal serve` is a separate, **write-capable** browser
+terminal (xterm.js) bound to an **existing local tmux session** — you type in the browser and the
+keystrokes go to the session. This is the Terminal Mode MVP: **local tmux only** (no relay, no agent
+launching yet). You create the session; the terminal attaches to it.
+
+```bash
+# create a session yourself first, then serve it:
+tmux new -d -s work 'bash'
+vibe terminal serve --session work            # binds 127.0.0.1:8790, prints a URL with a one-time control token
+# open the printed http://127.0.0.1:8790/?control=… in a browser and type
+```
+
+Because it is write-capable, it is stricter than the read-only viewer:
+
+- **Loopback-only by default.** A non-loopback bind requires the explicit **`--allow-control-bind`**
+  (a stronger, separate flag — *not* the viewer's `--allow-public-bind`) and prints a loud warning.
+  For phone/LAN access, prefer loopback + an SSH tunnel.
+- **A one-time control token** (distinct from the read-only viewer access token) gates **both** the
+  page and the WebSocket; it arrives via `?control=` and is stored as an HttpOnly cookie (JS never
+  sees it). Missing session ⇒ a clean `tmux_session_not_found` error.
+- **No secrets/keystrokes logged.** The server never logs the token or typed input.
+
+```bash
+vibe terminal serve --session work --host 192.168.1.50 --port 8790 --allow-control-bind   # LAN (discouraged)
+```
+
+Deferred: remote-node terminal over the relay, launching agents interactively, and node-pty.
+
 ### Codex CLI setup
 
 **Install:**
