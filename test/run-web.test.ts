@@ -37,8 +37,16 @@ function startDetachedRun() {
   return { env, record }
 }
 
+// Kill ONLY the `vibe-run-*` sessions this suite created — never `tmux
+// kill-server`, which would also destroy an unrelated production `vibe-node`
+// daemon session running in tmux on the same machine.
 after(() => {
-  if (TMUX_AVAILABLE) spawnSync('tmux', ['kill-server'], { stdio: 'ignore' })
+  if (!TMUX_AVAILABLE) return
+  const ls = spawnSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf8' })
+  if (ls.status !== 0) return
+  for (const name of ls.stdout.split('\n').map((s) => s.trim()).filter((n) => n.startsWith('vibe-run-'))) {
+    spawnSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' })
+  }
 })
 
 // ── unit: bind policy ───────────────────────────────────────────────────────

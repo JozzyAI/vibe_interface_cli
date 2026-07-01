@@ -40,9 +40,16 @@ function startLongRun(extra: NodeJS.ProcessEnv = {}) {
   return { env, record: JSON.parse(start.stdout.trim()) }
 }
 
-// Best-effort teardown: kill any tmux sessions this suite may have created.
+// Best-effort teardown: kill ONLY the `vibe-run-*` sessions this suite created.
+// (`tmux kill-server` would destroy every session on the machine, including an
+// unrelated production `vibe-node` daemon running in tmux — never do that.)
 after(() => {
-  if (TMUX_AVAILABLE) spawnSync('tmux', ['kill-server'], { stdio: 'ignore' })
+  if (!TMUX_AVAILABLE) return
+  const ls = spawnSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf8' })
+  if (ls.status !== 0) return
+  for (const name of ls.stdout.split('\n').map((s) => s.trim()).filter((n) => n.startsWith('vibe-run-'))) {
+    spawnSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' })
+  }
 })
 
 // ── stable session reference ────────────────────────────────────────────────
