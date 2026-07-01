@@ -6,20 +6,31 @@ import {
   isLoopbackHost,
   generateControlToken,
   startTerminalServer,
+  startRemoteTerminalServer,
 } from '../lib/terminal-web.js'
 
 /**
- * `vibe terminal` — a local, WRITE-CAPABLE web terminal for an existing tmux
- * session. Loopback-only by default; a control token gates the page and the WS.
- * This is the Terminal Mode MVP: local tmux only (no relay, no agent launching).
+ * `vibe terminal` — a WRITE-CAPABLE web terminal.
+ *
+ *   local (PR #41):   vibe terminal serve --session <local-tmux-session>
+ *   remote (this PR): vibe terminal serve --node <id> --session <name> --relay <ws> --token-file <path>
+ *
+ * Local mode drives a LOCAL tmux session directly. Remote mode is a gateway:
+ * the browser bridges over the relay to the node's terminal (echo skeleton for
+ * now — no node-side tmux yet). Loopback-only by default; a control token gates
+ * the page and the WS.
  */
 export function registerTerminalCommand(program: Command): void {
-  const terminal = program.command('terminal').description('interactive web terminal for a local tmux session')
+  const terminal = program.command('terminal').description('interactive web terminal (local tmux, or remote node over the relay)')
 
   terminal
     .command('serve')
-    .description('serve a browser terminal bound to an existing local tmux session (write-capable)')
-    .requiredOption('--session <name>', 'name of an EXISTING tmux session to attach to')
+    .description('serve a browser terminal for a local tmux session, or a remote node over the relay (write-capable)')
+    .requiredOption('--session <name>', 'tmux session name (local: existing session; remote: node-side session)')
+    .option('--node <node_id>', 'REMOTE mode: bridge to this node over the relay instead of a local tmux session')
+    .option('--relay <url>', 'relay WebSocket URL (required with --node)')
+    .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file (required with --node unless --token/env)')
     .option('--host <host>', 'bind host (default 127.0.0.1; non-loopback requires --allow-control-bind)', '127.0.0.1')
     .option('--port <port>', 'port to bind (default 8790)', '8790')
     .option('--allow-control-bind', 'permit a non-loopback bind — exposes WRITE access on the network (discouraged)')
@@ -30,29 +41,17 @@ export function registerTerminalCommand(program: Command): void {
         process.exit(1)
       }
 
-      // 1. tmux must be available.
-      if (!tmuxAvailable()) {
-        fail('terminal_dependency_missing', 'the web terminal requires tmux (tmux -V failed); install tmux first')
-      }
-
-      // 2. The session must already exist (we never create shells/sessions).
       const session = opts.session as string
-      if (!tmuxSessionExists(session)) {
-        fail('tmux_session_not_found', `no tmux session named "${session}" — create it first, e.g. \`tmux new -d -s ${session} 'bash'\``)
-      }
-
-      // 3. Refuse a non-loopback bind unless explicitly allowed.
       const host = opts.host as string
-      const bind = validateControlBind(host, Boolean(opts.allowControlBind))
-      if (!bind.ok) {
-        fail(bind.code, bind.message)
-      }
+      const remote = Boolean(opts.node)
 
-      // 4. Loud warning on a network-exposed WRITE-capable bind.
+      // Bind guard (both modes): refuse a non-loopback bind unless allowed, warn loudly.
+      const bind = validateControlBind(host, Boolean(opts.allowControlBind))
+      if (!bind.ok) fail(bind.code, bind.message)
       if (!isLoopbackHost(host)) {
         process.stderr.write(
           `warning: --allow-control-bind exposes a WRITE-CAPABLE terminal on ${host}. Anyone who obtains the URL ` +
-          `(one-time control token) can type into the tmux session. Prefer loopback + an SSH tunnel.\n`,
+          `(one-time control token) can type into the ${remote ? 'remote node' : 'tmux'} session. Prefer loopback + an SSH tunnel.\n`,
         )
       }
 
@@ -60,15 +59,46 @@ export function registerTerminalCommand(program: Command): void {
       const controlToken = generateControlToken()
 
       let server
-      try {
-        server = await startTerminalServer({ session, host, port, controlToken })
-      } catch (err) {
-        fail('terminal_start_failed', `failed to bind ${host}:${port}: ${(err as Error).message}`)
-        return
+      if (remote) {
+        // Remote mode: bridge to a node over the relay. tmux lives on the node.
+        if (!opts.relay) fail('relay_required', '--relay <url> is required with --node')
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        let token: string
+        try {
+          token = resolveRelayToken({ tokenFile: opts.tokenFile, token: opts.token })
+        } catch (err) {
+          fail('auth_token_error', (err as Error).message)
+          return
+        }
+        warnIfTokenArg({ tokenFile: opts.tokenFile, token: opts.token })
+        try {
+          server = await startRemoteTerminalServer({
+            session, host, port, controlToken,
+            relay: opts.relay as string, token, nodeId: opts.node as string,
+          })
+        } catch (err) {
+          fail('terminal_start_failed', `failed to bind ${host}:${port}: ${(err as Error).message}`)
+          return
+        }
+      } else {
+        // Local mode (unchanged): drive a LOCAL tmux session.
+        if (!tmuxAvailable()) {
+          fail('terminal_dependency_missing', 'the web terminal requires tmux (tmux -V failed); install tmux first')
+        }
+        if (!tmuxSessionExists(session)) {
+          fail('tmux_session_not_found', `no tmux session named "${session}" — create it first, e.g. \`tmux new -d -s ${session} 'bash'\``)
+        }
+        try {
+          server = await startTerminalServer({ session, host, port, controlToken })
+        } catch (err) {
+          fail('terminal_start_failed', `failed to bind ${host}:${port}: ${(err as Error).message}`)
+          return
+        }
       }
 
       const info = {
         session,
+        ...(remote ? { node: opts.node as string, remote: true } : {}),
         url: server.url,
         host: server.host,
         port: server.port,
@@ -79,7 +109,8 @@ export function registerTerminalCommand(program: Command): void {
       if (opts.json) {
         process.stdout.write(JSON.stringify(info) + '\n')
       } else {
-        process.stdout.write(`vibe terminal: write-capable terminal for tmux session "${session}" at ${server.url}  (Ctrl-C to stop)\n`)
+        const where = remote ? `remote node ${opts.node} session "${session}"` : `tmux session "${session}"`
+        process.stdout.write(`vibe terminal: write-capable terminal for ${where} at ${server.url}  (Ctrl-C to stop)\n`)
       }
 
       const shutdown = (): void => { server!.close().finally(() => process.exit(0)) }

@@ -421,6 +421,11 @@ export async function relayNodeDaemon(
       // other unexpected responses fall through to 'error'/'close' (transient)
     })
 
+    // Remote-terminal ECHO skeleton: live session ids on this connection. This
+    // PR does NOT touch tmux/pty — it only proves the transport. `terminal_input`
+    // data is echoed back verbatim and is NEVER logged.
+    const terminalEchoSessions = new Set<string>()
+
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as RelayMessage
@@ -497,6 +502,26 @@ export async function relayNodeDaemon(
           handleEncryptedApprovalResponse(ws, nodeId, enc).catch((err: Error) => {
             process.stderr.write(`[vibe-node] encrypted approval_response error: ${err.message}\n`)
           })
+        } else if (msg.type === 'terminal_open') {
+          // Echo skeleton: register the session and ack ok. No tmux, no shell.
+          terminalEchoSessions.add(msg.session_id)
+          sendMsg(ws, {
+            version: 1, kind: 'plaintext', from: nodeId, to: msg.from, ts: t(),
+            type: 'terminal_open_ack', req_id: msg.req_id, session_id: msg.session_id,
+            ok: true, message: 'echo terminal (skeleton — no tmux yet)',
+          })
+        } else if (msg.type === 'terminal_input') {
+          // Echo the keystrokes straight back as output. NEVER log msg.data.
+          if (terminalEchoSessions.has(msg.session_id)) {
+            sendMsg(ws, {
+              version: 1, kind: 'plaintext', from: nodeId, to: msg.from, ts: t(),
+              type: 'terminal_output', session_id: msg.session_id, data: msg.data,
+            })
+          }
+        } else if (msg.type === 'terminal_resize') {
+          // Skeleton: accept and no-op (dimensions matter once real tmux lands).
+        } else if (msg.type === 'terminal_close') {
+          terminalEchoSessions.delete(msg.session_id)
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           try { ws.close() } catch { /* ignore */ }

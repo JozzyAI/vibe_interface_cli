@@ -25,6 +25,7 @@ import { spawn, spawnSync } from 'child_process'
 import { createRequire } from 'module'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { generateAccessToken } from './run-web.js'
+import { bridgeRemoteTerminal } from './terminal-remote.js'
 
 const require = createRequire(import.meta.url)
 const CONTROL_COOKIE = 'vibe_control'
@@ -181,9 +182,17 @@ export interface TerminalOptions {
  * Resolves once listening. This function performs NO stdout/stderr logging (the
  * command layer prints the URL); it never logs input or the token.
  */
-export function startTerminalServer(opts: TerminalOptions): Promise<TerminalServer> {
+/**
+ * Shared HTTP+WS scaffold for both local and remote terminals: control-token
+ * gate, xterm page/assets, `/ws` upgrade. `onConnection(ws)` is called for each
+ * authenticated browser WebSocket and owns the actual bridge (local tmux or
+ * relay). Performs NO logging; never logs input or the token.
+ */
+function serveTerminal(
+  opts: { session: string; host: string; port: number; controlToken: string },
+  onConnection: (ws: WebSocket) => void,
+): Promise<TerminalServer> {
   const { session, host, port, controlToken } = opts
-  const pollMs = opts.pollMs ?? 150
 
   const server = http.createServer((req, res) => {
     const decision = checkControlAccess(req, controlToken)
@@ -229,14 +238,13 @@ export function startTerminalServer(opts: TerminalOptions): Promise<TerminalServ
       socket.destroy()
       return
     }
-    wss.handleUpgrade(req, socket, head, (ws) => bridgeSession(ws, session, pollMs))
+    wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws))
   })
 
   return new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(port, host, () => {
-      const addr = server.address() as { port: number }
-      const boundPort = addr.port
+      const boundPort = (server.address() as { port: number }).port
       resolve({
         host,
         port: boundPort,
@@ -245,6 +253,37 @@ export function startTerminalServer(opts: TerminalOptions): Promise<TerminalServ
       })
     })
   })
+}
+
+/**
+ * Start the LOCAL terminal server (PR #41 behaviour, unchanged): the HTTP layer
+ * serves the xterm page + assets (control-token gated); the WS layer bridges the
+ * browser to a LOCAL tmux session via send-keys/capture-pane.
+ */
+export function startTerminalServer(opts: TerminalOptions): Promise<TerminalServer> {
+  const pollMs = opts.pollMs ?? 150
+  return serveTerminal(opts, (ws) => bridgeSession(ws, opts.session, pollMs))
+}
+
+export interface RemoteTerminalOptions {
+  session: string    // node-side session name (shown in the page; sent in terminal_open)
+  host: string
+  port: number
+  controlToken: string
+  relay: string      // relay ws url
+  token: string      // relay auth token VALUE (resolved by the caller; never logged)
+  nodeId: string     // target node
+}
+
+/**
+ * Start the REMOTE terminal server: same xterm page + control-token gate, but
+ * each browser WS is bridged to a node's terminal OVER THE RELAY
+ * (browser WS ↔ relay `terminal_*` ↔ node). No tmux here — the node owns it.
+ */
+export function startRemoteTerminalServer(opts: RemoteTerminalOptions): Promise<TerminalServer> {
+  return serveTerminal(opts, (ws) =>
+    bridgeRemoteTerminal(ws, { relay: opts.relay, token: opts.token, nodeId: opts.nodeId, session: opts.session }),
+  )
 }
 
 /**
