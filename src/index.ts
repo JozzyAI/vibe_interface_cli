@@ -7,6 +7,7 @@ import { registerRelayCommand } from './commands/relay.js'
 import { registerApprovalCommand } from './commands/approval.js'
 import { registerMonitorCommand } from './commands/monitor.js'
 import { registerConnectCommand } from './commands/connect.js'
+import { registerTerminalCommand } from './commands/terminal.js'
 import { runSupervisor } from './runtime/supervisor.js'
 
 const program = new Command()
@@ -38,5 +39,6 @@ registerNodeCommand(program)
 registerRelayCommand(program)
 registerApprovalCommand(program)
 registerMonitorCommand(program)
+registerTerminalCommand(program)
 
 program.parse()
