@@ -96,6 +96,10 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const runOwnership = new Map<string, string>()
     // run_id → set of subscriber ws, for streaming run events to CLI clients
     const subscribers = new Map<string, Set<WebSocket>>()
+    // session_id → set of gateway ws, for fanning terminal_output/error/open_ack
+    // back to the terminal gateway. Kept separate from `subscribers` (run events)
+    // for this skeleton. Relay never inspects/logs terminal payload `data`.
+    const terminalSubscribers = new Map<string, Set<WebSocket>>()
     // node_id → PublicIdentity (populated on node_pair_request).
     // Loaded from disk when a pairings file is configured so pairings survive a
     // relay restart; otherwise starts empty (legacy in-memory behaviour).
@@ -349,6 +353,41 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             break
           }
 
+          // ── remote terminal (gateway → node): route by `to`; the gateway
+          //    subscribes to node→gateway messages on terminal_open. ──────────
+          case 'terminal_open': {
+            const subs = terminalSubscribers.get(msg.session_id) ?? new Set<WebSocket>()
+            subs.add(ws)
+            terminalSubscribers.set(msg.session_id, subs)
+            const target = registry.get(msg.to)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'terminal_error', session_id: msg.session_id,
+                code: 'node_offline', message: `Node not found: ${msg.to}`,
+              })
+              break
+            }
+            sendMsg(target.ws, msg) // forward verbatim; relay never reads payload
+            break
+          }
+          case 'terminal_input':
+          case 'terminal_resize':
+          case 'terminal_close': {
+            const target = registry.get(msg.to)
+            if (target) sendMsg(target.ws, msg) // forward to node; payload untouched
+            break
+          }
+
+          // ── remote terminal (node → gateway): fan out by session_id ─────────
+          case 'terminal_open_ack':
+          case 'terminal_output':
+          case 'terminal_error': {
+            const subs = terminalSubscribers.get(msg.session_id)
+            if (subs) for (const sub of subs) sendMsg(sub, msg)
+            break
+          }
+
           case 'run_start': {
             pendingReqs.set(msg.req_id, ws)
             const target = registry.get(msg.to)
@@ -468,6 +507,10 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         for (const [runId, subs] of subscribers) {
           subs.delete(ws)
           if (subs.size === 0) subscribers.delete(runId)
+        }
+        for (const [sid, subs] of terminalSubscribers) {
+          subs.delete(ws)
+          if (subs.size === 0) terminalSubscribers.delete(sid)
         }
       })
     })

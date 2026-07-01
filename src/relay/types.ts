@@ -318,6 +318,53 @@ export interface RelayErrorMsg extends RelayMsgBase {
   message: string
 }
 
+// ── remote terminal (echo skeleton) — gateway ↔ relay ↔ node daemon ─────────
+// Additive protocol. gateway→node messages route by `to` (like run_start);
+// node→gateway messages (open_ack/output/error) fan out by `session_id`. The
+// relay stays payload-dumb: it never inspects or logs `data`.
+
+export interface TerminalOpenMsg extends RelayMsgBase {
+  type: 'terminal_open'
+  req_id: string
+  session_id: string   // gateway-generated id; relay fans node→gateway msgs on it
+  session: string      // node-side session name to attach to (ignored by the echo node)
+  cols?: number
+  rows?: number
+}
+export interface TerminalOpenAckMsg extends RelayMsgBase {
+  type: 'terminal_open_ack'
+  req_id: string
+  session_id: string
+  ok: boolean
+  message?: string
+}
+export interface TerminalInputMsg extends RelayMsgBase {
+  type: 'terminal_input'
+  session_id: string
+  data: string         // raw keystrokes — NEVER logged by relay or node
+}
+export interface TerminalOutputMsg extends RelayMsgBase {
+  type: 'terminal_output'
+  session_id: string
+  data: string
+}
+export interface TerminalResizeMsg extends RelayMsgBase {
+  type: 'terminal_resize'
+  session_id: string
+  cols: number
+  rows: number
+}
+export interface TerminalCloseMsg extends RelayMsgBase {
+  type: 'terminal_close'
+  session_id: string
+}
+export interface TerminalErrorMsg extends RelayMsgBase {
+  type: 'terminal_error'
+  session_id: string
+  code: string
+  message: string
+}
+
 export type RelayMessage =
   | EncryptedRunStartMsg
   | EncryptedRunEventMsg
@@ -342,4 +389,11 @@ export type RelayMessage =
   | RunStreamSubscribeAckMsg
   | RunStopAckMsg
   | RunStatusAckMsg
+  | TerminalOpenMsg
+  | TerminalOpenAckMsg
+  | TerminalInputMsg
+  | TerminalOutputMsg
+  | TerminalResizeMsg
+  | TerminalCloseMsg
+  | TerminalErrorMsg
   | RelayErrorMsg
