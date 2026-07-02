@@ -1,15 +1,17 @@
 /**
- * Remote terminal protocol skeleton (echo). Proves the transport end-to-end:
- *   browser WS -> gateway -> relay -> node daemon (ECHO) -> relay -> gateway -> browser
- * plus the raw relay routing/fan-out and the node echo handler. No tmux yet.
+ * Remote terminal over the relay — REAL node-side tmux attach (PR: attach).
+ *   browser WS -> gateway -> relay -> node daemon -> tmux send-keys/capture-pane
+ * Proves: attach to an EXISTING session, input reaches tmux, pane output streams
+ * back, missing-session fails cleanly, close cleans up WITHOUT killing tmux.
  *
- * Live in-process relay + a real spawned mock node daemon (async spawn — an
- * in-process relay shares the event loop). Temp VIBE_DIR. No token/input logged.
+ * Live in-process relay + a real spawned mock node daemon (async spawn). Real
+ * tmux tests are gated on tmux being installed and kill ONLY their own uniquely
+ * named session (never kill-server — protects any production `vibe-node`).
  */
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'http'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -23,6 +25,8 @@ const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
 const NODE = process.execPath
 const TEST_TOKEN = `termremote-tok-${Date.now()}-${Math.random().toString(36).slice(2)}`
 const NODE_ID = 'rt-node'
+const TMUX = (() => { try { return spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0 } catch { return false } })()
+const SESS = `vibe-rtt-${process.pid}-${Math.random().toString(36).slice(2, 7)}`
 
 function tmpDir(): string { return fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-termremote-')) }
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -43,8 +47,7 @@ let live: Live | undefined
 let gw: TerminalServer | undefined
 let CONTROL = ''
 
-// Single setup: bring up relay + mock node daemon, then the gateway server.
-// (One hook avoids any multi-`before` ordering ambiguity around `live`.)
+// Single setup: relay + mock node daemon + a dedicated tmux session + gateway.
 before(async () => {
   const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
   const relayUrl = `ws://127.0.0.1:${server.port}`
@@ -61,62 +64,94 @@ before(async () => {
     try { if (JSON.parse(r.stdout.trim()).some((n: { node_id: string }) => n.node_id === NODE_ID)) live = { server, relayUrl, daemon, tokenFile, vibeDir } } catch { /* not ready */ }
   }
   if (!live) { daemon.kill('SIGKILL'); await server.close(); return }
+  if (TMUX) spawnSync('tmux', ['new', '-d', '-s', SESS, 'bash']) // the ONE session under test
   CONTROL = generateControlToken()
-  gw = await startRemoteTerminalServer({ session: 'phone-echo', host: '127.0.0.1', port: 0, controlToken: CONTROL, relay: relayUrl, token: TEST_TOKEN, nodeId: NODE_ID })
+  gw = await startRemoteTerminalServer({ session: SESS, host: '127.0.0.1', port: 0, controlToken: CONTROL, relay: relayUrl, token: TEST_TOKEN, nodeId: NODE_ID })
 })
 
 after(async () => {
   if (gw) await gw.close()
   if (live) { if (!live.daemon.killed) live.daemon.kill('SIGTERM'); await delay(300); await live.server.close() }
+  if (TMUX) spawnSync('tmux', ['kill-session', '-t', SESS], { stdio: 'ignore' }) // ONLY our session
 })
 
-/** Open a raw relay client ws (as a gateway would), authed with the token. */
-function relayClient(): WebSocket {
-  return new WebSocket(`${live!.relayUrl}?token=${TEST_TOKEN}`)
+function relayClient(): WebSocket { return new WebSocket(`${live!.relayUrl}?token=${TEST_TOKEN}`) }
+function openRelay(ws: WebSocket): Promise<void> {
+  return new Promise((res, rej) => { ws.once('open', () => res()); ws.once('error', rej); setTimeout(() => rej(new Error('open timeout')), 4000) })
 }
 
-test('relay routes terminal_open/input to the node; node ECHOes output back to the gateway', { timeout: 20000 }, async () => {
-  assert.ok(live, 'relay + node up'); if (!live) return
-  const ws = relayClient()
-  const sid = 'sess_a'
-  const outputs: string[] = []
-  let ackOk: boolean | undefined
-  ws.on('message', (raw) => {
-    try {
-      const m = JSON.parse(raw.toString())
-      if (m.session_id !== sid) return
-      if (m.type === 'terminal_open_ack') ackOk = m.ok
-      if (m.type === 'terminal_output') outputs.push(m.data)
-    } catch { /* ignore */ }
-  })
-  await new Promise<void>((res, rej) => { ws.once('open', () => res()); ws.once('error', rej); setTimeout(() => rej(new Error('open timeout')), 4000) })
+// ── node-side tmux attach (raw relay client as the gateway) ──────────────────
 
-  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_open', req_id: 'r1', session_id: sid, session: 'whatever' }))
-  await delay(400)
-  assert.equal(ackOk, true, 'node acked terminal_open ok')
-
-  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_input', session_id: sid, data: 'ECHO_ME_123' }))
-  const deadline = Date.now() + 4000
-  while (Date.now() < deadline && !outputs.some((d) => d.includes('ECHO_ME_123'))) await delay(100)
+test('terminal_open attaches to an EXISTING tmux session; input reaches tmux and pane output streams back', { skip: !TMUX, timeout: 20000 }, async () => {
+  assert.ok(live); if (!live) return
+  const ws = relayClient(); const sid = 'sess_attach'
+  const outputs: string[] = []; let ackOk: boolean | undefined
+  ws.on('message', (raw) => { try { const m = JSON.parse(raw.toString()); if (m.session_id !== sid) return; if (m.type === 'terminal_open_ack') ackOk = m.ok; if (m.type === 'terminal_output') outputs.push(m.data) } catch { /* ignore */ } })
+  await openRelay(ws)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_open', req_id: 'r1', session_id: sid, session: SESS }))
+  await delay(500)
+  assert.equal(ackOk, true, 'attached to the existing session')
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_input', session_id: sid, data: 'echo RTOPEN_OK\r' }))
+  const deadline = Date.now() + 6000
+  while (Date.now() < deadline && !outputs.some((d) => d.includes('RTOPEN_OK'))) await delay(150)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_close', session_id: sid }))
   ws.close()
-  assert.ok(outputs.some((d) => d.includes('ECHO_ME_123')), 'input was echoed back as terminal_output through the relay')
+  assert.ok(outputs.some((d) => d.includes('RTOPEN_OK')), 'the tmux pane output (echo result) streamed back to the gateway')
 })
 
-test('relay returns terminal_error(node_offline) for terminal_open to an unknown node', { timeout: 15000 }, async () => {
-  assert.ok(live, 'relay up'); if (!live) return
-  const ws = relayClient()
-  const sid = 'sess_ghost'
-  let errCode: string | undefined
+test('terminal_open to a MISSING tmux session → terminal_open_ack ok:false', { timeout: 15000 }, async () => {
+  assert.ok(live); if (!live) return
+  const ws = relayClient(); const sid = 'sess_missing'
+  let ack: { ok?: boolean; message?: string } | undefined
+  ws.on('message', (raw) => { try { const m = JSON.parse(raw.toString()); if (m.session_id === sid && m.type === 'terminal_open_ack') ack = m } catch { /* ignore */ } })
+  await openRelay(ws)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_open', req_id: 'r2', session_id: sid, session: `no-such-${Math.random().toString(36).slice(2)}` }))
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline && !ack) await delay(100)
+  ws.close()
+  assert.ok(ack, 'got an ack'); assert.equal(ack!.ok, false, 'missing session fails cleanly (no attach)')
+})
+
+test('terminal_open to an unknown node → terminal_error(node_offline)', { timeout: 15000 }, async () => {
+  assert.ok(live); if (!live) return
+  const ws = relayClient(); const sid = 'sess_ghost'; let errCode: string | undefined
   ws.on('message', (raw) => { try { const m = JSON.parse(raw.toString()); if (m.session_id === sid && m.type === 'terminal_error') errCode = m.code } catch { /* ignore */ } })
-  await new Promise<void>((res, rej) => { ws.once('open', () => res()); ws.once('error', rej); setTimeout(() => rej(new Error('open timeout')), 4000) })
-  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: 'ghost-node', ts: t(), type: 'terminal_open', req_id: 'r2', session_id: sid, session: 'x' }))
+  await openRelay(ws)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: 'ghost-node', ts: t(), type: 'terminal_open', req_id: 'r3', session_id: sid, session: 'x' }))
   const deadline = Date.now() + 3000
   while (Date.now() < deadline && !errCode) await delay(100)
   ws.close()
-  assert.equal(errCode, 'node_offline', 'unknown node → terminal_error node_offline routed back to the gateway')
+  assert.equal(errCode, 'node_offline')
 })
 
-// ── gateway server (startRemoteTerminalServer) end-to-end ────────────────────
+test('terminal_close stops the bridge but does NOT kill the tmux session', { skip: !TMUX, timeout: 15000 }, async () => {
+  assert.ok(live); if (!live) return
+  const ws = relayClient(); const sid = 'sess_close'
+  await openRelay(ws)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_open', req_id: 'r4', session_id: sid, session: SESS }))
+  await delay(500)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_close', session_id: sid }))
+  await delay(400)
+  ws.close()
+  assert.equal(spawnSync('tmux', ['has-session', '-t', SESS], { stdio: 'ignore' }).status, 0, 'tmux session survived terminal_close')
+})
+
+test('terminal_resize is accepted best-effort and does not break the bridge', { skip: !TMUX, timeout: 20000 }, async () => {
+  assert.ok(live); if (!live) return
+  const ws = relayClient(); const sid = 'sess_resize'; const outputs: string[] = []
+  ws.on('message', (raw) => { try { const m = JSON.parse(raw.toString()); if (m.session_id === sid && m.type === 'terminal_output') outputs.push(m.data) } catch { /* ignore */ } })
+  await openRelay(ws)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_open', req_id: 'r5', session_id: sid, session: SESS }))
+  await delay(400)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_resize', session_id: sid, cols: 100, rows: 30 }))
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_input', session_id: sid, data: 'echo AFTER_RESIZE_OK\r' }))
+  const deadline = Date.now() + 6000
+  while (Date.now() < deadline && !outputs.some((d) => d.includes('AFTER_RESIZE_OK'))) await delay(150)
+  ws.send(JSON.stringify({ version: 1, kind: 'plaintext', from: 'cli', to: NODE_ID, ts: t(), type: 'terminal_close', session_id: sid })); ws.close()
+  assert.ok(outputs.some((d) => d.includes('AFTER_RESIZE_OK')), 'bridge still streams after a resize')
+})
+
+// ── gateway server (startRemoteTerminalServer) ───────────────────────────────
 
 function httpGet(pathAndQuery: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -144,21 +179,21 @@ test('gateway WS: unauthenticated upgrade rejected', { timeout: 15000 }, async (
   assert.equal(rejected, true)
 })
 
-test('gateway bridge e2e: browser input → node echo → browser output (over the relay)', { timeout: 20000 }, async () => {
+test('gateway bridge e2e: browser input → node tmux → browser output (over the relay)', { skip: !TMUX, timeout: 20000 }, async () => {
   assert.ok(gw)
   const ws = new WebSocket(`ws://127.0.0.1:${gw.port}/ws?control=${CONTROL}`)
   let sawMarker = false
-  ws.on('message', (raw) => { try { const m = JSON.parse(raw.toString()); if (m.type === 'output' && typeof m.data === 'string' && m.data.includes('BROWSER_ECHO_OK')) sawMarker = true } catch { /* ignore */ } })
+  ws.on('message', (raw) => { try { const m = JSON.parse(raw.toString()); if (m.type === 'output' && typeof m.data === 'string' && m.data.includes('BROWSER_TMUX_OK')) sawMarker = true } catch { /* ignore */ } })
   await new Promise<void>((res, rej) => { ws.once('open', () => res()); ws.once('error', rej); setTimeout(() => rej(new Error('open timeout')), 5000) })
-  await delay(500) // let terminal_open round-trip
-  ws.send(JSON.stringify({ type: 'input', data: 'BROWSER_ECHO_OK' }))
-  const deadline = Date.now() + 6000
+  await delay(600) // terminal_open round-trip
+  ws.send(JSON.stringify({ type: 'input', data: 'echo BROWSER_TMUX_OK\r' }))
+  const deadline = Date.now() + 8000
   while (Date.now() < deadline && !sawMarker) await delay(150)
   ws.close()
-  assert.equal(sawMarker, true, 'the full browser↔gateway↔relay↔node echo path delivered the marker')
+  assert.equal(sawMarker, true, 'the full browser↔gateway↔relay↔node↔tmux path delivered the pane output')
 })
 
-test('gateway performs no logging (control token + typed input never written to stdout/stderr)', { timeout: 20000 }, async () => {
+test('gateway performs no logging (control token + typed input never written to stdout/stderr)', { skip: !TMUX, timeout: 20000 }, async () => {
   assert.ok(gw)
   const captured: string[] = []
   const oOut = process.stdout.write.bind(process.stdout); const oErr = process.stderr.write.bind(process.stderr)
@@ -168,8 +203,8 @@ test('gateway performs no logging (control token + typed input never written to 
     const secret = `SECRET_${Math.random().toString(36).slice(2, 8)}`
     const ws = new WebSocket(`ws://127.0.0.1:${gw.port}/ws?control=${CONTROL}`)
     await new Promise<void>((res) => { ws.on('open', () => res()); setTimeout(res, 3000) })
-    ws.send(JSON.stringify({ type: 'input', data: `echo ${secret}` }))
-    await delay(800); ws.close()
+    ws.send(JSON.stringify({ type: 'input', data: `echo ${secret}\r` }))
+    await delay(900); ws.close()
     const all = captured.join('')
     assert.ok(!all.includes(CONTROL), 'control token never logged')
     assert.ok(!all.includes(secret), 'typed input never logged')
