@@ -20,6 +20,7 @@ import type { RelayMessage, RunStartMsg, RunStopRequestMsg, RunStatusRequestMsg,
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
 import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, deriveApprovalKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
 import { nextBackoffMs, sleep } from './reconnect.js'
+import { tmuxAvailable, tmuxHasSession, tmuxCapturePane, tmuxSendKeys, tmuxResizeWindow } from '../lib/tmux.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -421,10 +422,19 @@ export async function relayNodeDaemon(
       // other unexpected responses fall through to 'error'/'close' (transient)
     })
 
-    // Remote-terminal ECHO skeleton: live session ids on this connection. This
-    // PR does NOT touch tmux/pty — it only proves the transport. `terminal_input`
-    // data is echoed back verbatim and is NEVER logged.
-    const terminalEchoSessions = new Set<string>()
+    // Remote-terminal bridges for THIS relay connection: session_id →
+    // { tmux session, poll timer }. Each bridge attaches to an EXISTING tmux
+    // session via capture-pane polling (out) + send-keys (in). We NEVER create,
+    // resize away, or kill the tmux session/server; keystroke data is NEVER
+    // logged. Output strategy: full-pane capture-pane redraw (like the local
+    // terminal, PR #41) — TUI-safe (works for Claude Code's alt-screen) and
+    // trivially cleaned up. See PR notes re: pipe-pane tradeoff.
+    const terminalBridges = new Map<string, { session: string; timer: NodeJS.Timeout }>()
+    const TERMINAL_POLL_MS = 200
+    const stopTerminalBridge = (sessionId: string): void => {
+      const b = terminalBridges.get(sessionId)
+      if (b) { clearInterval(b.timer); terminalBridges.delete(sessionId) }
+    }
 
     ws.on('message', (raw) => {
       try {
@@ -503,25 +513,53 @@ export async function relayNodeDaemon(
             process.stderr.write(`[vibe-node] encrypted approval_response error: ${err.message}\n`)
           })
         } else if (msg.type === 'terminal_open') {
-          // Echo skeleton: register the session and ack ok. No tmux, no shell.
-          terminalEchoSessions.add(msg.session_id)
-          sendMsg(ws, {
-            version: 1, kind: 'plaintext', from: nodeId, to: msg.from, ts: t(),
-            type: 'terminal_open_ack', req_id: msg.req_id, session_id: msg.session_id,
-            ok: true, message: 'echo terminal (skeleton — no tmux yet)',
+          // Attach to an EXISTING tmux session (never create one here). Validate
+          // first; on success start a capture-pane pump streaming terminal_output.
+          const sid = msg.session_id
+          const from = msg.from
+          const openAck = (ok: boolean, message: string): void => sendMsg(ws, {
+            version: 1, kind: 'plaintext', from: nodeId, to: from, ts: t(),
+            type: 'terminal_open_ack', req_id: msg.req_id, session_id: sid, ok, message,
           })
-        } else if (msg.type === 'terminal_input') {
-          // Echo the keystrokes straight back as output. NEVER log msg.data.
-          if (terminalEchoSessions.has(msg.session_id)) {
-            sendMsg(ws, {
-              version: 1, kind: 'plaintext', from: nodeId, to: msg.from, ts: t(),
-              type: 'terminal_output', session_id: msg.session_id, data: msg.data,
-            })
+          if (!tmuxAvailable()) {
+            openAck(false, 'tmux is not available on this node')
+          } else if (!tmuxHasSession(msg.session)) {
+            openAck(false, `no tmux session "${msg.session}" on this node — create it first`)
+          } else if (terminalBridges.has(sid)) {
+            openAck(true, `already attached to "${msg.session}"`) // idempotent
+          } else {
+            openAck(true, `attached to tmux session "${msg.session}"`)
+            let lastPane: string | undefined
+            const pump = (): void => {
+              const cap = tmuxCapturePane(msg.session)
+              if (!cap.ok) {
+                sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: from, ts: t(), type: 'terminal_output', session_id: sid, data: '\r\n[vibe] tmux session ended\r\n' })
+                stopTerminalBridge(sid)
+                return
+              }
+              if (cap.pane !== lastPane) {
+                lastPane = cap.pane
+                // Home + clear, then redraw (CRLF for xterm). Full-pane redraw.
+                const data = '\x1b[H\x1b[2J' + cap.pane.replace(/\n/g, '\r\n')
+                sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: from, ts: t(), type: 'terminal_output', session_id: sid, data })
+              }
+            }
+            const timer = setInterval(pump, TERMINAL_POLL_MS)
+            if (typeof timer.unref === 'function') timer.unref()
+            terminalBridges.set(sid, { session: msg.session, timer })
+            pump()
           }
+        } else if (msg.type === 'terminal_input') {
+          // Literal keys to tmux via an ARGS ARRAY (no shell). NEVER log msg.data.
+          const b = terminalBridges.get(msg.session_id)
+          if (b) tmuxSendKeys(b.session, msg.data)
         } else if (msg.type === 'terminal_resize') {
-          // Skeleton: accept and no-op (dimensions matter once real tmux lands).
+          // Best-effort; a detached session may clamp — errors ignored.
+          const b = terminalBridges.get(msg.session_id)
+          if (b && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)) tmuxResizeWindow(b.session, msg.cols, msg.rows)
         } else if (msg.type === 'terminal_close') {
-          terminalEchoSessions.delete(msg.session_id)
+          // Stop the pump + drop state. NEVER kill the tmux session itself.
+          stopTerminalBridge(msg.session_id)
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           try { ws.close() } catch { /* ignore */ }
@@ -531,6 +569,9 @@ export async function relayNodeDaemon(
     })
 
     ws.on('close', () => {
+      // Stop every terminal pump for this connection (do NOT kill tmux sessions).
+      for (const b of terminalBridges.values()) clearInterval(b.timer)
+      terminalBridges.clear()
       process.stderr.write('[vibe-node] relay connection closed\n')
       emit('closed')
       finish({ kind: 'closed', registered })
