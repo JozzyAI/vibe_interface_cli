@@ -20,7 +20,7 @@ import type { RelayMessage, RunStartMsg, RunStopRequestMsg, RunStatusRequestMsg,
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
 import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, deriveApprovalKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
 import { nextBackoffMs, sleep } from './reconnect.js'
-import { tmuxAvailable, tmuxHasSession, tmuxCapturePane, tmuxSendKeys, tmuxResizeWindow } from '../lib/tmux.js'
+import { tmuxAvailable, tmuxHasSession, tmuxCapturePane, tmuxSendKeys, tmuxResizeWindow, isSafeSessionName, tmuxCreateOwnedSession, tmuxListOwnedSessions, tmuxKillOwnedSession } from '../lib/tmux.js'
 
 const RUNS_DIR = path.join(os.homedir(), '.vibe', 'runs')
 
@@ -333,6 +333,12 @@ export async function relayNodeDaemon(
   // per-connection buildNode and risking a reconnect busy-loop.
   const advertisedAgents = resolveAdvertisedAgents(advertiseAgents)
 
+  // Terminal session CREATION opt-in (default OFF). Creating a session spawns a
+  // login shell on this node, so the operator must explicitly enable it via
+  // VIBE_TERMINAL_ALLOW_CREATE=1 (or `vibe node daemon --allow-terminal-create`,
+  // which sets that env). Attach/list/stop-of-owned do not need it.
+  const allowTerminalCreate = process.env.VIBE_TERMINAL_ALLOW_CREATE === '1'
+
   // Load identity; if available and no --node-id override, use identity id as node_id.
   let identity: IdentityFile | null = null
   try { identity = ensureIdentity() } catch { /* non-fatal — fall back to hostname-derived id */ }
@@ -513,22 +519,17 @@ export async function relayNodeDaemon(
             process.stderr.write(`[vibe-node] encrypted approval_response error: ${err.message}\n`)
           })
         } else if (msg.type === 'terminal_open') {
-          // Attach to an EXISTING tmux session (never create one here). Validate
-          // first; on success start a capture-pane pump streaming terminal_output.
+          // Attach to a tmux session; with create=true (and node opt-in) create a
+          // login shell if it is missing. Never take ownership of a pre-existing
+          // session. On attach, start a capture-pane pump streaming terminal_output.
           const sid = msg.session_id
           const from = msg.from
-          const openAck = (ok: boolean, message: string): void => sendMsg(ws, {
+          const openAck = (ok: boolean, message: string, code?: string): void => sendMsg(ws, {
             version: 1, kind: 'plaintext', from: nodeId, to: from, ts: t(),
-            type: 'terminal_open_ack', req_id: msg.req_id, session_id: sid, ok, message,
+            type: 'terminal_open_ack', req_id: msg.req_id, session_id: sid, ok, message, ...(code ? { code } : {}),
           })
-          if (!tmuxAvailable()) {
-            openAck(false, 'tmux is not available on this node')
-          } else if (!tmuxHasSession(msg.session)) {
-            openAck(false, `no tmux session "${msg.session}" on this node — create it first`)
-          } else if (terminalBridges.has(sid)) {
-            openAck(true, `already attached to "${msg.session}"`) // idempotent
-          } else {
-            openAck(true, `attached to tmux session "${msg.session}"`)
+          const attachAndPump = (label: string): void => {
+            openAck(true, label)
             let lastPane: string | undefined
             const pump = (): void => {
               const cap = tmuxCapturePane(msg.session)
@@ -549,6 +550,23 @@ export async function relayNodeDaemon(
             terminalBridges.set(sid, { session: msg.session, timer })
             pump()
           }
+          if (!tmuxAvailable()) {
+            openAck(false, 'tmux is not available on this node', 'terminal_unavailable')
+          } else if (terminalBridges.has(sid)) {
+            openAck(true, `already attached to "${msg.session}"`) // idempotent
+          } else if (tmuxHasSession(msg.session)) {
+            attachAndPump(`attached to tmux session "${msg.session}"`) // exists → attach; ownership unchanged
+          } else if (!msg.create) {
+            openAck(false, `no tmux session "${msg.session}" on this node — pass --create to make it`, 'session_not_found')
+          } else if (!isSafeSessionName(msg.session)) {
+            openAck(false, `invalid session name "${msg.session}"`, 'invalid_session_name')
+          } else if (!allowTerminalCreate) {
+            openAck(false, 'session creation is disabled on this node — start the daemon with --allow-terminal-create (or VIBE_TERMINAL_ALLOW_CREATE=1)', 'terminal_create_disabled')
+          } else if (!tmuxCreateOwnedSession(msg.session)) {
+            openAck(false, `failed to create session "${msg.session}"`, 'terminal_create_failed')
+          } else {
+            attachAndPump(`created and attached to tmux session "${msg.session}"`)
+          }
         } else if (msg.type === 'terminal_input') {
           // Literal keys to tmux via an ARGS ARRAY (no shell). NEVER log msg.data.
           const b = terminalBridges.get(msg.session_id)
@@ -560,6 +578,30 @@ export async function relayNodeDaemon(
         } else if (msg.type === 'terminal_close') {
           // Stop the pump + drop state. NEVER kill the tmux session itself.
           stopTerminalBridge(msg.session_id)
+        } else if (msg.type === 'terminal_session_list') {
+          // Vibe-OWNED sessions only (never surfaces vibe-node / user sessions).
+          sendMsg(ws, {
+            version: 1, kind: 'plaintext', from: nodeId, to: msg.from, ts: t(),
+            type: 'terminal_session_list_ack', req_id: msg.req_id, ok: true,
+            sessions: tmuxAvailable() ? tmuxListOwnedSessions() : [],
+          })
+        } else if (msg.type === 'terminal_session_kill') {
+          // Kill ONLY a Vibe-owned session — never vibe-node, a user session, or
+          // the tmux server. (Owned kill is allowed even if create is disabled.)
+          const killAck = (ok: boolean, result: 'killed' | 'not_owned' | 'missing' | undefined, message: string, code?: string): void => sendMsg(ws, {
+            version: 1, kind: 'plaintext', from: nodeId, to: msg.from, ts: t(),
+            type: 'terminal_session_kill_ack', req_id: msg.req_id, ok, ...(result ? { result } : {}), message, ...(code ? { code } : {}),
+          })
+          if (!tmuxAvailable()) {
+            killAck(false, undefined, 'tmux is not available on this node', 'terminal_unavailable')
+          } else if (!isSafeSessionName(msg.session)) {
+            killAck(false, undefined, `invalid session name "${msg.session}"`, 'invalid_session_name')
+          } else {
+            const result = tmuxKillOwnedSession(msg.session)
+            if (result === 'killed') killAck(true, 'killed', `killed session "${msg.session}"`)
+            else if (result === 'not_owned') killAck(false, 'not_owned', `refusing to kill "${msg.session}" — not a Vibe-owned session`, 'terminal_not_owned')
+            else killAck(false, 'missing', `no session "${msg.session}"`, 'session_not_found')
+          }
         } else if (msg.type === 'relay_error') {
           process.stderr.write(`[vibe-node] relay error: ${msg.code} — ${msg.message}\n`)
           try { ws.close() } catch { /* ignore */ }
@@ -1329,6 +1371,64 @@ export async function remoteStop(relay: string, token: string, runId: string): P
 
     ws.on('close', () => done(undefined, new Error('Relay connection closed before run_stop_ack')))
     ws.on('error', (err) => done(undefined, err))
+  })
+}
+
+/** One-shot: list Vibe-owned terminal sessions on a node (request/reply). */
+export async function remoteTerminalList(relay: string, token: string, nodeId: string): Promise<string[]> {
+  return new Promise<string[]>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+    let settled = false
+    const done = (v?: string[], err?: Error): void => { if (settled) return; settled = true; clearTimeout(timeout); try { ws.close() } catch { /* ignore */ } ; v ? resolve(v) : reject(err!) }
+    const timeout = setTimeout(() => { ws.terminate(); done(undefined, new Error('Timeout waiting for terminal_session_list_ack')) }, 10_000)
+    ws.on('open', () => sendMsg(ws, { version: 1, kind: 'plaintext', from: 'cli', to: nodeId, ts: t(), type: 'terminal_session_list', req_id: reqId }))
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        const m = msg as { type?: string; req_id?: string }
+        if (m.type === 'terminal_session_list_ack' && m.req_id === reqId) {
+          const ack = msg as import('./types.js').TerminalSessionListAckMsg
+          ack.ok ? done(ack.sessions ?? []) : done(undefined, new Error(`${ack.code ?? 'error'}: ${ack.message ?? 'list failed'}`))
+        } else if (m.type === 'relay_error') {
+          const e = msg as { code: string; message: string }
+          done(undefined, new Error(`${e.code}: ${e.message}`))
+        }
+      } catch { /* ignore */ }
+    })
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before terminal_session_list_ack')))
+    ws.on('error', (err) => done(undefined, err as Error))
+  })
+}
+
+export interface TerminalKillResult { ok: boolean; result?: 'killed' | 'not_owned' | 'missing'; message?: string; code?: string }
+
+/** One-shot: ask a node to kill a Vibe-owned terminal session (request/reply).
+ *  Resolves with the node's result (incl. not_owned/missing); rejects only on
+ *  transport/relay errors. */
+export async function remoteTerminalKill(relay: string, token: string, nodeId: string, session: string): Promise<TerminalKillResult> {
+  return new Promise<TerminalKillResult>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+    let settled = false
+    const done = (v?: TerminalKillResult, err?: Error): void => { if (settled) return; settled = true; clearTimeout(timeout); try { ws.close() } catch { /* ignore */ } ; v ? resolve(v) : reject(err!) }
+    const timeout = setTimeout(() => { ws.terminate(); done(undefined, new Error('Timeout waiting for terminal_session_kill_ack')) }, 10_000)
+    ws.on('open', () => sendMsg(ws, { version: 1, kind: 'plaintext', from: 'cli', to: nodeId, ts: t(), type: 'terminal_session_kill', req_id: reqId, session }))
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        const m = msg as { type?: string; req_id?: string }
+        if (m.type === 'terminal_session_kill_ack' && m.req_id === reqId) {
+          const ack = msg as import('./types.js').TerminalSessionKillAckMsg
+          done({ ok: ack.ok, result: ack.result, message: ack.message, code: ack.code })
+        } else if (m.type === 'relay_error') {
+          const e = msg as { code: string; message: string }
+          done(undefined, new Error(`${e.code}: ${e.message}`))
+        }
+      } catch { /* ignore */ }
+    })
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before terminal_session_kill_ack')))
+    ws.on('error', (err) => done(undefined, err as Error))
   })
 }
 

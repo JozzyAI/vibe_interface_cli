@@ -57,6 +57,43 @@ status/doctor`:
 - If no relay resolves, the command fails with `relay_required` and a hint to run
   `vibe connect` or pass `--relay`.
 
+## Session lifecycle (create / list / stop)
+
+You can create the session from the client, list what Vibe created, and stop it —
+without shelling into the node box.
+
+**Create-if-missing** — `serve --create` makes the session (a **login shell**) if
+it doesn't exist, then attaches:
+
+```bash
+vibe terminal serve --node <id> --session remote-claude --create \
+  --host 192.168.1.89 --port 8790 --allow-control-bind --url-file ~/.cache/vibe/terminal-url
+```
+
+> **The node must opt in.** Creating a session spawns a shell on the node, so the
+> node operator must start the daemon with **`--allow-terminal-create`** (or
+> `VIBE_TERMINAL_ALLOW_CREATE=1`). Default is **OFF** — otherwise `--create`
+> fails with `terminal_create_disabled`. Attach/list/stop don't need it.
+
+**List / stop** (relay + token from the profile, like `serve`):
+
+```bash
+vibe terminal list --node <id>                       # Vibe-owned sessions only
+vibe terminal stop --node <id> --session remote-claude
+```
+
+**Ownership & safety:**
+- Only sessions Vibe **created** are marked owned (a tmux `@vibe_owned` option).
+- `list` shows **only** owned sessions; `stop` kills **only** owned sessions and
+  **refuses** anything else (`terminal_not_owned`) — so `vibe-node` and your own
+  tmux sessions can never be killed by Vibe. Vibe never runs `tmux kill-server`.
+- `serve --create` on a session that already exists just **attaches** — it does
+  not take ownership, so `stop` won't kill it.
+- Session names are validated (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`) and every tmux
+  call uses an args array — no shell interpolation, no injection.
+- **No arbitrary command:** created sessions run a login shell only. `--command`
+  (e.g. one-tap `claude`) is deferred.
+
 ## Safe URL handling
 
 The control URL contains the write-capable token. Keep it out of your terminal

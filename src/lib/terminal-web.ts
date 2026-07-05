@@ -273,6 +273,7 @@ export interface RemoteTerminalOptions {
   relay: string      // relay ws url
   token: string      // relay auth token VALUE (resolved by the caller; never logged)
   nodeId: string     // target node
+  create?: boolean   // create-if-missing (node gates on its opt-in)
 }
 
 /**
@@ -282,7 +283,7 @@ export interface RemoteTerminalOptions {
  */
 export function startRemoteTerminalServer(opts: RemoteTerminalOptions): Promise<TerminalServer> {
   return serveTerminal(opts, (ws) =>
-    bridgeRemoteTerminal(ws, { relay: opts.relay, token: opts.token, nodeId: opts.nodeId, session: opts.session }),
+    bridgeRemoteTerminal(ws, { relay: opts.relay, token: opts.token, nodeId: opts.nodeId, session: opts.session, create: opts.create }),
   )
 }
 
