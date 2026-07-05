@@ -344,7 +344,20 @@ Because it is write-capable, it is stricter than the read-only viewer:
 vibe terminal serve --session work --host 192.168.1.50 --port 8790 --allow-control-bind   # LAN (discouraged)
 ```
 
-Deferred: remote-node terminal over the relay, launching agents interactively, and node-pty.
+**Remote mode** (`--node`) bridges the browser to a tmux session on a *remote* node over the relay —
+phone/VPN → gateway → relay → node → tmux → Claude Code. Relay/token default from the connect
+profile, and `--url-file` keeps the write-capable URL out of your scrollback:
+
+```bash
+vibe terminal serve --node <node_id> --session remote-claude \
+  --host 192.168.1.89 --port 8790 --allow-control-bind --url-file ~/.cache/vibe/terminal-url
+```
+
+> **Full guide:** [docs/remote-terminal.md](docs/remote-terminal.md) — the LAN/VPN pattern, profile
+> defaults, safe URL handling, security, and cleanup.
+
+Deferred: remote session creation/lifecycle (`--create`, `terminal list/stop`), launching agents in
+one command (`--command claude`), and node-pty.
 
 ### Codex CLI setup
 
