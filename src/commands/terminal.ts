@@ -12,6 +12,21 @@ import {
 } from '../lib/terminal-web.js'
 import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
 
+/** Resolve remote relay URL + token for the terminal list/stop subcommands
+ *  (flag > env > profile, like `run status`). Throws if no relay resolves. */
+async function resolveTerminalRelay(opts: { relay?: string; token?: string; tokenFile?: string }): Promise<{ relay: string; token: string }> {
+  const { relay, tokenFile } = resolveClientDefaults(
+    { relay: opts.relay, token: opts.token, tokenFile: opts.tokenFile },
+    loadProfile(),
+    { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+  )
+  if (!relay) throw new Error('no relay URL — pass --relay <url> or set relay_url in your Vibe profile (run `vibe connect`)')
+  const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+  const token = resolveRelayToken({ tokenFile, token: opts.token })
+  warnIfTokenArg({ tokenFile, token: opts.token })
+  return { relay, token }
+}
+
 /**
  * `vibe terminal` — a WRITE-CAPABLE web terminal.
  *
@@ -31,6 +46,7 @@ export function registerTerminalCommand(program: Command): void {
     .description('serve a browser terminal for a local tmux session, or a remote node over the relay (write-capable)')
     .requiredOption('--session <name>', 'tmux session name (local: existing session; remote: node-side session)')
     .option('--node <node_id>', 'REMOTE mode: bridge to this node over the relay instead of a local tmux session')
+    .option('--create', 'REMOTE mode: create the tmux session (a login shell) if missing — the node must allow it (--allow-terminal-create)')
     .option('--relay <url>', 'relay WebSocket URL (remote mode; defaults to the connect-profile relay_url)')
     .option('--token <token>', 'auth token for relay (DEPRECATED: visible in process args; prefer VIBE_RELAY_TOKEN env or --token-file)')
     .option('--token-file <path>', 'read relay auth token from a file (remote mode; defaults to the connect-profile token_file)')
@@ -91,7 +107,7 @@ export function registerTerminalCommand(program: Command): void {
         try {
           server = await startRemoteTerminalServer({
             session, host, port, controlToken,
-            relay: relay as string, token, nodeId: opts.node as string,
+            relay: relay as string, token, nodeId: opts.node as string, create: Boolean(opts.create),
           })
         } catch (err) {
           fail('terminal_start_failed', `failed to bind ${host}:${port}: ${(err as Error).message}`)
@@ -150,5 +166,49 @@ export function registerTerminalCommand(program: Command): void {
       const shutdown = (): void => { server!.close().finally(() => process.exit(0)) }
       process.on('SIGINT', shutdown)
       process.on('SIGTERM', shutdown)
+    })
+
+  const failJson = (code: string, message: string): never => {
+    process.stdout.write(JSON.stringify({ error: true, code, message, ts: new Date().toISOString() }) + '\n')
+    process.exit(1)
+  }
+
+  terminal
+    .command('list')
+    .description('list Vibe-owned terminal sessions on a remote node')
+    .requiredOption('--node <node_id>', 'target node')
+    .option('--relay <url>', 'relay WebSocket URL (defaults to the connect-profile relay_url)')
+    .option('--token <token>', 'auth token for relay (prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file (defaults to the connect-profile token_file)')
+    .option('--json', 'print the session list as JSON')
+    .action(async (opts) => {
+      let relay: string; let token: string
+      try { ({ relay, token } = await resolveTerminalRelay(opts)) } catch (err) { failJson('relay_required', (err as Error).message); return }
+      const { remoteTerminalList } = await import('../relay/client.js')
+      let sessions: string[]
+      try { sessions = await remoteTerminalList(relay, token, opts.node as string) } catch (err) { failJson('terminal_list_failed', (err as Error).message); return }
+      if (opts.json) process.stdout.write(JSON.stringify({ node: opts.node as string, sessions, ts: new Date().toISOString() }) + '\n')
+      else if (sessions.length === 0) process.stdout.write(`no Vibe-owned terminal sessions on ${opts.node}\n`)
+      else process.stdout.write(sessions.join('\n') + '\n')
+    })
+
+  terminal
+    .command('stop')
+    .description('stop (kill) a Vibe-owned terminal session on a remote node — refuses non-owned sessions')
+    .requiredOption('--node <node_id>', 'target node')
+    .requiredOption('--session <name>', 'the Vibe-owned session to kill')
+    .option('--relay <url>', 'relay WebSocket URL (defaults to the connect-profile relay_url)')
+    .option('--token <token>', 'auth token for relay (prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file (defaults to the connect-profile token_file)')
+    .option('--json', 'print the result as JSON')
+    .action(async (opts) => {
+      let relay: string; let token: string
+      try { ({ relay, token } = await resolveTerminalRelay(opts)) } catch (err) { failJson('relay_required', (err as Error).message); return }
+      const { remoteTerminalKill } = await import('../relay/client.js')
+      let res: { ok: boolean; result?: string; message?: string; code?: string }
+      try { res = await remoteTerminalKill(relay, token, opts.node as string, opts.session as string) } catch (err) { failJson('terminal_stop_failed', (err as Error).message); return }
+      if (opts.json) process.stdout.write(JSON.stringify({ node: opts.node as string, session: opts.session as string, ...res, ts: new Date().toISOString() }) + '\n')
+      else process.stdout.write(`${res.ok ? '✓' : '✗'} ${res.message ?? res.result ?? (res.ok ? 'killed' : 'failed')}\n`)
+      if (!res.ok) process.exit(1)
     })
 }

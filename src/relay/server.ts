@@ -388,6 +388,44 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             break
           }
 
+          // ── terminal session lifecycle (request/reply, routed by req_id) ────
+          case 'terminal_session_list': {
+            pendingReqs.set(msg.req_id, ws)
+            const target = registry.get(msg.to)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'terminal_session_list_ack', req_id: msg.req_id, ok: false, sessions: [],
+                code: 'node_offline', message: `Node not found: ${msg.to}`,
+              })
+              pendingReqs.delete(msg.req_id)
+              break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+          case 'terminal_session_kill': {
+            pendingReqs.set(msg.req_id, ws)
+            const target = registry.get(msg.to)
+            if (!target) {
+              sendMsg(ws, {
+                version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(),
+                type: 'terminal_session_kill_ack', req_id: msg.req_id, ok: false,
+                code: 'node_offline', message: `Node not found: ${msg.to}`,
+              })
+              pendingReqs.delete(msg.req_id)
+              break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+          case 'terminal_session_list_ack':
+          case 'terminal_session_kill_ack': {
+            const requester = pendingReqs.get(msg.req_id)
+            if (requester) { sendMsg(requester, msg); pendingReqs.delete(msg.req_id) }
+            break
+          }
+
           case 'run_start': {
             pendingReqs.set(msg.req_id, ws)
             const target = registry.get(msg.to)

@@ -23,7 +23,8 @@ export interface RemoteTerminalBridgeOpts {
   relay: string    // relay ws url
   token: string    // relay auth token value (never logged)
   nodeId: string   // target node
-  session: string  // node-side session name (echo node ignores it)
+  session: string  // node-side session name
+  create?: boolean // create-if-missing (node gates on its opt-in)
 }
 
 function relayUrl(relay: string, token: string): string {
@@ -54,7 +55,7 @@ export function bridgeRemoteTerminal(browser: WebSocket, opts: RemoteTerminalBri
   relay.on('open', () => {
     relay.send(JSON.stringify({
       version: 1, kind: 'plaintext', from: 'cli', to: opts.nodeId, ts: t(),
-      type: 'terminal_open', req_id: sessionId, session_id: sessionId, session: opts.session,
+      type: 'terminal_open', req_id: sessionId, session_id: sessionId, session: opts.session, create: opts.create,
     }))
   })
 

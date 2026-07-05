@@ -327,7 +327,8 @@ export interface TerminalOpenMsg extends RelayMsgBase {
   type: 'terminal_open'
   req_id: string
   session_id: string   // gateway-generated id; relay fans node→gateway msgs on it
-  session: string      // node-side session name to attach to (ignored by the echo node)
+  session: string      // node-side session name to attach to
+  create?: boolean     // create-if-missing (login shell); node gates on opt-in
   cols?: number
   rows?: number
 }
@@ -337,6 +338,7 @@ export interface TerminalOpenAckMsg extends RelayMsgBase {
   session_id: string
   ok: boolean
   message?: string
+  code?: string        // e.g. terminal_create_disabled / invalid_session_name
 }
 export interface TerminalInputMsg extends RelayMsgBase {
   type: 'terminal_input'
@@ -363,6 +365,33 @@ export interface TerminalErrorMsg extends RelayMsgBase {
   session_id: string
   code: string
   message: string
+}
+
+// ── session lifecycle (request/reply, routed by req_id like run_status) ──────
+export interface TerminalSessionListMsg extends RelayMsgBase {
+  type: 'terminal_session_list'
+  req_id: string
+}
+export interface TerminalSessionListAckMsg extends RelayMsgBase {
+  type: 'terminal_session_list_ack'
+  req_id: string
+  ok: boolean
+  sessions: string[]   // Vibe-owned session names only
+  message?: string
+  code?: string
+}
+export interface TerminalSessionKillMsg extends RelayMsgBase {
+  type: 'terminal_session_kill'
+  req_id: string
+  session: string
+}
+export interface TerminalSessionKillAckMsg extends RelayMsgBase {
+  type: 'terminal_session_kill_ack'
+  req_id: string
+  ok: boolean
+  result?: 'killed' | 'not_owned' | 'missing'
+  message?: string
+  code?: string        // e.g. terminal_not_owned / terminal_create_disabled
 }
 
 export type RelayMessage =
@@ -396,4 +425,8 @@ export type RelayMessage =
   | TerminalResizeMsg
   | TerminalCloseMsg
   | TerminalErrorMsg
+  | TerminalSessionListMsg
+  | TerminalSessionListAckMsg
+  | TerminalSessionKillMsg
+  | TerminalSessionKillAckMsg
   | RelayErrorMsg

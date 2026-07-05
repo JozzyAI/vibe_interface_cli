@@ -110,6 +110,7 @@ export function registerNodeCommand(program: Command): void {
       (val: string, prev: string[]) => prev.concat(val),
       [] as string[],
     )
+    .option('--allow-terminal-create', 'allow remote `vibe terminal serve --create` to spawn a login shell on this node (default OFF; also VIBE_TERMINAL_ALLOW_CREATE=1)')
     .action(async (opts) => {
       // Fill missing daemon settings from the `vibe connect` profile so a connected
       // machine can just run `vibe node daemon`. Precedence: CLI flag > env > profile
@@ -139,6 +140,11 @@ export function registerNodeCommand(program: Command): void {
       // Apply the profile's VIBE_DIR only when the env var is unset (env > profile),
       // before any identity/daemon work reads vibeDir().
       if (defaults.vibeDir) process.env.VIBE_DIR = defaults.vibeDir
+
+      // Terminal session-creation opt-in (default OFF). The flag simply sets the
+      // env the daemon reads (VIBE_TERMINAL_ALLOW_CREATE=1); leaving it unset
+      // keeps `--create` refused with terminal_create_disabled.
+      if (opts.allowTerminalCreate) process.env.VIBE_TERMINAL_ALLOW_CREATE = '1'
 
       // Validate the advertise allowlist up front so a bad value (or env) fails
       // fast with a structured error, before any relay connection is attempted.
