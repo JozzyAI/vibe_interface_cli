@@ -428,18 +428,24 @@ export async function relayNodeDaemon(
       // other unexpected responses fall through to 'error'/'close' (transient)
     })
 
-    // Remote-terminal bridges for THIS relay connection: session_id →
-    // { tmux session, poll timer }. Each bridge attaches to an EXISTING tmux
-    // session via capture-pane polling (out) + send-keys (in). We NEVER create,
-    // resize away, or kill the tmux session/server; keystroke data is NEVER
-    // logged. Output strategy: full-pane capture-pane redraw (like the local
-    // terminal, PR #41) — TUI-safe (works for Claude Code's alt-screen) and
-    // trivially cleaned up. See PR notes re: pipe-pane tradeoff.
-    const terminalBridges = new Map<string, { session: string; timer: NodeJS.Timeout }>()
-    const TERMINAL_POLL_MS = 200
+    // Remote-terminal bridges for THIS relay connection: session_id → bridge
+    // state. Each attaches to an EXISTING tmux session via capture-pane polling
+    // (out) + send-keys (in). We NEVER create, resize away, or kill the tmux
+    // session/server; keystroke data is NEVER logged. Output strategy: full-pane
+    // capture-pane redraw (TUI-safe for Claude Code's alt-screen).
+    //
+    // Polling is ADAPTIVE (self-scheduling, not a fixed interval): poll FAST for
+    // a short window after any input or pane change (responsive typing), then
+    // decay to SLOW when idle (spares the node + phone/VPN). Exact-snapshot
+    // dedupe means an unchanged pane still sends nothing.
+    interface TerminalBridge { session: string; timer?: NodeJS.Timeout; lastActivityAt: number; stopped: boolean; bump?: () => void }
+    const terminalBridges = new Map<string, TerminalBridge>()
+    const TERMINAL_POLL_FAST_MS = 90   // right after input / a pane change
+    const TERMINAL_POLL_SLOW_MS = 700  // idle (no input or change for a while)
+    const TERMINAL_ACTIVE_WINDOW_MS = 1500 // stay fast for this long after activity
     const stopTerminalBridge = (sessionId: string): void => {
       const b = terminalBridges.get(sessionId)
-      if (b) { clearInterval(b.timer); terminalBridges.delete(sessionId) }
+      if (b) { b.stopped = true; if (b.timer) clearTimeout(b.timer); terminalBridges.delete(sessionId) }
     }
 
     ws.on('message', (raw) => {
@@ -530,8 +536,16 @@ export async function relayNodeDaemon(
           })
           const attachAndPump = (label: string): void => {
             openAck(true, label)
+            const bridge: TerminalBridge = { session: msg.session, lastActivityAt: Date.now(), stopped: false }
             let lastPane: string | undefined
+            const schedule = (): void => {
+              if (bridge.stopped) return
+              const active = Date.now() - bridge.lastActivityAt < TERMINAL_ACTIVE_WINDOW_MS
+              bridge.timer = setTimeout(pump, active ? TERMINAL_POLL_FAST_MS : TERMINAL_POLL_SLOW_MS)
+              if (typeof bridge.timer.unref === 'function') bridge.timer.unref()
+            }
             const pump = (): void => {
+              if (bridge.stopped) return
               const cap = tmuxCapturePane(msg.session)
               if (!cap.ok) {
                 sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: from, ts: t(), type: 'terminal_output', session_id: sid, data: '\r\n[vibe] tmux session ended\r\n' })
@@ -540,15 +554,23 @@ export async function relayNodeDaemon(
               }
               if (cap.pane !== lastPane) {
                 lastPane = cap.pane
+                bridge.lastActivityAt = Date.now() // a change keeps us in the fast band
                 // Home + clear, then redraw (CRLF for xterm). Full-pane redraw.
                 const data = '\x1b[H\x1b[2J' + cap.pane.replace(/\n/g, '\r\n')
                 sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: from, ts: t(), type: 'terminal_output', session_id: sid, data })
               }
+              schedule()
             }
-            const timer = setInterval(pump, TERMINAL_POLL_MS)
-            if (typeof timer.unref === 'function') timer.unref()
-            terminalBridges.set(sid, { session: msg.session, timer })
-            pump()
+            // Input pokes the pump: mark active + poll soon (don't wait out a slow sleep).
+            bridge.bump = (): void => {
+              if (bridge.stopped) return
+              bridge.lastActivityAt = Date.now()
+              if (bridge.timer) clearTimeout(bridge.timer)
+              bridge.timer = setTimeout(pump, TERMINAL_POLL_FAST_MS)
+              if (typeof bridge.timer.unref === 'function') bridge.timer.unref()
+            }
+            terminalBridges.set(sid, bridge)
+            pump() // immediate first frame, then self-schedules
           }
           if (!tmuxAvailable()) {
             openAck(false, 'tmux is not available on this node', 'terminal_unavailable')
@@ -570,7 +592,7 @@ export async function relayNodeDaemon(
         } else if (msg.type === 'terminal_input') {
           // Literal keys to tmux via an ARGS ARRAY (no shell). NEVER log msg.data.
           const b = terminalBridges.get(msg.session_id)
-          if (b) tmuxSendKeys(b.session, msg.data)
+          if (b) { tmuxSendKeys(b.session, msg.data); b.bump?.() } // poll fast right after input
         } else if (msg.type === 'terminal_resize') {
           // Best-effort; a detached session may clamp — errors ignored.
           const b = terminalBridges.get(msg.session_id)
@@ -612,7 +634,7 @@ export async function relayNodeDaemon(
 
     ws.on('close', () => {
       // Stop every terminal pump for this connection (do NOT kill tmux sessions).
-      for (const b of terminalBridges.values()) clearInterval(b.timer)
+      for (const b of terminalBridges.values()) { b.stopped = true; if (b.timer) clearTimeout(b.timer) }
       terminalBridges.clear()
       process.stderr.write('[vibe-node] relay connection closed\n')
       emit('closed')

@@ -113,10 +113,14 @@ export function checkControlAccess(req: http.IncomingMessage, controlToken: stri
 
 let xtermJs: Buffer | undefined
 let xtermCss: Buffer | undefined
-function xtermAssets(): { js: Buffer; css: Buffer } {
+let xtermFitJs: Buffer | undefined
+function xtermAssets(): { js: Buffer; css: Buffer; fitJs: Buffer } {
   if (!xtermJs) xtermJs = fs.readFileSync(require.resolve('@xterm/xterm/lib/xterm.js'))
   if (!xtermCss) xtermCss = fs.readFileSync(require.resolve('@xterm/xterm/css/xterm.css'))
-  return { js: xtermJs, css: xtermCss }
+  // FitAddon: sizes the terminal to the (phone) viewport correctly — manual fit
+  // needs xterm-internal render metrics/DPR math that's fragile on mobile.
+  if (!xtermFitJs) xtermFitJs = fs.readFileSync(require.resolve('@xterm/addon-fit/lib/addon-fit.js'))
+  return { js: xtermJs, css: xtermCss, fitJs: xtermFitJs }
 }
 
 /** The terminal page. The control token is NEVER embedded in the HTML — the WS
@@ -128,34 +132,57 @@ export function terminalHtml(session: string): string {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>vibe terminal · ${safeSession}</title>
 <link rel="stylesheet" href="/xterm.css">
 <style>
-  html,body{margin:0;height:100%;background:#000}
-  #bar{font:12px ui-monospace,Menlo,monospace;color:#7fdbca;background:#11161d;padding:4px 10px}
-  #term{position:absolute;top:24px;left:0;right:0;bottom:0;padding:4px}
+  html,body{margin:0;height:100dvh;background:#000;overflow:hidden}
+  #bar{font:12px ui-monospace,Menlo,monospace;color:#7fdbca;background:#11161d;padding:6px 10px;height:16px}
+  #wrap{position:absolute;top:28px;left:0;right:0;bottom:0}
+  #term{position:absolute;inset:0;padding:4px 4px env(safe-area-inset-bottom) 4px}
+  #load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#7fdbca;font:13px ui-monospace,Menlo,monospace;background:#000;z-index:2}
+  .xterm-viewport{overflow-y:auto !important}
 </style>
 </head>
 <body>
 <div id="bar">vibe terminal — session <b>${safeSession}</b> — write-capable</div>
-<div id="term"></div>
+<div id="wrap"><div id="term"></div><div id="load">connecting…</div></div>
 <script src="/xterm.js"></script>
+<script src="/addon-fit.js"></script>
 <script>
-  var term = new Terminal({ cursorBlink: true, convertEol: true, fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13 });
+  var term = new Terminal({ cursorBlink: false, convertEol: true, scrollback: 400, fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13 });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
   term.open(document.getElementById('term'));
-  term.focus();
+  var loadEl = document.getElementById('load');
+  function doFit(){ try { fit.fit(); } catch (_) {} }
+  doFit(); term.focus();
+
   var proto = location.protocol === 'https:' ? 'wss' : 'ws';
   // Forward the page query (e.g. ?session=X&create=1) to the bridge. Local/remote
   // serve loads at "/" with no query, so this stays "/ws".
   var ws = new WebSocket(proto + '://' + location.host + '/ws' + location.search);
+
+  // Tab-visibility render-skip: while hidden, don't repaint every frame — buffer
+  // only the latest frame and apply it once when we become visible again.
+  var pending = null, hidden = document.hidden;
+  function apply(data){ if (loadEl){ loadEl.style.display='none'; loadEl=null; } term.write(data); }
   ws.onmessage = function (e) {
-    try { var m = JSON.parse(e.data); if (m.type === 'output') term.write(m.data); } catch (_) {}
+    try { var m = JSON.parse(e.data); if (m.type !== 'output') return;
+      if (hidden) { pending = m.data; } else { apply(m.data); }
+    } catch (_) {}
   };
-  term.onData(function (d) { ws.send(JSON.stringify({ type: 'input', data: d })); });
-  function sendResize() { ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); }
-  ws.onopen = sendResize;
+  document.addEventListener('visibilitychange', function(){
+    hidden = document.hidden;
+    if (!hidden) { doFit(); if (pending !== null) { apply(pending); pending = null; } sendResize(); }
+  });
+
+  term.onData(function (d) { ws.send(JSON.stringify({ type: 'input', data: d })); }); // input never logged
+  function sendResize() { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); }
+  ws.onopen = function(){ doFit(); sendResize(); };
   term.onResize(sendResize);
+  window.addEventListener('resize', function(){ doFit(); });
+  window.addEventListener('orientationchange', function(){ setTimeout(function(){ doFit(); sendResize(); }, 200); });
 </script>
 </body>
 </html>`
@@ -220,6 +247,11 @@ function serveTerminal(
     if (path === '/xterm.js') {
       res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', ...setCookie })
       res.end(xtermAssets().js)
+      return
+    }
+    if (path === '/addon-fit.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', ...setCookie })
+      res.end(xtermAssets().fitJs)
       return
     }
     if (path === '/xterm.css') {

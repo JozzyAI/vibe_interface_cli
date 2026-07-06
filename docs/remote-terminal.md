@@ -146,6 +146,44 @@ scrollback and shell history:
   are never written to logs — the token appears only in the intended URL output
   (or `--url-file`).
 
+## Performance & phone tips
+
+The remote terminal streams **full-pane snapshots** (a `tmux capture-pane` redraw)
+— chosen for TUI correctness (Claude Code's alt-screen renders cleanly). To keep
+it responsive on phone/VPN:
+
+- The node polls **adaptively**: fast (~90 ms) right after you type or the pane
+  changes, decaying to a slow idle rate (~700 ms) when nothing is happening.
+  Identical snapshots are de-duplicated, so an idle pane sends nothing.
+- The browser uses **FitAddon** (sizes the terminal to your screen), a small
+  scrollback, and **skips repainting while the tab is hidden** (it applies the
+  latest frame when you return).
+
+For the smoothest experience:
+
+- **Don't open many tabs on the same session** — each browser tab is its own
+  live bridge polling the same pane. One tab per session is best.
+- Prefer a good VPN link; latency stacks on top of each redraw.
+- Full-screen TUIs (Claude Code) are the heaviest; a plain shell is lightest.
+
+> A line-level diff renderer (send only changed lines instead of a full redraw)
+> is a planned follow-up for even lower bandwidth.
+
+## Getting a clean Claude Code session
+
+Claude Code works **in the context of the current repo/session** — so a fresh
+"hi" inside an existing session may get answered as if you're continuing prior
+work (e.g. explaining `npm test`). That's Claude's session context, **not** a
+terminal bug. To start clean, do one of:
+
+- Type **`/clear`** inside Claude to reset the conversation.
+- Exit Claude (`/exit` or Ctrl-C) and run **`claude`** again.
+- Open a **new tmux session** for the task (dashboard → New session, e.g.
+  `fresh-claude`) and run `claude` there.
+
+The terminal deliberately **does not** auto-clear or reset Claude — that stays
+your choice.
+
 ## Cleanup
 
 - **Stop the gateway** with `Ctrl-C` (foreground) or, if backgrounded:
