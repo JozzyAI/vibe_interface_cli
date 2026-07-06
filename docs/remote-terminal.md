@@ -94,6 +94,31 @@ vibe terminal stop --node <id> --session remote-claude
 - **No arbitrary command:** created sessions run a login shell only. `--command`
   (e.g. one-tap `claude`) is deferred.
 
+## Dashboard (phone home screen)
+
+A tiny page that lists your Vibe-owned sessions and lets you open, create, or
+stop them — all on the same gateway port, same control-token gate:
+
+```bash
+vibe terminal dashboard --node <id> \
+  --host 192.168.1.89 --port 8790 --allow-control-bind --url-file ~/.cache/vibe/dashboard-url
+```
+
+Open the URL on your phone. You get:
+
+- **Owned sessions** — each with **Open** (attaches an xterm) and **Stop** (kills
+  it; only Vibe-owned).
+- **New session** — a name field + **Create / Open** (validates the name, then
+  opens with create-if-missing; the node must have `--allow-terminal-create`).
+- **Refresh**.
+
+Routes (all control-token gated; `/api/*` also require the `X-Vibe-Control: 1`
+header as a CSRF guard): `GET /`, `GET /terminal?session=<name>`,
+`WS /ws?session=<name>[&create=1]`, `GET /api/sessions`,
+`DELETE /api/sessions/<name>`. The relay stays the control plane on `:7433`; the
+dashboard is only on the terminal gateway port. The control token is never placed
+in the page JS — it stays in the HttpOnly cookie.
+
 ## Safe URL handling
 
 The control URL contains the write-capable token. Keep it out of your terminal
