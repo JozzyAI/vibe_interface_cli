@@ -9,6 +9,7 @@ import {
   generateControlToken,
   startTerminalServer,
   startRemoteTerminalServer,
+  startTerminalDashboardServer,
 } from '../lib/terminal-web.js'
 import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
 
@@ -210,5 +211,68 @@ export function registerTerminalCommand(program: Command): void {
       if (opts.json) process.stdout.write(JSON.stringify({ node: opts.node as string, session: opts.session as string, ...res, ts: new Date().toISOString() }) + '\n')
       else process.stdout.write(`${res.ok ? '✓' : '✗'} ${res.message ?? res.result ?? (res.ok ? 'killed' : 'failed')}\n`)
       if (!res.ok) process.exit(1)
+    })
+
+  terminal
+    .command('dashboard')
+    .description('serve a phone-friendly terminal dashboard for a node (list / open / create / stop owned sessions)')
+    .requiredOption('--node <node_id>', 'target node')
+    .option('--relay <url>', 'relay WebSocket URL (defaults to the connect-profile relay_url)')
+    .option('--token <token>', 'auth token for relay (prefer VIBE_RELAY_TOKEN env or --token-file)')
+    .option('--token-file <path>', 'read relay auth token from a file (defaults to the connect-profile token_file)')
+    .option('--host <host>', 'bind host (default 127.0.0.1; non-loopback requires --allow-control-bind)', '127.0.0.1')
+    .option('--port <port>', 'port to bind (default 8790)', '8790')
+    .option('--allow-control-bind', 'permit a non-loopback bind — exposes WRITE access on the network (discouraged)')
+    .option('--url-file <path>', 'write the full tokenized dashboard URL to this file (0600, parent dir created) instead of printing it')
+    .option('--print-url-only', 'print ONLY the full URL to stdout (for scripting)')
+    .option('--quiet', 'suppress the human info/warning lines (errors still print)')
+    .option('--json', 'print the listening URL as JSON and keep serving')
+    .action(async (opts) => {
+      const host = opts.host as string
+      const bind = validateControlBind(host, Boolean(opts.allowControlBind))
+      if (!bind.ok) failJson(bind.code, bind.message)
+      if (!isLoopbackHost(host) && !opts.quiet) {
+        process.stderr.write(
+          `warning: WRITE-CAPABLE terminal dashboard exposed on ${host} (LAN/VPN bind). The URL is a SECRET — anyone ` +
+          `who obtains it can create/open/stop sessions on the node (and any Claude running in them). Use on a trusted ` +
+          `LAN/VPN only; do NOT expose this host/port to the public internet.\n`,
+        )
+      }
+      let relay: string; let token: string
+      try { ({ relay, token } = await resolveTerminalRelay(opts)) } catch (err) { failJson('relay_required', (err as Error).message); return }
+      const port = Number.parseInt(opts.port as string, 10) || 8790
+      const controlToken = generateControlToken()
+      let server
+      try {
+        server = await startTerminalDashboardServer({ nodeId: opts.node as string, host, port, controlToken, relay, token })
+      } catch (err) {
+        failJson('terminal_start_failed', `failed to bind ${host}:${port}: ${(err as Error).message}`)
+        return
+      }
+      let urlFileWritten: string | undefined
+      if (opts.urlFile) {
+        try {
+          const p = path.resolve(opts.urlFile as string)
+          fs.mkdirSync(path.dirname(p), { recursive: true })
+          fs.writeFileSync(p, server.url + '\n', { mode: 0o600 })
+          urlFileWritten = p
+        } catch (err) { failJson('url_file_write_failed', `could not write --url-file: ${(err as Error).message}`); return }
+      }
+      if (opts.printUrlOnly) {
+        process.stdout.write(server.url + '\n')
+      } else if (opts.json) {
+        process.stdout.write(JSON.stringify({
+          node: opts.node as string, dashboard: true,
+          ...(urlFileWritten ? { url_file: urlFileWritten } : { url: server.url }),
+          host: server.host, port: server.port, mode: 'write-capable', auth: 'control-token', ts: new Date().toISOString(),
+        }) + '\n')
+      } else if (!opts.quiet) {
+        process.stdout.write(urlFileWritten
+          ? `vibe terminal: dashboard for node ${opts.node} — URL written to ${urlFileWritten}  (Ctrl-C to stop)\n`
+          : `vibe terminal: dashboard for node ${opts.node} at ${server.url}  (Ctrl-C to stop)\n`)
+      }
+      const shutdown = (): void => { server!.close().finally(() => process.exit(0)) }
+      process.on('SIGINT', shutdown)
+      process.on('SIGTERM', shutdown)
     })
 }

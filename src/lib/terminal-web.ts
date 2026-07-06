@@ -26,6 +26,7 @@ import { createRequire } from 'module'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { generateAccessToken } from './run-web.js'
 import { bridgeRemoteTerminal } from './terminal-remote.js'
+import { isSafeSessionName } from './tmux.js'
 
 const require = createRequire(import.meta.url)
 const CONTROL_COOKIE = 'vibe_control'
@@ -145,7 +146,9 @@ export function terminalHtml(session: string): string {
   term.open(document.getElementById('term'));
   term.focus();
   var proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  var ws = new WebSocket(proto + '://' + location.host + '/ws');
+  // Forward the page query (e.g. ?session=X&create=1) to the bridge. Local/remote
+  // serve loads at "/" with no query, so this stays "/ws".
+  var ws = new WebSocket(proto + '://' + location.host + '/ws' + location.search);
   ws.onmessage = function (e) {
     try { var m = JSON.parse(e.data); if (m.type === 'output') term.write(m.data); } catch (_) {}
   };
@@ -190,7 +193,8 @@ export interface TerminalOptions {
  */
 function serveTerminal(
   opts: { session: string; host: string; port: number; controlToken: string },
-  onConnection: (ws: WebSocket) => void,
+  onConnection: (ws: WebSocket, req: http.IncomingMessage) => void,
+  httpRoutes?: (req: http.IncomingMessage, res: http.ServerResponse, ctx: { controlToken: string; setCookie: Record<string, string>; url: URL }) => boolean,
 ): Promise<TerminalServer> {
   const { session, host, port, controlToken } = opts
 
@@ -201,13 +205,18 @@ function serveTerminal(
       res.end('unauthorized\n')
       return
     }
+    const setCookie: Record<string, string> = decision.setCookie ? { 'set-cookie': decision.setCookie } : {}
+    const url = new URL(req.url ?? '/', 'http://localhost')
+    // Optional custom routes (dashboard) run first and own their own method
+    // handling, so DELETE /api/* is reachable. Falls through to the GET-only
+    // page + assets below when not handled.
+    if (httpRoutes && httpRoutes(req, res, { controlToken, setCookie, url })) return
     if (req.method !== 'GET') {
       res.writeHead(405, { 'content-type': 'text/plain', allow: 'GET' })
       res.end('method not allowed\n')
       return
     }
-    const setCookie = decision.setCookie ? { 'set-cookie': decision.setCookie } : {}
-    const path = new URL(req.url ?? '/', 'http://localhost').pathname
+    const path = url.pathname
     if (path === '/xterm.js') {
       res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', ...setCookie })
       res.end(xtermAssets().js)
@@ -238,7 +247,7 @@ function serveTerminal(
       socket.destroy()
       return
     }
-    wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws))
+    wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws, req))
   })
 
   return new Promise((resolve, reject) => {
@@ -284,6 +293,162 @@ export interface RemoteTerminalOptions {
 export function startRemoteTerminalServer(opts: RemoteTerminalOptions): Promise<TerminalServer> {
   return serveTerminal(opts, (ws) =>
     bridgeRemoteTerminal(ws, { relay: opts.relay, token: opts.token, nodeId: opts.nodeId, session: opts.session, create: opts.create }),
+  )
+}
+
+/** Tiny phone-friendly dashboard page. The node id is embedded (non-secret); the
+ *  control token is NEVER placed in the page — auth stays in the HttpOnly cookie
+ *  and API calls carry the X-Vibe-Control CSRF header. Session names are rendered
+ *  via textContent, never innerHTML. */
+export function dashboardHtml(nodeId: string): string {
+  const safeNode = String(nodeId).replace(/[<>&"]/g, '')
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibe terminal · ${safeNode}</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;background:#0b0f14;color:#c9d1d9;font:14px ui-monospace,Menlo,monospace}
+  header{padding:12px 14px;background:#11161d;border-bottom:1px solid #222}
+  h1{font-size:14px;margin:0 0 2px}
+  .sub{color:#7fdbca;font-size:12px}
+  main{padding:14px;max-width:640px}
+  h2{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px}
+  .row{display:flex;align-items:center;gap:8px;padding:8px;border:1px solid #222;border-radius:8px;margin-bottom:8px}
+  .nm{flex:1;word-break:break-all}
+  .btn{appearance:none;border:1px solid #2b3440;background:#1b2230;color:#c9d1d9;padding:8px 12px;border-radius:8px;font:inherit;text-decoration:none;cursor:pointer}
+  .btn:active{background:#243044}
+  .stop{border-color:#5a2a2a;background:#2a1717}
+  form{display:flex;gap:8px}
+  input{flex:1;padding:9px;border:1px solid #2b3440;background:#0d1117;color:#c9d1d9;border-radius:8px;font:inherit}
+  #list .empty{color:#6e7681}
+</style>
+</head>
+<body>
+<header>
+  <h1>vibe terminal</h1>
+  <div class="sub">node <b>${safeNode}</b> · <span id="status">…</span> · write-capable</div>
+</header>
+<main>
+  <h2>Owned sessions <button id="refresh" class="btn" style="float:right;padding:4px 8px">Refresh</button></h2>
+  <div id="list"><span class="empty">loading…</span></div>
+  <h2>New session</h2>
+  <form id="newform">
+    <input id="newname" placeholder="session name" autocapitalize="off" autocomplete="off" spellcheck="false">
+    <button type="submit" class="btn">Create / Open</button>
+  </form>
+</main>
+<script>
+  var NAME_RE=/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+  function api(path, opts){ opts=opts||{}; opts.headers=Object.assign({'X-Vibe-Control':'1'}, opts.headers||{}); return fetch(path, opts); }
+  function render(sessions){
+    var list=document.getElementById('list'); list.innerHTML='';
+    if(!sessions.length){ var e=document.createElement('span'); e.className='empty'; e.textContent='(no owned sessions yet)'; list.appendChild(e); return; }
+    sessions.forEach(function(name){
+      var row=document.createElement('div'); row.className='row';
+      var nm=document.createElement('span'); nm.className='nm'; nm.textContent=name; row.appendChild(nm);
+      var open=document.createElement('a'); open.className='btn'; open.textContent='Open'; open.href='/terminal?session='+encodeURIComponent(name); row.appendChild(open);
+      var stop=document.createElement('button'); stop.className='btn stop'; stop.textContent='Stop';
+      stop.onclick=function(){ stop.disabled=true; api('/api/sessions/'+encodeURIComponent(name),{method:'DELETE'}).then(function(r){return r.json().catch(function(){return {};});}).then(function(j){ if(j.ok){ load(); } else { alert('stop: '+(j.message||j.code||'failed')); stop.disabled=false; } }); };
+      row.appendChild(stop); list.appendChild(row);
+    });
+  }
+  function load(){
+    var list=document.getElementById('list'); list.innerHTML='<span class="empty">loading…</span>';
+    api('/api/sessions').then(function(r){ if(!r.ok){ throw new Error('HTTP '+r.status); } return r.json(); })
+      .then(function(d){ document.getElementById('status').textContent=d.online?'● online':'○ offline'; render(d.sessions||[]); })
+      .catch(function(e){ document.getElementById('status').textContent='○ error'; document.getElementById('list').textContent='error: '+e.message; });
+  }
+  document.getElementById('refresh').onclick=load;
+  document.getElementById('newform').addEventListener('submit', function(ev){ ev.preventDefault(); var name=(document.getElementById('newname').value||'').trim(); if(!NAME_RE.test(name)){ alert('invalid name — letters/digits/_/-, 1–64 chars'); return; } location.href='/terminal?session='+encodeURIComponent(name)+'&create=1'; });
+  load();
+</script>
+</body>
+</html>`
+}
+
+export interface TerminalDashboardOptions {
+  nodeId: string
+  host: string
+  port: number
+  controlToken: string
+  relay: string
+  token: string   // relay auth token VALUE (resolved by the caller; never logged)
+}
+
+/**
+ * Start the terminal DASHBOARD server: a phone-friendly home page that lists
+ * Vibe-owned sessions and opens/creates/stops them — all on the SAME gateway
+ * port, reusing the control-token gate + xterm + remote bridge. Runs the relay
+ * list/kill helpers server-side (one-shot relay WS each). No relay protocol
+ * change. Never logs the token or typed input.
+ */
+export function startTerminalDashboardServer(opts: TerminalDashboardOptions): Promise<TerminalServer> {
+  return serveTerminal(
+    { session: '', host: opts.host, port: opts.port, controlToken: opts.controlToken },
+    // WS: bridge to the session named in the query (create-if-missing per ?create=1).
+    (ws, req) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const session = url.searchParams.get('session') ?? ''
+      const create = url.searchParams.get('create') === '1'
+      if (!isSafeSessionName(session)) {
+        try { ws.send(JSON.stringify({ type: 'output', data: '\r\n[vibe] invalid or missing session\r\n' })); ws.close() } catch { /* ignore */ }
+        return
+      }
+      bridgeRemoteTerminal(ws, { relay: opts.relay, token: opts.token, nodeId: opts.nodeId, session, create })
+    },
+    // HTTP: dashboard `/`, `/terminal`, and the `/api/sessions` list/stop.
+    (req, res, ctx) => {
+      const path = ctx.url.pathname
+      if (path === '/' && req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...ctx.setCookie })
+        res.end(dashboardHtml(opts.nodeId))
+        return true
+      }
+      if (path === '/terminal' && req.method === 'GET') {
+        const session = ctx.url.searchParams.get('session') ?? ''
+        if (!isSafeSessionName(session)) { res.writeHead(400, { 'content-type': 'text/plain' }); res.end('invalid session name\n'); return true }
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...ctx.setCookie })
+        res.end(terminalHtml(session))
+        return true
+      }
+      if (path === '/api/sessions' || path.startsWith('/api/sessions/')) {
+        // CSRF guard: same-origin JS sets this header; cross-origin can't without
+        // a CORS preflight we never approve. Applied to every /api route.
+        if (req.headers['x-vibe-control'] !== '1') { res.writeHead(403, { 'content-type': 'text/plain' }); res.end('missing X-Vibe-Control header\n'); return true }
+        if (path === '/api/sessions' && req.method === 'GET') {
+          void (async () => {
+            try {
+              const { remoteTerminalList } = await import('../relay/client.js')
+              const sessions = await remoteTerminalList(opts.relay, opts.token, opts.nodeId)
+              res.writeHead(200, { 'content-type': 'application/json', ...ctx.setCookie }); res.end(JSON.stringify({ node: opts.nodeId, online: true, sessions }))
+            } catch (err) {
+              res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ node: opts.nodeId, online: false, sessions: [], error: (err as Error).message }))
+            }
+          })()
+          return true
+        }
+        if (path.startsWith('/api/sessions/') && req.method === 'DELETE') {
+          const name = decodeURIComponent(path.slice('/api/sessions/'.length))
+          if (!isSafeSessionName(name)) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, code: 'invalid_session_name' })); return true }
+          void (async () => {
+            try {
+              const { remoteTerminalKill } = await import('../relay/client.js')
+              const r = await remoteTerminalKill(opts.relay, opts.token, opts.nodeId, name)
+              res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(r))
+            } catch (err) {
+              res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, code: 'terminal_stop_failed', message: (err as Error).message }))
+            }
+          })()
+          return true
+        }
+        res.writeHead(405, { 'content-type': 'text/plain', allow: 'GET, DELETE' }); res.end('method not allowed\n')
+        return true
+      }
+      return false // fall through to /xterm.js, /xterm.css, and the default 404
+    },
   )
 }
 
