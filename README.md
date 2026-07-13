@@ -25,6 +25,7 @@ The relay is E2E encrypted.
 **What is working:**
 
 - `vibe run start / stream / status / stop` — stable CLI contract any orchestrator can call (see [`docs/orchestrator-contract.md`](docs/orchestrator-contract.md) for the canonical command path, JSONL event schema, structured error envelope, and exit codes)
+- **Agent Task API (canonical contract)** — the agent-neutral Task/event/error schema the forthcoming Vibe Agent Gateway (REST + SSE) and A2A/MCP adapters map onto (pure types + mappers, no server yet): see [`docs/agent-task-api.md`](docs/agent-task-api.md)
 - `vibe symphony start / stream / status / stop / approval respond` — Symphony-specific surface
 - `vibe node daemon` — long-lived worker node, local or relay-connected
 - `vibe relay dev` — dev relay with identity-based pairing and token auth
