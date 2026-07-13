@@ -529,7 +529,12 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
 
       ws.on('close', () => {
         allConns.delete(ws)
-        if (nodeId) registry.delete(nodeId)
+        // Only the CURRENT owner's socket may deregister the node. Without this
+        // identity guard, a stale socket closing after the node reconnected on a
+        // new socket (which overwrote the registry entry) would delete the live
+        // entry, taking an online node offline. Mirrors the reqWs===ws / subs
+        // ownership checks below.
+        if (nodeId && registry.get(nodeId)?.ws === ws) registry.delete(nodeId)
         for (const [reqId, reqWs] of pendingReqs) {
           if (reqWs === ws) pendingReqs.delete(reqId)
         }
