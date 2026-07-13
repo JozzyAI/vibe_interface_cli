@@ -10,7 +10,7 @@
 import { Command } from 'commander'
 import fs from 'fs'
 import path from 'path'
-import { loadProfile } from '../lib/node-config.js'
+import { loadProfile, resolveClientDefaults } from '../lib/node-config.js'
 import { vibeDir } from '../config.js'
 import { generateAccessToken } from '../lib/run-web.js'
 import { isLoopbackHost } from '../lib/terminal-web.js'
@@ -89,8 +89,11 @@ export function registerApiCommand(program: Command): void {
     .option('--port <port>', `port to listen on (default ${DEFAULT_API_PORT})`, String(DEFAULT_API_PORT))
     .option('--token-file <path>', 'path to the 0600 API bearer-token file (default: <vibe_dir>/api-token; created once if missing, reused otherwise)')
     .option('--allow-bind', 'permit a non-loopback bind — exposes the write-capable API on the network (discouraged)')
+    .option('--relay <url>', 'relay ws URL — enables REMOTE agent execution on online nodes (else connect-profile relay_url)')
+    .option('--relay-token-file <path>', 'relay auth token file for remote execution (else connect-profile token_file / VIBE_RELAY_TOKEN)')
+    .option('--relay-token <token>', 'relay auth token (DEPRECATED: visible in process args; prefer --relay-token-file or VIBE_RELAY_TOKEN)')
     .option('--quiet', 'suppress the human info lines (errors still print)')
-    .action(async (opts: { host: string; port: string; tokenFile?: string; allowBind?: boolean; quiet?: boolean }) => {
+    .action(async (opts: { host: string; port: string; tokenFile?: string; allowBind?: boolean; relay?: string; relayTokenFile?: string; relayToken?: string; quiet?: boolean }) => {
       const host = opts.host
       const port = Number.parseInt(opts.port, 10)
       if (!Number.isInteger(port) || port < 0 || port > 65535) fail('invalid_port', `--port must be 0-65535, got ${opts.port}`)
@@ -104,9 +107,33 @@ export function registerApiCommand(program: Command): void {
       const tf = resolveApiTokenFile(tokenPath)
       if (!tf.ok) fail(tf.code, tf.message)
 
+      // Optional relay for REMOTE execution: relay URL + auth token from flags,
+      // env, or the connect profile. The relay token is DISTINCT from the API
+      // bearer token and is never printed. No relay => local/mock-only (as before).
+      const defaults = resolveClientDefaults(
+        { relay: opts.relay, token: opts.relayToken, tokenFile: opts.relayTokenFile },
+        loadProfile(),
+        { VIBE_DIR: process.env.VIBE_DIR, VIBE_RELAY_TOKEN: process.env.VIBE_RELAY_TOKEN },
+      )
+      let relayUrl = defaults.relay
+      let relayToken: string | undefined
+      if (relayUrl) {
+        const { resolveRelayToken, warnIfTokenArg } = await import('../relay/token.js')
+        warnIfTokenArg({ tokenFile: defaults.tokenFile, token: opts.relayToken })
+        try {
+          relayToken = resolveRelayToken({ tokenFile: defaults.tokenFile, token: opts.relayToken })
+        } catch (err) {
+          // Explicit --relay demands a token; an IMPLICIT (profile) relay degrades
+          // to local-only rather than blocking a local mock gateway.
+          if (opts.relay) fail('relay_token_required', `--relay set but no relay auth token: ${(err as Error).message}`)
+          if (!opts.quiet) process.stderr.write(`warning: a connect-profile relay was found but no relay token resolved — remote execution disabled (local mock only)\n`)
+          relayUrl = undefined
+        }
+      }
+
       let server
       try {
-        server = await startAgentGateway({ host, port, apiToken: tf.token })
+        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken })
       } catch (err) {
         fail('serve_failed', `could not start the gateway: ${(err as Error).message}`)
       }
@@ -119,7 +146,12 @@ export function registerApiCommand(program: Command): void {
         process.stdout.write(`vibe api: serving the Agent Task API on ${base}\n`)
         process.stdout.write(`  auth: send  Authorization: Bearer <token>  on every request\n`)
         process.stdout.write(`  API token file: ${tf.path} (mode 0600, ${tf.created ? 'created' : 'reused'}) — keep it secret; the token itself is never printed\n`)
-        process.stdout.write(`  local mock agent only (remote Claude/Codex execution is deferred). Ctrl-C to stop.\n`)
+        if (relayUrl) {
+          process.stdout.write(`  remote execution: ENABLED via relay ${relayUrl} — target a node with node_id (agents: GET /v1/agents)\n`)
+        } else {
+          process.stdout.write(`  remote execution: disabled (local mock only) — pass --relay / run 'vibe connect' to enable\n`)
+        }
+        process.stdout.write(`  Ctrl-C to stop.\n`)
       }
 
       const shutdown = (): void => { void server.close().then(() => process.exit(0)) }

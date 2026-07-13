@@ -142,20 +142,23 @@ test('isPlainObject rejects null, arrays, and primitives', () => {
   assert.ok(!isPlainObject(undefined))
 })
 
-test('validateCreateTaskRequest accepts a full valid request', () => {
+test('validateCreateTaskRequest accepts a valid v1 request (supported fields only)', () => {
   const r = validateCreateTaskRequest({
     agent: 'claude-code', node_id: 'node_1', input: { text: 'fix it' },
-    workspace: { path: '/x', repo_url: 'r', branch: 'b', workspace_key: 'k', extra: 'dropped' },
-    execution: { permission_mode: 'default', timeout_seconds: 60 }, metadata: { a: 1 },
+    workspace: { workspace_key: 'ws.key-1' },
+    execution: { permission_mode: 'default' }, metadata: { a: 1 },
   })
   assert.ok(r.ok)
   if (r.ok) {
     assert.equal(r.value.agent, 'claude-code')
     assert.equal(r.value.input.text, 'fix it')
-    assert.deepEqual(r.value.workspace, { path: '/x', repo_url: 'r', branch: 'b', workspace_key: 'k' })
-    assert.equal(r.value.execution?.timeout_seconds, 60)
+    assert.deepEqual(r.value.workspace, { workspace_key: 'ws.key-1' })
+    assert.equal(r.value.execution?.permission_mode, 'default')
     assert.deepEqual(r.value.metadata, { a: 1 })
   }
+  // omitting workspace_key stays valid (runtime generates its own)
+  const noKey = validateCreateTaskRequest({ agent: 'mock', input: { text: 'x' }, workspace: {} })
+  assert.ok(noKey.ok)
 })
 
 test('validateCreateTaskRequest rejects each malformed shape with invalid_request', () => {
@@ -167,13 +170,41 @@ test('validateCreateTaskRequest rejects each malformed shape with invalid_reques
     { agent: 'a', input: { text: '   ' } },
     { agent: 'a', node_id: 5, input: { text: 'x' } },
     { agent: 'a', input: { text: 'x' }, execution: { permission_mode: 'wild' } },
-    { agent: 'a', input: { text: 'x' }, execution: { timeout_seconds: 0 } },
-    { agent: 'a', input: { text: 'x' }, execution: { timeout_seconds: 1.5 } },
   ]
   for (const b of bad) {
     const r = validateCreateTaskRequest(b)
     assert.ok(!r.ok, `should reject ${JSON.stringify(b)}`)
     if (!r.ok) { assert.equal(r.error.code, 'invalid_request'); assert.equal(r.error.error, true) }
+  }
+})
+
+test('validateCreateTaskRequest fails CLOSED on deferred workspace/execution fields (no echo of values)', () => {
+  const cases: Array<[string, unknown, string]> = [
+    ['workspace.path', { agent: 'a', input: { text: 'x' }, workspace: { path: '/etc/passwd' } }, '/etc/passwd'],
+    ['workspace.repo_url', { agent: 'a', input: { text: 'x' }, workspace: { repo_url: 'https://secret.example/r.git' } }, 'secret.example'],
+    ['workspace.branch', { agent: 'a', input: { text: 'x' }, workspace: { branch: 'super-secret-branch' } }, 'super-secret-branch'],
+    ['execution.timeout_seconds', { agent: 'a', input: { text: 'x' }, execution: { timeout_seconds: 999 } }, '999'],
+  ]
+  for (const [label, body, secret] of cases) {
+    const r = validateCreateTaskRequest(body)
+    assert.ok(!r.ok, `${label} must be rejected`)
+    if (!r.ok) {
+      assert.equal(r.error.code, 'invalid_request')
+      assert.ok(!r.error.message.includes(secret), `${label} error must NOT echo the submitted value`)
+    }
+  }
+})
+
+test('validateCreateTaskRequest: workspace_key must be an opaque safe key (no paths/traversal)', () => {
+  const ok = ['a', 'A1', 'run.key_9-x', 'x'.repeat(128)]
+  for (const k of ok) assert.ok(validateCreateTaskRequest({ agent: 'a', input: { text: 'x' }, workspace: { workspace_key: k } }).ok, `accept ${k.slice(0, 12)}`)
+  const bad: unknown[] = ['', '/abs/path', 'win-back-'+String.fromCharCode(92)+'path', '..', '.', '../escape', 'a/b', 'a'+String.fromCharCode(92)+'b', '.hidden', '-lead', 'x'.repeat(129), 'a'+String.fromCharCode(1)+'b', 'sp ace', 42]
+  for (const k of bad) {
+    const r = validateCreateTaskRequest({ agent: 'a', input: { text: 'x' }, workspace: { workspace_key: k } })
+    assert.ok(!r.ok, `reject ${JSON.stringify(k).slice(0, 16)}`)
+    // The message is a static regex hint and never reflects the submitted value.
+    // (Check distinctive keys; single chars like "." trivially appear in the regex text.)
+    if (!r.ok) { assert.equal(r.error.code, 'invalid_request'); if (typeof k === 'string' && k.length >= 4) assert.ok(!r.error.message.includes(k), 'unsafe key not echoed') }
   }
 })
 

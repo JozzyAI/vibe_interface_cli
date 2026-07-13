@@ -1024,6 +1024,15 @@ export interface RemoteStreamControl {
   /** When true, do not write events to process.stdout — the consumer takes them
    *  via {@link onRunEvent} instead. Unset preserves the CLI stdout behaviour. */
   suppressStdout?: boolean
+  /** On reconnect exhaustion, whether to emit the synthetic `error(stream_
+   *  disconnected)` + `status:failed` terminal. Defaults to TRUE (unchanged CLI
+   *  behaviour). The Gateway sets this FALSE — a dropped event transport is NOT a
+   *  task failure; it reconciles authoritative status instead. */
+  emitDisconnectTerminal?: boolean
+  /** Called once when the stream gives up (reconnects exhausted or fatal). Lets a
+   *  consumer trigger authoritative status reconciliation without treating the
+   *  transport drop as a terminal run result. */
+  onGiveUp?: (reason: string) => void
 }
 
 /** Outcome of a single subscriber connection attempt. */
@@ -1206,12 +1215,18 @@ export async function remoteStream(
     // safeWrite) so an in-process consumer (onRunEvent) also learns the stream
     // died and the events respect suppressStdout. Never silently stop forwarding.
     emit('gave_up')
-    const ts = t()
-    printEvent({
-      run_id: runId, ts, type: 'error', code: 'stream_disconnected',
-      message: `${lastReason} — the run may still be active on the node`,
-    } satisfies RunEvent)
-    printEvent({ run_id: runId, ts, type: 'status', status: 'failed' } satisfies RunEvent)
+    try { control?.onGiveUp?.(lastReason) } catch { /* a buggy consumer must not crash cleanup */ }
+    // The Gateway disables this: a transport give-up is NOT an authoritative run
+    // failure, so it must not fabricate a terminal status. Default TRUE keeps the
+    // CLI's clear-failure behaviour for callers (e.g. Symphony) that need one.
+    if (control?.emitDisconnectTerminal !== false) {
+      const ts = t()
+      printEvent({
+        run_id: runId, ts, type: 'error', code: 'stream_disconnected',
+        message: `${lastReason} — the run may still be active on the node`,
+      } satisfies RunEvent)
+      printEvent({ run_id: runId, ts, type: 'status', status: 'failed' } satisfies RunEvent)
+    }
     finished = true
   } finally {
     process.stdout.removeListener('error', onStdoutError)
