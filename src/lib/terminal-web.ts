@@ -136,20 +136,63 @@ export function terminalHtml(session: string): string {
 <title>vibe terminal · ${safeSession}</title>
 <link rel="stylesheet" href="/xterm.css">
 <style>
-  html,body{margin:0;height:100dvh;background:#000;overflow:hidden}
-  #bar{font:12px ui-monospace,Menlo,monospace;color:#7fdbca;background:#11161d;padding:6px 10px;height:16px}
-  #wrap{position:absolute;top:28px;left:0;right:0;bottom:0}
+  :root{
+    --bg:#0b0f14; --bar:#11161d; --border:#21262d; --text:#c9d1d9; --muted:#8b949e;
+    --teal:#7fdbca; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100dvh;background:var(--bg);overflow:hidden}
+  body{display:flex;flex-direction:column;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text)}
+  #bar{
+    flex:0 0 auto;display:flex;align-items:center;gap:10px;
+    padding:8px 10px;padding-top:calc(8px + env(safe-area-inset-top));
+    background:var(--bar);border-bottom:1px solid var(--border);
+  }
+  #back{
+    display:none;align-items:center;justify-content:center;flex:0 0 auto;
+    min-width:40px;height:34px;padding:0 10px;border:1px solid #2b3440;border-radius:8px;
+    background:#1b2230;color:var(--text);text-decoration:none;font-size:16px;line-height:1;
+  }
+  #back:active{background:#243044}
+  .titles{flex:1 1 auto;min-width:0;line-height:1.25}
+  .brand{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+  .sess{color:var(--teal);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #conn{
+    flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;
+    padding:5px 9px;border-radius:999px;font-size:11px;white-space:nowrap;
+    border:1px solid var(--border);background:#0d1117;color:var(--muted);
+  }
+  #conn .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  #conn.connecting{color:var(--warn)} #conn.connecting .dot{background:var(--warn)}
+  #conn.connected{color:var(--ok)} #conn.connected .dot{background:var(--ok)}
+  #conn.down{color:var(--err)} #conn.down .dot{background:var(--err)}
+  #wrap{flex:1 1 auto;position:relative;min-height:0}
   #term{position:absolute;inset:0;padding:4px 4px env(safe-area-inset-bottom) 4px}
-  #load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#7fdbca;font:13px ui-monospace,Menlo,monospace;background:#000;z-index:2}
+  #load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--teal);font:13px ui-monospace,Menlo,monospace;background:var(--bg);z-index:2}
   .xterm-viewport{overflow-y:auto !important}
 </style>
 </head>
 <body>
-<div id="bar">vibe terminal — session <b>${safeSession}</b> — write-capable</div>
+<div id="bar">
+  <a id="back" href="/" title="Back to dashboard" aria-label="Back to dashboard">‹</a>
+  <div class="titles">
+    <div class="brand">Vibe Terminal · write-capable</div>
+    <div class="sess" title="${safeSession}">${safeSession}</div>
+  </div>
+  <span id="conn" class="connecting"><span class="dot"></span><span id="connlabel">connecting</span></span>
+</div>
 <div id="wrap"><div id="term"></div><div id="load">connecting…</div></div>
 <script src="/xterm.js"></script>
 <script src="/addon-fit.js"></script>
 <script>
+  // "Back to dashboard" only makes sense in dashboard mode (page served at
+  // /terminal). A standalone serve loads the terminal at "/", where Back would
+  // just reload the same page — so hide it there.
+  if (location.pathname === '/terminal') document.getElementById('back').style.display='inline-flex';
+
+  var conn = document.getElementById('conn'), connLabel = document.getElementById('connlabel');
+  function setConn(cls, label){ conn.className = cls; connLabel.textContent = label; }
+
   var term = new Terminal({ cursorBlink: false, convertEol: true, scrollback: 400, fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13 });
   var fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
@@ -179,7 +222,9 @@ export function terminalHtml(session: string): string {
 
   term.onData(function (d) { ws.send(JSON.stringify({ type: 'input', data: d })); }); // input never logged
   function sendResize() { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); }
-  ws.onopen = function(){ doFit(); sendResize(); };
+  ws.onopen = function(){ setConn('connected','connected'); doFit(); sendResize(); };
+  ws.onclose = function(){ setConn('down','disconnected'); if (loadEl){ loadEl.textContent='disconnected'; } };
+  ws.onerror = function(){ setConn('down','disconnected'); };
   term.onResize(sendResize);
   window.addEventListener('resize', function(){ doFit(); });
   window.addEventListener('orientationchange', function(){ setTimeout(function(){ doFit(); sendResize(); }, 200); });
@@ -338,63 +383,195 @@ export function dashboardHtml(nodeId: string): string {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vibe terminal · ${safeNode}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vibe Terminal · ${safeNode}</title>
 <style>
-  :root{color-scheme:dark}
-  body{margin:0;background:#0b0f14;color:#c9d1d9;font:14px ui-monospace,Menlo,monospace}
-  header{padding:12px 14px;background:#11161d;border-bottom:1px solid #222}
-  h1{font-size:14px;margin:0 0 2px}
-  .sub{color:#7fdbca;font-size:12px}
-  main{padding:14px;max-width:640px}
-  h2{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px}
-  .row{display:flex;align-items:center;gap:8px;padding:8px;border:1px solid #222;border-radius:8px;margin-bottom:8px}
-  .nm{flex:1;word-break:break-all}
-  .btn{appearance:none;border:1px solid #2b3440;background:#1b2230;color:#c9d1d9;padding:8px 12px;border-radius:8px;font:inherit;text-decoration:none;cursor:pointer}
-  .btn:active{background:#243044}
-  .stop{border-color:#5a2a2a;background:#2a1717}
-  form{display:flex;gap:8px}
-  input{flex:1;padding:9px;border:1px solid #2b3440;background:#0d1117;color:#c9d1d9;border-radius:8px;font:inherit}
-  #list .empty{color:#6e7681}
+  :root{
+    color-scheme:dark;
+    --bg:#0b0f14; --surface:#11161d; --surface2:#161b22; --border:#21262d; --border2:#30363d;
+    --text:#c9d1d9; --muted:#8b949e; --faint:#6e7681;
+    --teal:#7fdbca; --blue:#388bfd; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;-webkit-text-size-adjust:100%}
+  /* ── header ── */
+  header{
+    position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border);
+    padding:12px 14px;padding-top:calc(12px + env(safe-area-inset-top));
+    display:flex;align-items:center;gap:12px;
+  }
+  .hgrow{flex:1 1 auto;min-width:0}
+  h1{font-size:15px;margin:0;letter-spacing:.02em}
+  .node{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .node b{color:var(--teal);font-weight:600}
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;
+    padding:5px 10px;border-radius:999px;font-size:11px;white-space:nowrap;
+    border:1px solid var(--border2);background:#0d1117;color:var(--muted);
+  }
+  .chip .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  .chip.online{color:var(--ok);border-color:#1f6f34} .chip.online .dot{background:var(--ok)}
+  .chip.offline{color:var(--warn);border-color:#6b4c17} .chip.offline .dot{background:var(--warn)}
+  .chip.error{color:var(--err);border-color:#79231f} .chip.error .dot{background:var(--err)}
+  .chip.checking{color:var(--muted)} .chip.checking .dot{background:var(--muted);animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+  /* ── layout ── */
+  main{padding:14px;max-width:680px;margin:0 auto}
+  .sechead{display:flex;align-items:center;gap:10px;margin:22px 0 10px}
+  .sechead:first-child{margin-top:6px}
+  h2{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:0;flex:1 1 auto}
+  /* ── buttons (44px touch targets on mobile) ── */
+  .btn{
+    appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    min-height:40px;padding:0 14px;border:1px solid var(--border2);border-radius:10px;
+    background:var(--surface2);color:var(--text);font:inherit;font-size:13px;text-decoration:none;
+    cursor:pointer;transition:background .12s,border-color .12s,opacity .12s;white-space:nowrap;
+  }
+  .btn:hover{border-color:#3f4956}
+  .btn:active{transform:translatey(1px)}
+  .btn:disabled{opacity:.55;cursor:default}
+  .btn.small{min-height:32px;padding:0 10px;font-size:12px}
+  .btn.open{border-color:#1f4b7a;background:#12233a;color:#9cc7ff}
+  .btn.open:hover{background:#173049}
+  .btn.stop{border-color:#5a2a2a;background:#2a1717;color:#ffb4ab}
+  .btn.stop:hover{background:#3a1d1d}
+  .btn.stop.confirm{background:var(--err);border-color:var(--err);color:#0b0f14;font-weight:600}
+  .btn.primary{border-color:#1f4b7a;background:#12233a;color:#9cc7ff}
+  .btn.primary:hover{background:#173049}
+  /* ── session cards ── */
+  .card{
+    display:flex;align-items:center;gap:10px;padding:12px;margin-bottom:10px;
+    border:1px solid var(--border);border-radius:12px;background:var(--surface);
+  }
+  .card .nm{flex:1 1 auto;min-width:0;font-size:14px;word-break:break-all}
+  .card .nm .sub{display:block;color:var(--faint);font-size:11px;word-break:normal}
+  .card .actions{display:flex;gap:8px;flex:0 0 auto}
+  /* ── new-session form ── */
+  form{margin:0}
+  .field{display:flex;gap:8px;align-items:stretch}
+  input{
+    flex:1 1 auto;min-width:0;min-height:40px;padding:0 12px;border:1px solid var(--border2);
+    background:#0d1117;color:var(--text);border-radius:10px;font:inherit;font-size:14px;
+  }
+  input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 2px rgba(56,139,253,.25)}
+  input.invalid{border-color:var(--err)}
+  input.invalid:focus{box-shadow:0 0 0 2px rgba(248,81,73,.25)}
+  .hint{min-height:16px;margin:6px 2px 0;font-size:12px;color:var(--faint)}
+  .hint.err{color:var(--err)}
+  /* ── states ── */
+  .state{padding:22px 14px;text-align:center;border:1px dashed var(--border2);border-radius:12px;color:var(--muted)}
+  .state .big{font-size:13px;color:var(--text)}
+  .state .small{font-size:12px;color:var(--faint);margin-top:4px}
+  .state.error{border-color:#79231f;color:var(--err)}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--border2);border-top-color:var(--teal);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 <header>
-  <h1>vibe terminal</h1>
-  <div class="sub">node <b>${safeNode}</b> · <span id="status">…</span> · write-capable</div>
+  <div class="hgrow">
+    <h1>Vibe Terminal</h1>
+    <div class="node">node <b>${safeNode}</b></div>
+  </div>
+  <span id="status" class="chip checking"><span class="dot"></span><span id="statuslabel">checking…</span></span>
+  <button id="refresh" class="btn small" title="Refresh">Refresh</button>
 </header>
 <main>
-  <h2>Owned sessions <button id="refresh" class="btn" style="float:right;padding:4px 8px">Refresh</button></h2>
-  <div id="list"><span class="empty">loading…</span></div>
-  <h2>New session</h2>
-  <form id="newform">
-    <input id="newname" placeholder="session name" autocapitalize="off" autocomplete="off" spellcheck="false">
-    <button type="submit" class="btn">Create / Open</button>
+  <div class="sechead"><h2>Owned sessions</h2></div>
+  <div id="list"></div>
+  <div class="sechead"><h2>New session</h2></div>
+  <form id="newform" autocomplete="off" novalidate>
+    <div class="field">
+      <input id="newname" placeholder="session name" autocapitalize="off" autocomplete="off" spellcheck="false" enterkeyhint="go" aria-label="new session name">
+      <button id="newbtn" type="submit" class="btn primary">Create / Open</button>
+    </div>
+    <div id="newhint" class="hint">Letters, digits, <code>_</code> and <code>-</code> · 1–64 chars.</div>
   </form>
 </main>
 <script>
   var NAME_RE=/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
   function api(path, opts){ opts=opts||{}; opts.headers=Object.assign({'X-Vibe-Control':'1'}, opts.headers||{}); return fetch(path, opts); }
+  function el(tag, cls, text){ var e=document.createElement(tag); if(cls)e.className=cls; if(text!=null)e.textContent=text; return e; }
+
+  var listEl=document.getElementById('list');
+  var statusEl=document.getElementById('status'), statusLabel=document.getElementById('statuslabel');
+  function setStatus(cls,label){ statusEl.className='chip '+cls; statusLabel.textContent=label; }
+
+  // Rebuilding the list detaches any armed Stop button; clear its pending 3s
+  // reset timer so it can't fire disarm() on a removed node.
+  var armTimers=[];
+  function clearArmTimers(){ for(var i=0;i<armTimers.length;i++) clearTimeout(armTimers[i]); armTimers=[]; }
+
+  function stateBox(kind, big, small){
+    clearArmTimers(); listEl.innerHTML='';
+    var box=el('div','state'+(kind==='error'?' error':''));
+    var b=el('div','big'); if(kind==='loading'){ b.appendChild(el('span','spin')); b.appendChild(document.createTextNode(' '+big)); } else { b.textContent=big; }
+    box.appendChild(b);
+    if(small){ box.appendChild(el('div','small',small)); }
+    listEl.appendChild(box);
+  }
+
   function render(sessions){
-    var list=document.getElementById('list'); list.innerHTML='';
-    if(!sessions.length){ var e=document.createElement('span'); e.className='empty'; e.textContent='(no owned sessions yet)'; list.appendChild(e); return; }
+    clearArmTimers(); listEl.innerHTML='';
+    if(!sessions.length){ stateBox('empty','No owned sessions yet','Create one below to get started.'); return; }
     sessions.forEach(function(name){
-      var row=document.createElement('div'); row.className='row';
-      var nm=document.createElement('span'); nm.className='nm'; nm.textContent=name; row.appendChild(nm);
-      var open=document.createElement('a'); open.className='btn'; open.textContent='Open'; open.href='/terminal?session='+encodeURIComponent(name); row.appendChild(open);
-      var stop=document.createElement('button'); stop.className='btn stop'; stop.textContent='Stop';
-      stop.onclick=function(){ stop.disabled=true; api('/api/sessions/'+encodeURIComponent(name),{method:'DELETE'}).then(function(r){return r.json().catch(function(){return {};});}).then(function(j){ if(j.ok){ load(); } else { alert('stop: '+(j.message||j.code||'failed')); stop.disabled=false; } }); };
-      row.appendChild(stop); list.appendChild(row);
+      var card=el('div','card');
+      var nm=el('div','nm'); nm.appendChild(el('span',null,name)); nm.appendChild(el('span','sub','tmux · Vibe-owned')); card.appendChild(nm);
+      var actions=el('div','actions');
+      var open=el('a','btn open small','Open'); open.href='/terminal?session='+encodeURIComponent(name); actions.appendChild(open);
+      var stop=el('button','btn stop small','Stop'); stop.type='button';
+      var armed=false, armTimer=null;
+      function disarm(){ armed=false; stop.classList.remove('confirm'); stop.textContent='Stop'; if(armTimer){clearTimeout(armTimer);armTimer=null;} }
+      stop.onclick=function(){
+        if(!armed){ armed=true; stop.classList.add('confirm'); stop.textContent='Confirm stop'; armTimer=setTimeout(disarm,3000); armTimers.push(armTimer); return; }
+        if(armTimer){clearTimeout(armTimer);armTimer=null;}
+        stop.disabled=true; stop.classList.remove('confirm'); stop.textContent='Stopping…';
+        api('/api/sessions/'+encodeURIComponent(name),{method:'DELETE'})
+          .then(function(r){return r.json().catch(function(){return {};});})
+          .then(function(j){ if(j.ok){ load(); } else { stop.disabled=false; disarm(); showRowError(card,'stop failed: '+(j.message||j.code||'unknown')); } })
+          .catch(function(e){ stop.disabled=false; disarm(); showRowError(card,'stop failed: '+e.message); });
+      };
+      actions.appendChild(stop); card.appendChild(actions); listEl.appendChild(card);
     });
   }
-  function load(){
-    var list=document.getElementById('list'); list.innerHTML='<span class="empty">loading…</span>';
-    api('/api/sessions').then(function(r){ if(!r.ok){ throw new Error('HTTP '+r.status); } return r.json(); })
-      .then(function(d){ document.getElementById('status').textContent=d.online?'● online':'○ offline'; render(d.sessions||[]); })
-      .catch(function(e){ document.getElementById('status').textContent='○ error'; document.getElementById('list').textContent='error: '+e.message; });
+  function showRowError(card, msg){
+    var old=card.parentNode.querySelector('.rowerr'); if(old)old.remove();
+    var e=el('div','hint err rowerr',msg); e.style.marginBottom='10px'; card.parentNode.insertBefore(e, card.nextSibling);
   }
-  document.getElementById('refresh').onclick=load;
-  document.getElementById('newform').addEventListener('submit', function(ev){ ev.preventDefault(); var name=(document.getElementById('newname').value||'').trim(); if(!NAME_RE.test(name)){ alert('invalid name — letters/digits/_/-, 1–64 chars'); return; } location.href='/terminal?session='+encodeURIComponent(name)+'&create=1'; });
+
+  var refreshBtn=document.getElementById('refresh');
+  // Monotonic request token: loads can overlap (Refresh + a Stop success both
+  // call load()), so a stale response must never overwrite newer UI state.
+  var loadSeq=0;
+  function load(){
+    var seq=++loadSeq;
+    setStatus('checking','checking…'); refreshBtn.disabled=true; stateBox('loading','Loading sessions…');
+    api('/api/sessions').then(function(r){ if(!r.ok){ throw new Error('HTTP '+r.status); } return r.json(); })
+      .then(function(d){
+        if(seq!==loadSeq) return; // a newer load started; drop this stale response
+        refreshBtn.disabled=false;
+        if(d.online===false){ setStatus('offline','offline'); stateBox('empty','Node is offline','The node daemon isn\\u2019t reachable via the relay right now. Tap Refresh once it\\u2019s back.'); return; }
+        setStatus('online','online'); render(d.sessions||[]);
+      })
+      .catch(function(e){ if(seq!==loadSeq) return; refreshBtn.disabled=false; setStatus('error','error'); stateBox('error','Couldn\\u2019t reach the gateway',e.message); });
+  }
+  refreshBtn.onclick=load;
+
+  var nameEl=document.getElementById('newname'), hintEl=document.getElementById('newhint'), newBtn=document.getElementById('newbtn');
+  var DEFAULT_HINT='Letters, digits, _ and - \\u00b7 1\\u201364 chars.';
+  function clearInvalid(){ nameEl.classList.remove('invalid'); hintEl.className='hint'; hintEl.textContent=DEFAULT_HINT; }
+  nameEl.addEventListener('input', clearInvalid);
+  document.getElementById('newform').addEventListener('submit', function(ev){
+    ev.preventDefault();
+    var name=(nameEl.value||'').trim();
+    if(!NAME_RE.test(name)){
+      nameEl.classList.add('invalid'); hintEl.className='hint err';
+      hintEl.textContent=name?'Invalid name \\u2014 use letters, digits, _ or -, 1\\u201364 chars.':'Enter a session name.';
+      nameEl.focus(); return;
+    }
+    newBtn.disabled=true; nameEl.disabled=true; newBtn.textContent='Opening…';
+    location.href='/terminal?session='+encodeURIComponent(name)+'&create=1';
+  });
   load();
 </script>
 </body>
