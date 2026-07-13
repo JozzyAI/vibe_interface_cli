@@ -250,6 +250,37 @@ test('relay: disconnected node removed from registry', async () => {
   }
 })
 
+test('relay: stale disconnect of an old socket does not deregister a reconnected node', async () => {
+  // A registers node_x; the node reconnects on a new socket B and re-registers
+  // (B becomes the current owner). When the OLD socket A finally closes, the
+  // live entry owned by B must survive — only the current owner may deregister.
+  const server = await startRelayServer({ port: 0, token: TEST_TOKEN })
+  try {
+    const aWs = await connect(`ws://localhost:${server.port}?token=${TEST_TOKEN}`)
+    await registerNode(aWs, 'node_x')
+    const bWs = await connect(`ws://localhost:${server.port}?token=${TEST_TOKEN}`)
+    await registerNode(bWs, 'node_x') // B overwrites the registry entry → current owner
+
+    aWs.close() // stale socket closes after the reconnect
+    await new Promise((r) => setTimeout(r, 200))
+
+    let cliWs = await connect(`ws://localhost:${server.port}?token=${TEST_TOKEN}`)
+    let nodes = await listNodes(cliWs)
+    assert.ok(nodes.find((n) => n.node_id === 'node_x'), 'reconnected node still registered after old socket closed')
+    cliWs.terminate()
+
+    // Sanity: when the CURRENT owner B closes, the node is finally removed.
+    bWs.close()
+    await new Promise((r) => setTimeout(r, 200))
+    cliWs = await connect(`ws://localhost:${server.port}?token=${TEST_TOKEN}`)
+    nodes = await listNodes(cliWs)
+    assert.ok(!nodes.find((n) => n.node_id === 'node_x'), 'node removed once the current owner disconnects')
+    cliWs.terminate()
+  } finally {
+    await server.close()
+  }
+})
+
 test('relay: stale node (connected, no heartbeat) shows offline in list', async () => {
   const server = await startRelayServer({ port: 0, token: TEST_TOKEN, staleMs: 300 })
   try {
