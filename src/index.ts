@@ -9,6 +9,7 @@ import { registerMonitorCommand } from './commands/monitor.js'
 import { registerConnectCommand } from './commands/connect.js'
 import { registerTerminalCommand } from './commands/terminal.js'
 import { registerApiCommand } from './commands/api.js'
+import { registerMcpCommand } from './commands/mcp.js'
 import { runSupervisor } from './runtime/supervisor.js'
 
 const program = new Command()
@@ -42,5 +43,6 @@ registerApprovalCommand(program)
 registerMonitorCommand(program)
 registerTerminalCommand(program)
 registerApiCommand(program)
+registerMcpCommand(program)
 
 program.parse()
