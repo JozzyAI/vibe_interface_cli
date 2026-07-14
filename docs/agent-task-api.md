@@ -1,5 +1,9 @@
 # Agent Task API — canonical contract
 
+> **Status: Gateway v1 (frozen).** Core is complete and accepted in production —
+> see [`agent-gateway-v1-baseline.md`](agent-gateway-v1-baseline.md). The next arc
+> (MCP / A2A) is a **client of this API**; it must not change the Gateway core.
+
 The **Vibe Agent Gateway** turns any locally-runnable agent harness (Claude Code,
 Codex, mock, …) into a uniform, streaming **Task API** so external callers
 (Symphony, Linear/GitHub automation, n8n, Slack bots, other agents, MCP hosts)

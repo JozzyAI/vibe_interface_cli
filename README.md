@@ -146,6 +146,58 @@ external:
   agent: mock       # or claude-code
 ```
 
+## Agent Task API — `vibe api serve` (Gateway v1)
+
+A **REST + SSE** HTTP API in front of the run lifecycle: any caller (Symphony,
+CI, an MCP host, a bot) can start an agent task and stream its events over one
+uniform, agent-neutral contract — without knowing which harness runs underneath.
+Full contract: [`docs/agent-task-api.md`](docs/agent-task-api.md).
+
+```bash
+# Start the gateway. Loopback-only by default; a dedicated Bearer token is created
+# once at 0600 (its value is never printed — only the file path). Add --relay (or a
+# connect profile) to enable remote Claude Code / Codex execution on an online node.
+vibe api serve --host 127.0.0.1 --port 8787 \
+  --token-file ~/.cache/vibe/api-token \
+  --relay ws://<relay-host>:7433 --relay-token-file ~/.config/vibe/relay-token
+
+TOKEN=$(cat ~/.cache/vibe/api-token); BASE=http://127.0.0.1:8787
+
+# List agents (local mock + each online remote node's advertised agents)
+curl -H "Authorization: Bearer $TOKEN" $BASE/v1/agents
+
+# Start a remote Claude Code task (202; run_start is ENCRYPTED for the node)
+TASK=$(curl -s -X POST $BASE/v1/tasks -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"agent":"claude-code","node_id":"node_<id>",
+       "input":{"text":"Fix the failing auth test"},
+       "workspace":{"workspace_key":"my-task-1"}}' | jq -r .task_id)
+
+# Stream canonical events (id: / event: / data: <TaskEvent>) until the terminal one
+curl -N -H "Authorization: Bearer $TOKEN" $BASE/v1/tasks/$TASK/events
+
+# Authoritative status, and idempotent cancel (POST, not DELETE)
+curl -H "Authorization: Bearer $TOKEN" $BASE/v1/tasks/$TASK
+curl -X POST -H "Authorization: Bearer $TOKEN" $BASE/v1/tasks/$TASK/cancel
+```
+
+**Gateway v1 at a glance** (see the [contract doc](docs/agent-task-api.md) for detail):
+
+- **Auth:** dedicated `Authorization: Bearer` token (never the relay/terminal
+  token), constant-time compared, loopback-only unless `--allow-bind`.
+- **Supported request fields:** `agent`, `node_id`, `input.text`,
+  `workspace.workspace_key` (opaque `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` — not a
+  path), `execution.permission_mode`, `metadata`. **Deferred fields fail closed**
+  (400): `workspace.path`/`repo_url`/`branch`, `execution.timeout_seconds`.
+- **Remote execution is encrypted** — `run_start` is encrypted for the target
+  node (no plaintext fallback); the node independently contains the workspace
+  within its workspace root.
+- **Durability is process-local:** task→run mappings and SSE replay history are
+  in-memory only; a gateway restart loses them (the run store is unaffected).
+  Bounds: `MAX_ACTIVE_TASKS=32`, `MAX_RETAINED_COMPLETED_TASKS=100`,
+  `MAX_EVENTS_PER_TASK=1000`, `MAX_BODY_BYTES=1 MiB`.
+- **Baseline:** [`docs/agent-gateway-v1-baseline.md`](docs/agent-gateway-v1-baseline.md).
+
 ## Backends
 
 | Backend | Description |
