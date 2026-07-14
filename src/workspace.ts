@@ -18,6 +18,62 @@ export function resolveWorkspacePath(workspaceKey: string, workspaceRoot: string
   return resolved
 }
 
+/**
+ * Opaque workspace-key rule. MUST stay in sync with WORKSPACE_KEY_RE in
+ * src/lib/agent-task-contract.ts (the API-layer copy). Starts alphanumeric, then
+ * alphanumeric/`.`/`_`/`-`, max 128 chars — this alone rejects '', '/', '\',
+ * absolute paths, leading '.' (so '.'/'..'/traversal), control chars, oversized.
+ */
+export const WORKSPACE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+export type WorkspaceResolution =
+  | { ok: true; path: string }
+  | { ok: false; code: 'invalid_workspace_key'; message: string }
+
+/**
+ * Resolve an UNTRUSTED workspace_key to a path CONTAINED within workspaceRoot.
+ * This is the node's filesystem trust boundary for every relay client (not only
+ * Agent Gateway callers). Result-returning — NO process.exit, and the submitted
+ * key is NEVER echoed in the (relay-visible) error. Creates NO directory: the
+ * caller creates the workspace dir only after this succeeds.
+ *
+ * Layers of containment:
+ *   1. `workspace_key` must be an opaque identifier (WORKSPACE_KEY_RE) — a single
+ *      safe path segment. This rejects empty, '/', '\', absolute paths, '.'/'..'
+ *      and any traversal, control characters, and oversized keys up front.
+ *   2. The resolved path is verified inside the realpath'd root via `path.relative`
+ *      (NOT a bare string-prefix comparison).
+ *   3. If the final path already EXISTS, its realpath must still be inside the root
+ *      — this rejects an existing symlink (or symlinked component) that escapes.
+ *
+ * Residual limitation (documented, not silently claimed solved): this is not fully
+ * TOCTOU-race-proof. A directory/component could be swapped for an escaping symlink
+ * between the realpath check here and later filesystem use by the backend. Fully
+ * race-resistant containment needs per-component O_NOFOLLOW/openat traversal, which
+ * is a substantially larger design left as a follow-up.
+ */
+export function resolveContainedWorkspace(workspaceKey: string, workspaceRoot: string): WorkspaceResolution {
+  const OPAQUE_KEY = 'workspace_key must be an opaque key matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ (not a path)'
+  if (typeof workspaceKey !== 'string' || !WORKSPACE_KEY_RE.test(workspaceKey)) {
+    return { ok: false, code: 'invalid_workspace_key', message: OPAQUE_KEY }
+  }
+  fs.mkdirSync(workspaceRoot, { recursive: true }) // ensure the ROOT exists (not the key dir)
+  const realRoot = fs.realpathSync(workspaceRoot)
+  const resolved = path.resolve(realRoot, workspaceKey)
+  const rel = path.relative(realRoot, resolved)
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { ok: false, code: 'invalid_workspace_key', message: 'workspace_key does not resolve within the workspace root' }
+  }
+  if (fs.existsSync(resolved)) {
+    const realResolved = fs.realpathSync(resolved)
+    const relReal = path.relative(realRoot, realResolved)
+    if (relReal === '' || relReal.startsWith('..') || path.isAbsolute(relReal)) {
+      return { ok: false, code: 'invalid_workspace_key', message: 'existing workspace path escapes the workspace root' }
+    }
+  }
+  return { ok: true, path: resolved }
+}
+
 export function ensureWorkspace(workspacePath: string): void {
   fs.mkdirSync(workspacePath, { recursive: true })
 }

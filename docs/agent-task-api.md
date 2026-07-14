@@ -61,9 +61,14 @@ but does not clone/prepare a repo before starting the backend). The API
 error **never echoes** the submitted path/URL/branch/timeout or an unsafe
 `workspace_key`.
 
-> Follow-up: the remote node should enforce workspace-root containment for **all**
-> relay clients (not just Agent Gateway callers); the gateway `workspace_key`
-> validation here is defense in depth.
+> The remote **node** independently enforces workspace-root containment for **all**
+> relay clients (`resolveContainedWorkspace` in `src/workspace.ts`): the same
+> opaque-key rule, realpath containment (not string-prefix), and rejection of an
+> existing final path that symlinks outside the root — so this gateway
+> `workspace_key` validation is defense in depth. Residual limitation: node-side
+> containment is not fully TOCTOU-race-proof (a component could be swapped for an
+> escaping symlink between check and use); per-component `O_NOFOLLOW` traversal is
+> a documented follow-up.
 
 Deliberately **excluded** for the MVP arc: approvals, follow-up messages,
 artifacts, file transfer, multi-user ownership.
