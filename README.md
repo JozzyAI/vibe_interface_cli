@@ -197,6 +197,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" $BASE/v1/tasks/$TASK/cancel
   Bounds: `MAX_ACTIVE_TASKS=32`, `MAX_RETAINED_COMPLETED_TASKS=100`,
   `MAX_EVENTS_PER_TASK=1000`, `MAX_BODY_BYTES=1 MiB`.
 - **Baseline:** [`docs/agent-gateway-v1-baseline.md`](docs/agent-gateway-v1-baseline.md).
+- **MCP:** `vibe mcp serve` exposes the gateway as MCP tools for local hosts (Claude Desktop, Cursor) — a pure HTTP client of the gateway: see [`docs/mcp-server.md`](docs/mcp-server.md).
 
 ## Backends
 
