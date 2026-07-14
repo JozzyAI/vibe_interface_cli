@@ -198,6 +198,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" $BASE/v1/tasks/$TASK/cancel
   `MAX_EVENTS_PER_TASK=1000`, `MAX_BODY_BYTES=1 MiB`.
 - **Baseline:** [`docs/agent-gateway-v1-baseline.md`](docs/agent-gateway-v1-baseline.md).
 - **MCP:** `vibe mcp serve` exposes the gateway as MCP tools for local hosts (Claude Desktop, Cursor) — a pure HTTP client of the gateway: see [`docs/mcp-server.md`](docs/mcp-server.md). Host setup (Claude Code, Cursor), the seven-tool reference, and the recommended run/wait/resume workflow: [`docs/mcp-client-integrations.md`](docs/mcp-client-integrations.md).
+- **Workflow contract (v1):** a declarative, JSON-first multi-agent workflow spec (e.g. a Codex-planner → Claude-Code-executor → Codex-review loop) — types + a pure validator only, no runtime yet: see [`docs/workflow-contract.md`](docs/workflow-contract.md).
 
 ## Backends
 
