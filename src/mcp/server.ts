@@ -14,6 +14,13 @@
  */
 import { GatewayApiError, type GatewayClient } from './gateway-client.js'
 
+/** Overall wait budget bounds for the higher-level workflow tools (in seconds).
+ *  Wider than a single SSE poll (still capped at 30s inside gateway-client): the
+ *  workflow loops bounded polls within this one budget. */
+const RUN_WAIT_MIN_S = 0.5
+const RUN_WAIT_MAX_S = 120
+const RUN_WAIT_DEFAULT_S = 30
+
 /** Preferred protocol version (latest stable). Older supported revisions are also
  *  accepted; an unknown/future version negotiates DOWN to this — we never claim an
  *  unimplemented version. */
@@ -55,6 +62,43 @@ function reqString(args: Record<string, unknown>, key: string): { ok: true; valu
   return { ok: true, value: v }
 }
 
+/** Shared inputSchema fragment for the create-task fields — only Gateway v1
+ *  supported fields (no workspace.path/repo_url/branch, no timeout, no commands). */
+const START_TASK_PROPERTIES: Record<string, unknown> = {
+  agent: { type: 'string', description: 'agent id (e.g. mock, claude-code, codex)' },
+  node_id: { type: 'string', description: 'target remote node id; omit for the local mock' },
+  input_text: { type: 'string', description: 'the task prompt' },
+  workspace_key: { type: 'string', description: 'opaque workspace key ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ (NOT a path); omit to auto-generate', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' },
+  permission_mode: { type: 'string', enum: ['default', 'unsafe-skip'] },
+  metadata: { type: 'object' },
+}
+
+/** Validate + build the Gateway POST /v1/tasks body from shared create-task args.
+ *  Only Gateway v1 supported fields are forwarded. */
+function buildStartBody(args: Record<string, unknown>): { ok: true; body: Record<string, unknown> } | { ok: false; err: ToolContent } {
+  const agent = reqString(args, 'agent'); if (!agent.ok) return { ok: false, err: agent.err }
+  const text = reqString(args, 'input_text'); if (!text.ok) return { ok: false, err: text.err }
+  if (args.node_id !== undefined && typeof args.node_id !== 'string') return { ok: false, err: toolError('invalid_request', '`node_id` must be a string') }
+  if (args.workspace_key !== undefined && typeof args.workspace_key !== 'string') return { ok: false, err: toolError('invalid_request', '`workspace_key` must be a string') }
+  if (args.permission_mode !== undefined && args.permission_mode !== 'default' && args.permission_mode !== 'unsafe-skip') return { ok: false, err: toolError('invalid_request', '`permission_mode` must be "default" or "unsafe-skip"') }
+  if (args.metadata !== undefined && (typeof args.metadata !== 'object' || args.metadata === null || Array.isArray(args.metadata))) return { ok: false, err: toolError('invalid_request', '`metadata` must be an object') }
+  const body: Record<string, unknown> = { agent: agent.value, input: { text: text.value } }
+  if (typeof args.node_id === 'string') body.node_id = args.node_id
+  if (typeof args.workspace_key === 'string') body.workspace = { workspace_key: args.workspace_key }
+  if (args.permission_mode) body.execution = { permission_mode: args.permission_mode }
+  if (args.metadata) body.metadata = args.metadata
+  return { ok: true, body }
+}
+
+/** Parse an optional `wait_seconds` into a bounded overall-wait budget in ms.
+ *  Out-of-range/non-finite is REJECTED (not clamped); absent uses the default. */
+function parseWaitBudgetMs(args: Record<string, unknown>): { ok: true; ms: number } | { ok: false; err: ToolContent } {
+  const raw = args.wait_seconds
+  if (raw === undefined) return { ok: true, ms: RUN_WAIT_DEFAULT_S * 1000 }
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < RUN_WAIT_MIN_S || raw > RUN_WAIT_MAX_S) return { ok: false, err: toolError('invalid_request', `\`wait_seconds\` must be a number in [${RUN_WAIT_MIN_S}, ${RUN_WAIT_MAX_S}]`) }
+  return { ok: true, ms: raw * 1000 }
+}
+
 export function createGatewayTools(client: GatewayClient): ToolDef[] {
   return [
     {
@@ -66,38 +110,52 @@ export function createGatewayTools(client: GatewayClient): ToolDef[] {
     },
     {
       name: 'vibe_start_task',
-      description: 'Start an agent task and return the canonical Task (status typically "running"). Poll vibe_get_task_events with the returned task_id to follow it. Does not wait for completion.',
+      description: 'Start an agent task and return the canonical Task (status typically "running") WITHOUT waiting. Follow it with vibe_get_task_events (or use vibe_run_task to start and wait in one call). Only Gateway v1 fields are accepted.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        required: ['agent', 'input_text'],
+        properties: { ...START_TASK_PROPERTIES },
+      },
+      handler: async (args) => {
+        const built = buildStartBody(args); if (!built.ok) return built.err
+        try {
+          const task = await client.startTask(built.body)
+          const taskId = (task as { task_id?: string }).task_id
+          return ok({ task, next: taskId ? { tool: 'vibe_get_task_events', arguments: { task_id: taskId } } : undefined })
+        } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_run_task',
+      description: 'CONVENIENCE WORKFLOW: start an agent task AND wait (bounded) for it to finish, in one call. Creates the task, then resumes its events until the task is terminal or the overall wait budget (wait_seconds, default 30s, max 120s) expires. MAY RETURN BEFORE COMPLETION: if it returns terminal=false / ended_by="timeout", the task is STILL RUNNING — continue it with vibe_wait_task using the returned task_id and next_event_id (resume cursor). A timeout or MCP disconnect NEVER cancels the task; only vibe_cancel_task does. Returns the authoritative Task, ordered events, next_event_id, terminal, ended_by, truncated, and (if any) a bounded output_preview.',
       inputSchema: {
         type: 'object', additionalProperties: false,
         required: ['agent', 'input_text'],
         properties: {
-          agent: { type: 'string', description: 'agent id (e.g. mock, claude-code, codex)' },
-          node_id: { type: 'string', description: 'target remote node id; omit for the local mock' },
-          input_text: { type: 'string', description: 'the task prompt' },
-          workspace_key: { type: 'string', description: 'opaque workspace key ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ (NOT a path); omit to auto-generate', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' },
-          permission_mode: { type: 'string', enum: ['default', 'unsafe-skip'] },
-          metadata: { type: 'object' },
+          ...START_TASK_PROPERTIES,
+          wait_seconds: { type: 'number', minimum: RUN_WAIT_MIN_S, maximum: RUN_WAIT_MAX_S, description: `overall seconds to wait for completion; must be in [${RUN_WAIT_MIN_S}, ${RUN_WAIT_MAX_S}] (default ${RUN_WAIT_DEFAULT_S})` },
         },
       },
       handler: async (args) => {
-        const agent = reqString(args, 'agent'); if (!agent.ok) return agent.err
-        const text = reqString(args, 'input_text'); if (!text.ok) return text.err
-        if (args.node_id !== undefined && typeof args.node_id !== 'string') return toolError('invalid_request', '`node_id` must be a string')
-        if (args.workspace_key !== undefined && typeof args.workspace_key !== 'string') return toolError('invalid_request', '`workspace_key` must be a string')
-        if (args.permission_mode !== undefined && args.permission_mode !== 'default' && args.permission_mode !== 'unsafe-skip') return toolError('invalid_request', '`permission_mode` must be "default" or "unsafe-skip"')
-        if (args.metadata !== undefined && (typeof args.metadata !== 'object' || args.metadata === null || Array.isArray(args.metadata))) return toolError('invalid_request', '`metadata` must be an object')
-        // Only supported gateway fields are forwarded — deferred fields
-        // (workspace.path/repo_url/branch, execution.timeout_seconds) are not exposed.
-        const body: Record<string, unknown> = { agent: agent.value, input: { text: text.value } }
-        if (typeof args.node_id === 'string') body.node_id = args.node_id
-        if (typeof args.workspace_key === 'string') body.workspace = { workspace_key: args.workspace_key }
-        if (args.permission_mode) body.execution = { permission_mode: args.permission_mode }
-        if (args.metadata) body.metadata = args.metadata
+        const built = buildStartBody(args); if (!built.ok) return built.err
+        const budget = parseWaitBudgetMs(args); if (!budget.ok) return budget.err
+        // 1) Create the task. A failure here means nothing is running.
+        let taskId: string
         try {
-          const task = await client.startTask(body)
-          const taskId = (task as { task_id?: string }).task_id
-          return ok({ task, next: taskId ? { tool: 'vibe_get_task_events', arguments: { task_id: taskId } } : undefined })
+          const created = await client.startTask(built.body)
+          const id = (created as { task_id?: unknown }).task_id
+          if (typeof id !== 'string' || id === '') return ok({ task: created, note: 'task created but no task_id was returned; cannot wait', terminal: false, ended_by: 'timeout' })
+          taskId = id
         } catch (e) { return fromGatewayError(e) }
+        // 2) Wait bounded for completion. If waiting fails AFTER creation, the task
+        //    may still be running — surface the task_id and DO NOT cancel it.
+        try {
+          const r = await client.waitForTask(taskId, { overallWaitMs: budget.ms })
+          return ok(r.terminal ? r : { ...r, task_id: taskId, resume: { tool: 'vibe_wait_task', arguments: { task_id: taskId, after_event_id: r.next_event_id } }, note: 'wait budget expired; the task is still running — resume with vibe_wait_task (no cancellation occurred)' })
+        } catch (e) {
+          const base = e instanceof GatewayApiError ? e.api : { error: true, code: 'mcp_internal_error', message: (e as Error).message }
+          return { content: [{ type: 'text', text: JSON.stringify({ ...base, task_id: taskId, terminal: false, note: 'task was created and MAY STILL BE RUNNING; waiting failed and no cancellation occurred — resume with vibe_wait_task', resume: { tool: 'vibe_wait_task', arguments: { task_id: taskId } } }, null, 2) }], isError: true }
+        }
       },
     },
     {
@@ -138,6 +196,33 @@ export function createGatewayTools(client: GatewayClient): ToolDef[] {
           waitMs = w * 1000
         }
         try { return ok(await client.collectEvents(id.value, { afterId, waitMs })) } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_wait_task',
+      description: 'RESUMABLE BOUNDED WAIT: continue an existing task from a resume cursor and wait (bounded) for it to finish. The primary continuation path for a task returned by vibe_run_task with terminal=false. Pass after_event_id = the next_event_id you last received; resumes strictly after it with no gap and no duplicate boundary event. Loops bounded polls within wait_seconds (default 30s, max 120s), stopping on terminal (authoritative Task status) or timeout. A no-new-event timeout preserves your cursor. A timeout or MCP disconnect NEVER cancels the task. Returns task, ordered events, next_event_id, terminal, ended_by, truncated, and (if any) a bounded output_preview.',
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['task_id'],
+        properties: {
+          task_id: { type: 'string' },
+          after_event_id: { type: 'integer', minimum: 0, maximum: MAX_CURSOR, description: 'resume cursor: continue strictly after this event id (the next_event_id from a prior call)' },
+          wait_seconds: { type: 'number', minimum: RUN_WAIT_MIN_S, maximum: RUN_WAIT_MAX_S, description: `overall seconds to wait for completion; must be in [${RUN_WAIT_MIN_S}, ${RUN_WAIT_MAX_S}] (default ${RUN_WAIT_DEFAULT_S})` },
+        },
+      },
+      annotations: { readOnlyHint: true },
+      handler: async (args) => {
+        const id = reqString(args, 'task_id'); if (!id.ok) return id.err
+        let afterId: number | undefined
+        if (args.after_event_id !== undefined) {
+          const n = args.after_event_id
+          if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > MAX_CURSOR) return toolError('invalid_request', `\`after_event_id\` must be an integer in [0, ${MAX_CURSOR}]`)
+          afterId = n
+        }
+        const budget = parseWaitBudgetMs(args); if (!budget.ok) return budget.err
+        try {
+          const r = await client.waitForTask(id.value, { afterId, overallWaitMs: budget.ms })
+          return ok(r.terminal ? r : { ...r, task_id: id.value, resume: { tool: 'vibe_wait_task', arguments: { task_id: id.value, after_event_id: r.next_event_id } }, note: 'wait budget expired; the task is still running — resume again with vibe_wait_task (no cancellation occurred)' })
+        } catch (e) { return fromGatewayError(e) }
       },
     },
     {

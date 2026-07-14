@@ -15,6 +15,16 @@ export const EVENT_WAIT_MAX_MS = 30_000
 export const DEFAULT_EVENT_WAIT_MS = 10_000
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000
 
+/** Overall wait budget for the higher-level workflow tools (vibe_run_task /
+ *  vibe_wait_task). The workflow LOOPS bounded, single SSE polls (each still
+ *  capped at EVENT_WAIT_MAX_MS) within one overall deadline — a fresh full window
+ *  is never granted to each internal request past the caller's deadline. */
+export const OVERALL_WAIT_MIN_MS = 500
+export const OVERALL_WAIT_MAX_MS = 120_000
+export const DEFAULT_OVERALL_WAIT_MS = 30_000
+/** Cap on the optional agent-output text preview aggregated from delta events. */
+export const OUTPUT_PREVIEW_MAX_CHARS = 4_000
+
 const TERMINAL_TASK_EVENTS = new Set(['task.completed', 'task.failed', 'task.cancelled'])
 
 /** A structured Gateway error surfaced to MCP tool callers (never carries a token). */
@@ -75,6 +85,41 @@ export interface CollectedEvents {
   terminal: boolean
   truncated: boolean
   ended_by: 'terminal' | 'timeout'
+}
+
+/** Result of a higher-level workflow wait — a CollectedEvents aggregated across
+ *  bounded polls, plus an optional compact text preview of agent output. */
+export interface WaitResult extends CollectedEvents {
+  /** Compact text derived ONLY from `agent.output.delta` events, in order, bounded
+   *  to OUTPUT_PREVIEW_MAX_CHARS. Absent when no delta output was seen. */
+  output_preview?: string
+  /** True when `output_preview` hit the size cap and was truncated. */
+  output_preview_truncated?: boolean
+}
+
+/**
+ * Aggregate a compact preview from `agent.output.delta` events ONLY, in order,
+ * bounded to `maxChars`. Never invents output not present in the events, never
+ * discards the canonical events (the caller keeps those), and surfaces truncation
+ * explicitly. Returns no preview when there was no delta output.
+ */
+export function summarizeDeltaEvents(events: unknown[], maxChars: number): { preview?: string; truncated: boolean } {
+  let text = ''
+  let sawDelta = false
+  let truncated = false
+  for (const ev of events) {
+    if (!ev || typeof ev !== 'object') continue
+    const e = ev as { type?: unknown; payload?: unknown }
+    if (e.type !== 'agent.output.delta') continue
+    const p = e.payload as { text?: unknown } | undefined
+    const t = p && typeof p.text === 'string' ? p.text : ''
+    if (!t) continue
+    sawDelta = true
+    if (text.length + t.length > maxChars) { text += t.slice(0, Math.max(0, maxChars - text.length)); truncated = true; break }
+    text += t
+  }
+  if (!sawDelta) return { truncated: false }
+  return { preview: text, truncated }
 }
 
 export class GatewayClient {
@@ -196,5 +241,45 @@ export class GatewayClient {
     const terminal = status === 'completed' || status === 'failed' || status === 'cancelled'
     void sawTerminalEvent // observed via the stream, but the Task status is authoritative
     return { task, events, next_event_id: lastSeq, terminal, truncated, ended_by: terminal ? 'terminal' : 'timeout' }
+  }
+
+  /**
+   * Higher-level WORKFLOW wait: repeatedly resume `collectEvents` from the last
+   * consumed cursor until the task is terminal (authoritative Task status) or one
+   * OVERALL deadline expires. Each internal poll is bounded to `min(remaining
+   * budget, EVENT_WAIT_MAX_MS)` — the caller's `overallWaitMs` is a single budget
+   * shared across polls, never re-granted per request, so the total wait can never
+   * exceed it. Events are aggregated in order with no gap or boundary-duplicate
+   * (each resume uses the prior cursor). A poll that consumes nothing preserves the
+   * cursor. Terminal is decided by the authoritative Task; a missed terminal SSE
+   * event is NOT fabricated. Timing out or disconnecting NEVER cancels the task.
+   */
+  async waitForTask(taskId: string, opts: { afterId?: number; overallWaitMs?: number } = {}): Promise<WaitResult> {
+    const overall = Math.min(Math.max(opts.overallWaitMs ?? DEFAULT_OVERALL_WAIT_MS, OVERALL_WAIT_MIN_MS), OVERALL_WAIT_MAX_MS)
+    const deadline = Date.now() + overall
+    let cursor = opts.afterId ?? -1
+    const events: unknown[] = []
+    let truncated = false
+    let last: CollectedEvents | undefined
+    while (true) {
+      const remaining = deadline - Date.now()
+      if (remaining < EVENT_WAIT_MIN_MS) break // no budget for even a minimum poll
+      const waitMs = Math.min(remaining, EVENT_WAIT_MAX_MS)
+      const r = await this.collectEvents(taskId, { afterId: cursor, waitMs })
+      if (r.events.length) events.push(...r.events)
+      cursor = r.next_event_id
+      truncated = truncated || r.truncated
+      last = r
+      if (r.terminal) break
+    }
+    // At least one poll always runs (overall >= EVENT_WAIT_MIN_MS), so `last` is set.
+    const task = last!.task
+    const terminal = last!.terminal
+    const preview = summarizeDeltaEvents(events, OUTPUT_PREVIEW_MAX_CHARS)
+    return {
+      task, events, next_event_id: cursor, terminal, truncated,
+      ended_by: terminal ? 'terminal' : 'timeout',
+      ...(preview.preview !== undefined ? { output_preview: preview.preview, output_preview_truncated: preview.truncated } : {}),
+    }
   }
 }

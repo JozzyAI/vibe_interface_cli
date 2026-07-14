@@ -71,7 +71,7 @@ test('official MCP SDK client drives the real stdio server end to end', { timeou
   await client.ping() // must succeed
 
   const list = await client.listTools()
-  assert.deepEqual(list.tools.map((t) => t.name).sort(), ['vibe_cancel_task', 'vibe_get_task', 'vibe_get_task_events', 'vibe_list_agents', 'vibe_start_task'])
+  assert.deepEqual(list.tools.map((t) => t.name).sort(), ['vibe_cancel_task', 'vibe_get_task', 'vibe_get_task_events', 'vibe_list_agents', 'vibe_run_task', 'vibe_start_task', 'vibe_wait_task'])
   const cancel = list.tools.find((t) => t.name === 'vibe_cancel_task')!
   assert.equal((cancel as { annotations?: { destructiveHint?: boolean } }).annotations?.destructiveHint, true)
 

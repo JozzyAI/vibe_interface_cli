@@ -59,8 +59,10 @@ real spawned server end-to-end).
 |------|--------------|-------|
 | `vibe_list_agents` | `GET /v1/agents` | local mock + online nodes' agents |
 | `vibe_start_task` | `POST /v1/tasks` | `agent`, optional `node_id`, `input_text`, optional `workspace_key` (opaque; not a path), `permission_mode`, `metadata`. Deferred gateway fields (`path`/`repo_url`/`branch`/`timeout_seconds`) are **not exposed**. Returns the Task; does not wait. |
+| `vibe_run_task` | `POST /v1/tasks` + bounded resume loop | **convenience workflow**: start **and** wait (bounded) in one call — see below. Same inputs as `vibe_start_task` plus `wait_seconds`. **May return before completion.** |
+| `vibe_wait_task` | `GET /v1/tasks/:id/events` (SSE) resume loop | **resumable bounded wait**: continue an existing task from a cursor until terminal or timeout — see below. Inputs `task_id`, optional `after_event_id`, `wait_seconds`. |
 | `vibe_get_task` | `GET /v1/tasks/:id` | authoritative canonical Task |
-| `vibe_get_task_events` | `GET /v1/tasks/:id/events` (SSE) | **bounded** request/response — see below |
+| `vibe_get_task_events` | `GET /v1/tasks/:id/events` (SSE) | **bounded** single request/response — see below |
 | `vibe_cancel_task` | `POST /v1/tasks/:id/cancel` | **destructive** (annotated); idempotent (the gateway owns idempotency) |
 
 ### Bounded event polling (`vibe_get_task_events`)
@@ -88,6 +90,59 @@ task is terminal **or** the bounded wait elapses. It returns:
 **Closing or timing out the tool never cancels the task** — only
 `vibe_cancel_task` cancels. Poll again with `next_event_id` to follow a long task.
 
+### Wait/resume workflows (`vibe_run_task`, `vibe_wait_task`)
+
+These are convenience wrappers so an agent host can start and follow a task
+without hand-rolling the poll loop. They add **no** Gateway behavior: each is a
+sequence of the same bounded calls above.
+
+- **`vibe_run_task`** — creates the task (`POST /v1/tasks`, only Gateway v1
+  fields), then resumes its events from the last consumed cursor until the task is
+  **terminal** or the **overall** `wait_seconds` budget expires. **It may return
+  before completion.**
+- **`vibe_wait_task`** — the continuation path: resume an existing `task_id` from
+  `after_event_id` (a `next_event_id` from a prior call) under the same bounded
+  loop. Use it whenever `vibe_run_task` returns `terminal: false`.
+
+**Overall wait semantics.** `wait_seconds` is a **single overall deadline**
+(default **30 s**, min **0.5 s**, max **120 s**; out-of-range is **rejected**, not
+clamped) shared across all internal polls — a fresh full window is **never**
+re-granted per request, so the total wait can never exceed the budget. Each
+internal SSE poll stays capped at 30 s; a longer budget simply loops more bounded
+polls. There is no unbounded loop and every HTTP request has a bounded timeout.
+
+Both return the same shape as `vibe_get_task_events` (`task`, ordered `events`,
+`next_event_id`, `terminal`, `truncated`, `ended_by`) plus, when the agent emitted
+output, a bounded `output_preview` (concatenated `agent.output.delta` text only,
+capped, with `output_preview_truncated` when the cap is hit — the canonical
+`events` are always kept in full and nothing is invented).
+
+**A timeout does NOT mean the task was cancelled.** When `ended_by` is
+`"timeout"` / `terminal` is `false`, the task **is still running**; the result
+carries the `task_id` and a `resume` hint. Continue with `vibe_wait_task`
+(or `vibe_get_task_events`). Only `vibe_cancel_task` cancels — never a timeout or
+an MCP client disconnect. If task **creation** succeeds but the subsequent wait
+fails, the result still carries the created `task_id` and states the task may
+still be running; it is **not** auto-cancelled.
+
+**Terminal is authoritative.** As with `vibe_get_task_events`, a `completed` /
+`failed` / `cancelled` GET makes `terminal: true` even if the terminal SSE event
+was missed; a missing terminal event is never fabricated, and a terminal task is
+never regressed to running.
+
+**Example multi-call flow** (a task that outlives the first wait):
+
+```jsonc
+// 1) start + wait up to 30s
+vibe_run_task { "agent": "claude-code", "node_id": "node_x", "input_text": "…", "wait_seconds": 30 }
+//    -> { "terminal": false, "ended_by": "timeout", "task_id": "run_42",
+//         "next_event_id": 7, "resume": { "tool": "vibe_wait_task", … } }
+
+// 2) resume from the cursor, no gap / no duplicate
+vibe_wait_task { "task_id": "run_42", "after_event_id": 7, "wait_seconds": 60 }
+//    -> { "terminal": true, "ended_by": "terminal", "task": { "status": "completed", … } }
+```
+
 ## Errors
 
 Canonical Gateway `ApiError` responses are mapped to structured MCP tool errors
@@ -113,8 +168,5 @@ A gateway restart drops them; the MCP server holds no additional state.
 
 ## Roadmap
 
-- **PR #57** — richer wait/resume: a high-level `vibe_run_task` (start + bounded
-  wait → terminal result, or a `task_id`/`next_event_id` to resume) and resumed
-  polling helpers.
 - **PR #58** — client-specific **Claude Desktop / Cursor** configuration guides
   and a live Claude/Codex integration smoke.
