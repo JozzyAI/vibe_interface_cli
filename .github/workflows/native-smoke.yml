@@ -1,0 +1,30 @@
+# Portability smoke for the repo's first native dependency (better-sqlite3).
+# Proves `npm ci`, native module load, build, and a temporary SQLite DB
+# open/migrate/query/close on Node 20 across Linux, macOS, and Windows.
+# This intentionally does NOT run the full test suite on every OS.
+name: native-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  control-store-smoke:
+    name: control-store smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install (npm ci; builds/loads better-sqlite3)
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Control-store portability smoke (open/migrate/query/close)
+        run: node scripts/control-store-smoke.mjs
