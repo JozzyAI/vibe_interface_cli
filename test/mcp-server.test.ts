@@ -12,7 +12,7 @@ import os from 'os'
 import path from 'path'
 import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
-import { GatewayClient, readGatewayToken, isLoopbackGatewayUrl } from '../src/mcp/gateway-client.js'
+import { GatewayClient, readGatewayToken, isLoopbackGatewayUrl, summarizeDeltaEvents, OUTPUT_PREVIEW_MAX_CHARS } from '../src/mcp/gateway-client.js'
 import { createMcpServer } from '../src/mcp/server.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -23,8 +23,12 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // ── fake gateway ──────────────────────────────────────────────────────────────
 
-interface FakeTask { task: any; events: Array<{ seq: number; type: string; data: unknown }>; terminal: boolean }
-function ev(seq: number, type: string): { seq: number; type: string; data: unknown } { return { seq, type, data: { seq, type, contract_version: 1 } } }
+interface FakeTask { task: any; events: Array<{ seq: number; type: string; data: unknown }>; terminal: boolean; failWait?: boolean }
+function ev(seq: number, type: string, text?: string): { seq: number; type: string; data: unknown } {
+  const data: any = { seq, task_id: 'run', type, ts: 't', contract_version: 1 }
+  if (text !== undefined) data.payload = { stream: 'stdout', text }
+  return { seq, type, data }
+}
 
 let server: http.Server
 let PORT = 0
@@ -59,8 +63,10 @@ before(async () => {
         else if (text.includes('GETDONE')) { events = [ev(0, 'task.created'), ev(1, 'task.started')]; status = 'completed'; terminal = true } // stream ends, NO terminal event
         else if (text.includes('GETFAILED')) { events = [ev(0, 'task.created'), ev(1, 'task.started')]; status = 'failed'; terminal = true }
         else if (text.includes('GETCANCELLED')) { events = [ev(0, 'task.created'), ev(1, 'task.started')]; status = 'cancelled'; terminal = true }
+        else if (text.includes('PREVIEW')) { events = [ev(0, 'task.created'), ev(1, 'agent.output.delta', 'Hello '), ev(2, 'agent.output.delta', 'world'), ev(3, 'task.completed')]; status = 'completed'; terminal = true }
+        else if (text.includes('WAITFAIL')) { events = [ev(0, 'task.created')]; status = 'running'; terminal = false } // created OK, but waiting will 500
         else { events = [ev(0, 'task.created'), ev(1, 'task.started'), ev(2, 'agent.output.delta'), ev(3, 'task.completed')]; status = 'completed'; terminal = true }
-        const t: FakeTask = { task: { task_id: id, agent: body.agent, node_id: body.node_id, status, contract_version: 1, created_at: 't', updated_at: 't', __forwarded: body }, events, terminal }
+        const t: FakeTask = { task: { task_id: id, agent: body.agent, node_id: body.node_id, status, contract_version: 1, created_at: 't', updated_at: 't', __forwarded: body }, events, terminal, failWait: text.includes('WAITFAIL') }
         tasks.set(id, t)
         sendJson(res, 202, { task_id: id, agent: body.agent, node_id: body.node_id, status, contract_version: 1, created_at: 't', updated_at: 't' })
       })
@@ -70,6 +76,8 @@ before(async () => {
       const id = decodeURIComponent(parts[2]); const t = tasks.get(id)
       if (parts.join('/') === 'v1/tasks/nonjson' ) { res.writeHead(500, { 'content-type': 'text/plain' }); return res.end('boom') }
       if (!t) return sendJson(res, 404, { error: true, code: 'task_not_found', message: `no such task: ${id}`, task_id: id, retryable: false, ts: 't' })
+      // Simulate a task that is created OK but whose subsequent waiting fails.
+      if (t.failWait && ((parts.length === 3 && m === 'GET') || (parts.length === 4 && parts[3] === 'events'))) return sendJson(res, 503, { error: true, code: 'service_unavailable', message: 'temporarily unavailable', retryable: true, ts: 't' })
       if (parts.length === 3 && m === 'GET') return sendJson(res, 200, t.task)
       if (parts.length === 4 && parts[3] === 'cancel' && m === 'POST') { cancelCount++; t.task.status = 'cancelled'; t.terminal = true; return sendJson(res, 200, t.task) }
       if (parts.length === 4 && parts[3] === 'events' && m === 'GET') {
@@ -152,9 +160,11 @@ test('protocol: initialize negotiates version (prefers 2025-11-25) + declares to
 test('protocol: tools/list has exact names, no deferred fields, cancel marked destructive', async () => {
   const r: any = await srv().handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
   const names = r.result.tools.map((t: any) => t.name).sort()
-  assert.deepEqual(names, ['vibe_cancel_task', 'vibe_get_task', 'vibe_get_task_events', 'vibe_list_agents', 'vibe_start_task'])
-  const start = r.result.tools.find((t: any) => t.name === 'vibe_start_task')
-  for (const deferred of ['path', 'repo_url', 'branch', 'timeout_seconds']) assert.ok(!(deferred in start.inputSchema.properties), `no ${deferred} in schema`)
+  assert.deepEqual(names, ['vibe_cancel_task', 'vibe_get_task', 'vibe_get_task_events', 'vibe_list_agents', 'vibe_run_task', 'vibe_start_task', 'vibe_wait_task'])
+  for (const toolName of ['vibe_start_task', 'vibe_run_task']) {
+    const tl = r.result.tools.find((t: any) => t.name === toolName)
+    for (const deferred of ['path', 'repo_url', 'branch', 'timeout_seconds']) assert.ok(!(deferred in tl.inputSchema.properties), `no ${deferred} in ${toolName} schema`)
+  }
   const cancel = r.result.tools.find((t: any) => t.name === 'vibe_cancel_task')
   assert.ok(cancel.annotations?.destructiveHint === true)
   assert.match(cancel.description, /DESTRUCTIVE/)
@@ -262,6 +272,114 @@ test('terminal reconciliation: authoritative Task status decides terminal, no fa
   assert.equal(dr.terminal, true); assert.equal(dr.ended_by, 'terminal') // SSE terminal + GET terminal consistent
 })
 
+// ── vibe_run_task / vibe_wait_task workflows (PR #57) ──────────────────────────
+
+test('vibe_run_task: completes within budget -> authoritative terminal Task + ordered events', async () => {
+  const r = parseResult(await call('vibe_run_task', { agent: 'mock', input_text: 'ok', wait_seconds: 3 }))
+  assert.equal(r.terminal, true); assert.equal(r.ended_by, 'terminal'); assert.equal(r.task.status, 'completed')
+  assert.deepEqual(r.events.map((e: any) => e.seq), [0, 1, 2, 3]) // ordered canonical events
+})
+
+test('vibe_run_task: budget expires -> still running, task_id + usable resume cursor, NO auto-cancel', async () => {
+  const before = cancelCount
+  const r = parseResult(await call('vibe_run_task', { agent: 'mock', input_text: 'RUNNING long', wait_seconds: 0.5 }))
+  assert.equal(r.terminal, false); assert.equal(r.ended_by, 'timeout')
+  assert.equal(typeof r.task_id, 'string')
+  assert.deepEqual(r.events.map((e: any) => e.seq), [0, 1])
+  assert.equal(r.next_event_id, 1) // usable resume cursor
+  assert.equal(r.resume.tool, 'vibe_wait_task'); assert.equal(r.resume.arguments.after_event_id, 1)
+  assert.equal(cancelCount, before, 'a wait-budget timeout must NOT cancel the task')
+})
+
+test('vibe_run_task: creation ok but waiting fails -> task_id preserved, may still run, NO auto-cancel', async () => {
+  const before = cancelCount
+  const res: any = await call('vibe_run_task', { agent: 'mock', input_text: 'WAITFAIL', wait_seconds: 2 })
+  assert.equal(res.result.isError, true)
+  const r = JSON.parse(res.result.content[0].text)
+  assert.equal(typeof r.task_id, 'string')        // created id preserved
+  assert.equal(r.terminal, false)
+  assert.equal(r.code, 'service_unavailable')      // canonical (retryable) error preserved, distinguishable
+  assert.match(r.note, /still|running/i)
+  assert.equal(r.resume.tool, 'vibe_wait_task')
+  assert.equal(cancelCount, before, 'a post-creation wait failure must NOT cancel the created task')
+})
+
+test('vibe_run_task: bounded output_preview aggregated ONLY from delta events (+ truncation)', async () => {
+  const r = parseResult(await call('vibe_run_task', { agent: 'mock', input_text: 'PREVIEW please', wait_seconds: 3 }))
+  assert.equal(r.terminal, true)
+  assert.equal(r.output_preview, 'Hello world')   // only delta text, in order, nothing invented
+  assert.equal(r.output_preview_truncated, false)
+  assert.deepEqual(r.events.map((e: any) => e.seq), [0, 1, 2, 3]) // canonical events NOT discarded
+  // aggregation is bounded and marks truncation
+  const big = [ev(1, 'agent.output.delta', 'x'.repeat(10)).data, ev(2, 'agent.output.delta', 'y'.repeat(10)).data]
+  const s = summarizeDeltaEvents(big, 15)
+  assert.equal(s.preview!.length, 15); assert.equal(s.truncated, true)
+  assert.equal(summarizeDeltaEvents([ev(1, 'task.started').data], OUTPUT_PREVIEW_MAX_CHARS).preview, undefined) // no delta -> no preview
+})
+
+test('vibe_wait_task: resumes from cursor with no gap/dup; no-new-event timeout preserves cursor', async () => {
+  const id = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'RESUME me' })).task.task_id
+  const p1 = parseResult(await call('vibe_wait_task', { task_id: id, wait_seconds: 0.5 }))
+  assert.deepEqual(p1.events.map((e: any) => e.seq), [1, 2]); assert.equal(p1.next_event_id, 2); assert.equal(p1.terminal, false)
+  tasks.get(id)!.events.push(ev(3, 'agent.output.delta')) // new event between calls
+  const p2 = parseResult(await call('vibe_wait_task', { task_id: id, after_event_id: p1.next_event_id, wait_seconds: 0.5 }))
+  assert.deepEqual(p2.events.map((e: any) => e.seq), [3]); assert.equal(p2.next_event_id, 3) // strictly after cursor 2, no dup
+  const p3 = parseResult(await call('vibe_wait_task', { task_id: id, after_event_id: p2.next_event_id, wait_seconds: 0.5 }))
+  assert.deepEqual(p3.events, []); assert.equal(p3.next_event_id, 3) // no new event -> cursor preserved
+})
+
+test('vibe_wait_task: terminal via SSE AND terminal only via authoritative GET (no fabricated event)', async () => {
+  const sseId = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'ok' })).task.task_id
+  const a = parseResult(await call('vibe_wait_task', { task_id: sseId, wait_seconds: 2 }))
+  assert.equal(a.terminal, true); assert.equal(a.ended_by, 'terminal'); assert.equal(a.task.status, 'completed')
+  const getId = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'GETDONE' })).task.task_id
+  const b = parseResult(await call('vibe_wait_task', { task_id: getId, wait_seconds: 2 }))
+  assert.equal(b.terminal, true); assert.equal(b.ended_by, 'terminal'); assert.equal(b.task.status, 'completed')
+  assert.ok(!b.events.some((e: any) => ['task.completed', 'task.failed', 'task.cancelled'].includes(e.type)), 'no terminal event fabricated')
+})
+
+test('vibe_wait_task: truncated replay surfaced; unknown task -> task_not_found', async () => {
+  const tid = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'TRUNCATE me' })).task.task_id
+  const r = parseResult(await call('vibe_wait_task', { task_id: tid, after_event_id: 0, wait_seconds: 2 }))
+  assert.equal(r.truncated, true); assert.equal(r.next_event_id, 6)
+  const nf = parseResult(await call('vibe_wait_task', { task_id: 'run_missing', wait_seconds: 2 }))
+  assert.equal(nf.error, true); assert.equal(nf.code, 'task_not_found')
+})
+
+test('vibe_wait_task: repeated calls eventually complete (running -> terminal between calls)', async () => {
+  const id = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'RUNNING then done' })).task.task_id
+  const first = parseResult(await call('vibe_wait_task', { task_id: id, wait_seconds: 0.5 }))
+  assert.equal(first.terminal, false)
+  const t = tasks.get(id)!; t.events.push(ev(2, 'task.completed')); t.task.status = 'completed'; t.terminal = true
+  const second = parseResult(await call('vibe_wait_task', { task_id: id, after_event_id: first.next_event_id, wait_seconds: 2 }))
+  assert.equal(second.terminal, true); assert.equal(second.ended_by, 'terminal')
+  assert.deepEqual(second.events.map((e: any) => e.seq), [2]) // resumed strictly after the cursor
+})
+
+test('overall deadline: workflow wait is bounded by the budget (not 30s) + rejects out-of-range wait_seconds', async () => {
+  const id = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'RUNNING forever' })).task.task_id
+  const t0 = Date.now()
+  const r = parseResult(await call('vibe_wait_task', { task_id: id, wait_seconds: 1 }))
+  const elapsed = Date.now() - t0
+  assert.equal(r.terminal, false)
+  assert.ok(elapsed >= 900 && elapsed < 8000, `bounded by overall deadline (~1s, not 30s): ${elapsed}ms`)
+  // min/max validation on BOTH workflow tools — reject (do NOT clamp); max is 120
+  for (const w of [0, 0.49, 120.01, 121, -1, Number.NaN, Number.POSITIVE_INFINITY, 'x', null]) {
+    assert.equal(parseResult(await call('vibe_wait_task', { task_id: id, wait_seconds: w as unknown as number })).code, 'invalid_request', `wait reject ${String(w)}`)
+    assert.equal(parseResult(await call('vibe_run_task', { agent: 'mock', input_text: 'ok', wait_seconds: w as unknown as number })).code, 'invalid_request', `run reject ${String(w)}`)
+  }
+  // boundaries 0.5 and 120 accepted (a done task returns immediately, so no real long wait)
+  assert.equal(parseResult(await call('vibe_run_task', { agent: 'mock', input_text: 'ok', wait_seconds: 0.5 })).terminal, true)
+  assert.equal(parseResult(await call('vibe_run_task', { agent: 'mock', input_text: 'ok', wait_seconds: 120 })).terminal, true)
+})
+
+test('overall deadline: no SSE-subscriber leak after a bounded workflow timeout (abort cleanup)', async () => {
+  const id = parseResult(await call('vibe_start_task', { agent: 'mock', input_text: 'RUNNING leak-check' })).task.task_id
+  await call('vibe_wait_task', { task_id: id, wait_seconds: 0.5 })
+  await delay(250) // allow the aborted request's 'close' to reach the fake
+  assert.equal(openStreams.size, 0, 'aborted SSE subscribers are cleaned up — no listener/stream leak')
+})
+
 test('json-rpc validation: jsonrpc/id/method/notifications/unknown/exceptions (item 6)', async () => {
   const s = srv()
   assert.equal((await s.handle({ jsonrpc: '1.0', id: 1, method: 'ping' } as any) as any).error.code, -32600, 'jsonrpc must be 2.0')
@@ -317,7 +435,7 @@ test('stdio: CLI serves MCP; initialize/tools/list/tools/call over stdin; no non
   for (const l of lines) { const j = JSON.parse(l); assert.equal(j.jsonrpc, '2.0') } // ONLY protocol JSON on stdout
   const byId = Object.fromEntries(lines.map((l) => JSON.parse(l)).filter((j: any) => j.id != null).map((j: any) => [j.id, j]))
   assert.equal(byId[1].result.serverInfo.name, 'vibe-agent-gateway')
-  assert.equal(byId[2].result.tools.length, 5)
+  assert.equal(byId[2].result.tools.length, 7)
   assert.ok(JSON.parse(byId[3].result.content[0].text).agents.length >= 1)
   assert.ok(!out.includes(TOKEN) && !err.includes(TOKEN), 'token never on stdout/stderr')
 })
