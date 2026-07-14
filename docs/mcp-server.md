@@ -4,6 +4,11 @@
 for local MCP hosts (Claude Desktop, Cursor, …). It is a **pure client** of the
 gateway's HTTP API.
 
+> **Setting up a host?** For step-by-step **Claude Code / Cursor** configuration,
+> the seven-tool reference, and the recommended run/wait/resume workflow, see
+> [`mcp-client-integrations.md`](mcp-client-integrations.md). This page is the
+> protocol/reference for the server itself.
+
 ```
 MCP Host  ──stdio(JSON-RPC)──▶  Vibe MCP server  ──HTTP──▶  Vibe Agent Gateway  ──▶  relay / node / Claude / Codex
 ```
@@ -168,5 +173,5 @@ A gateway restart drops them; the MCP server holds no additional state.
 
 ## Roadmap
 
-- **PR #58** — client-specific **Claude Desktop / Cursor** configuration guides
-  and a live Claude/Codex integration smoke.
+- **Client integration guides** (Claude Code, Cursor) + tool reference +
+  recommended workflow: [`mcp-client-integrations.md`](mcp-client-integrations.md).
