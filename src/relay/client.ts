@@ -10,6 +10,7 @@ import { resolveConfig, vibeDir } from '../config.js'
 import { getHeartbeatMs } from '../node-state.js'
 import { generateRunId, tryReadRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
+import { resolveContainedWorkspace } from '../workspace.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { codexBackend } from '../backends/codex.js'
@@ -80,8 +81,22 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   }
 
   const runId = generateRunId()
+  // The node is the filesystem trust boundary for every relay client. Contain the
+  // (untrusted) workspace_key within workspace_root BEFORE creating any directory,
+  // writing the run record, or starting a backend. Omitting the key uses the safe
+  // generated run_id. The error never echoes the submitted key.
   const workspaceKey = msg.workspace_key ?? runId
-  const workspacePath = path.join(config.workspace_root, workspaceKey)
+  const wsResolved = resolveContainedWorkspace(workspaceKey, config.workspace_root)
+  if (!wsResolved.ok) {
+    sendMsg(ws, {
+      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+      type: 'run_start_ack', req_id: msg.req_id, ok: false,
+      error: wsResolved.message, // never contains the submitted key
+      code: wsResolved.code,
+    })
+    return
+  }
+  const workspacePath = wsResolved.path
   fs.mkdirSync(workspacePath, { recursive: true })
 
   // Write prompt content to a node-local temp file. The controller sends the
