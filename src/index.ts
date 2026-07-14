@@ -11,9 +11,10 @@ import { registerTerminalCommand } from './commands/terminal.js'
 import { registerApiCommand } from './commands/api.js'
 import { registerMcpCommand } from './commands/mcp.js'
 import { runSupervisor } from './runtime/supervisor.js'
+import { readPackageVersion } from './lib/pkg-version.js'
 
 const program = new Command()
-program.name('vibe').description('Vibe Interface CLI — universal worker-node runtime').version('0.1.0')
+program.name('vibe').description('Vibe Interface CLI — universal worker-node runtime').version(readPackageVersion())
 
 // The supervisor is the single detached entrypoint behind every backend: it
 // runs the primary agent and, per the run's agent_policy, may fall back to

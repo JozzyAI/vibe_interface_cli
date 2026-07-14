@@ -13,6 +13,7 @@ import http from 'http'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { execFileSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -47,6 +48,14 @@ test('server preferred protocol matches the official SDK latest (2025-11-25)', (
   assert.equal(SUPPORTED_PROTOCOL, LATEST_PROTOCOL_VERSION, 'server prefers exactly the SDK LATEST_PROTOCOL_VERSION')
 })
 
+test('built CLI `vibe --version` reports the package.json version (not the 0.0.0 sentinel)', () => {
+  const pkgVersion = (JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8')) as { version: string }).version
+  const out = execFileSync(NODE, [CLI, '--version'], { encoding: 'utf8' }).trim()
+  assert.equal(out, pkgVersion, '`vibe --version` equals package.json version')
+  assert.equal(out, '0.2.0', '`vibe --version` is the v0.2.0 release version')
+  assert.notEqual(out, '0.0.0')
+})
+
 test('official MCP SDK client drives the real stdio server end to end', { timeout: 20000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-compat-'))
   const tf = path.join(dir, 'api-token'); fs.writeFileSync(tf, TOKEN + '\n', { mode: 0o600 })
@@ -63,10 +72,18 @@ test('official MCP SDK client drives the real stdio server end to end', { timeou
   await client.connect(transport) // performs initialize + notifications/initialized
 
   // negotiated protocol version is one our server supports
-  const negotiated = (client as unknown as { getServerVersion?: () => unknown }).getServerVersion?.()
   const proto = transport as unknown as { _protocolVersion?: string }
   if (proto._protocolVersion) assert.ok(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'].includes(proto._protocolVersion), `negotiated ${proto._protocolVersion}`)
-  void negotiated
+
+  // serverInfo (from the REAL spawned CLI) reports the correct name AND the actual
+  // package.json version — not the '0.0.0' sentinel. This exercises the built
+  // dist layout, where a fixed relative require previously mis-resolved to 0.0.0.
+  const info = (client as unknown as { getServerVersion?: () => { name?: string; version?: string } }).getServerVersion?.()
+  const pkgVersion = (JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8')) as { version: string }).version
+  assert.equal(info?.name, 'vibe-agent-gateway', 'serverInfo.name')
+  assert.equal(info?.version, pkgVersion, 'serverInfo.version equals package.json version')
+  assert.equal(info?.version, '0.2.0', 'serverInfo.version is the v0.2.0 release version')
+  assert.notEqual(info?.version, '0.0.0', 'serverInfo.version must not be the unknown sentinel')
 
   await client.ping() // must succeed
 
