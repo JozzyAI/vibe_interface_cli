@@ -25,7 +25,7 @@ The relay is E2E encrypted.
 **What is working:**
 
 - `vibe run start / stream / status / stop` — stable CLI contract any orchestrator can call (see [`docs/orchestrator-contract.md`](docs/orchestrator-contract.md) for the canonical command path, JSONL event schema, structured error envelope, and exit codes)
-- **Agent Task API** — `vibe api serve` runs a local REST + SSE **Agent Task Gateway** (Bearer-auth, loopback-default) over the run lifecycle, projecting the agent-neutral Task/event/error contract that A2A/MCP adapters will also map onto. Local **mock** agent only so far (remote Claude/Codex deferred): see [`docs/agent-task-api.md`](docs/agent-task-api.md)
+- **Agent Task API** — `vibe api serve` runs a REST + SSE **Agent Task Gateway** (Bearer-auth, loopback-default) over the run lifecycle, projecting the agent-neutral Task/event/error contract that A2A/MCP adapters will also map onto. Runs the **mock** agent locally, and — when started with `--relay` — executes **Claude Code / Codex on a remote node** via the existing `vibe run` remote contract: see [`docs/agent-task-api.md`](docs/agent-task-api.md)
 - `vibe symphony start / stream / status / stop / approval respond` — Symphony-specific surface
 - `vibe node daemon` — long-lived worker node, local or relay-connected
 - `vibe relay dev` — dev relay with identity-based pairing and token auth

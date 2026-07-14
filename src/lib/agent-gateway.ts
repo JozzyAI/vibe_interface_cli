@@ -25,16 +25,18 @@ import crypto from 'crypto'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import type { AgentBackend, RunEvent } from '../types.js'
+import type { AgentBackend, RunEvent, RunRecord } from '../types.js'
 import { startRun, stopRun } from './run-actions.js'
 import { readRun } from '../store.js'
 import { readEvents } from '../events.js'
 import { isLoopbackHost } from './terminal-web.js'
+import { remoteRunStart, remoteStream, remoteRunStatus, remoteStop, fetchRemoteNodes } from '../relay/client.js'
+import { classifyRunError } from './run-error.js'
 import {
   TASK_CONTRACT_VERSION,
   runRecordToTask, runStatusToTaskStatus, runEventToTaskEvent,
   validateCreateTaskRequest, buildAgentDescriptors,
-  apiError, isTerminalTaskStatus,
+  apiError, runErrorToApiError, apiErrorHttpStatus, isTerminalTaskStatus,
   type Task, type TaskEvent, type TaskEventType, type ApiError,
 } from './agent-task-contract.js'
 
@@ -64,15 +66,25 @@ const EVENT_POLL_MS = 200
 interface GatewayTask {
   taskId: string
   agent: AgentBackend
+  mode: 'local' | 'remote'     // local mock (readEvents poller) vs remote node (remoteStream pump)
   events: TaskEvent[]          // bounded canonical buffer (for replay)
   nextSeq: number              // monotonic per-task sequence
-  emittedRunEvents: number     // count of RunEvents already mapped
+  emittedRunEvents: number     // count of RunEvents already mapped (local poller cursor)
   subscribers: Set<http.ServerResponse>
   terminal: boolean
   cancelInFlight: boolean      // guards against duplicate stop operations
-  poll?: NodeJS.Timeout
+  poll?: NodeJS.Timeout        // local event poller
+  abort?: AbortController      // remote remoteStream pump
+  pumpActive?: boolean         // a remoteStream pump is currently running
+  reconciling?: boolean        // a status-reconciliation loop is in flight
+  resumeCount?: number         // bounded pump resumes after transport give-up
+  lastRecord?: RunRecord       // last known authoritative remote projection
   completedAt?: number
 }
+
+const REMOTE_RECONCILE_ATTEMPTS = 3   // bounded remoteRunStatus checks on stream give-up
+const REMOTE_RECONCILE_BACKOFF_MS = 500
+const REMOTE_MAX_RESUMES = 3          // bounded pump resumes (never poll indefinitely)
 
 export interface GatewayServer {
   host: string
@@ -90,6 +102,11 @@ export interface AgentGatewayOptions {
   maxEventsPerTask?: number
   /** Override MAX_ACTIVE_TASKS (tests). */
   maxActiveTasks?: number
+  /** Relay ws URL — enables REMOTE agent execution (Claude Code / Codex on an
+   *  online node). When unset, the gateway is local/mock-only (as before). */
+  relay?: string
+  /** Resolved relay auth token VALUE (never logged). Required with `relay`. */
+  relayToken?: string
 }
 
 // ── auth ─────────────────────────────────────────────────────────────────────
@@ -169,6 +186,9 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   const maxRetained = opts.maxRetainedCompletedTasks ?? MAX_RETAINED_COMPLETED_TASKS
   const maxEvents = opts.maxEventsPerTask ?? MAX_EVENTS_PER_TASK
   const maxActive = opts.maxActiveTasks ?? MAX_ACTIVE_TASKS
+  const relay = opts.relay
+  const relayToken = opts.relayToken
+  const remoteEnabled = Boolean(relay && relayToken)
   const tasks = new Map<string, GatewayTask>()
   const completedOrder: string[] = [] // FIFO of terminal task ids for eviction
   // Active-task accounting. `activeCount` = registered non-terminal tasks;
@@ -206,6 +226,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     activeCount-- // frees one active slot (completion or cancellation)
     task.completedAt = Date.now()
     if (task.poll) { clearInterval(task.poll); task.poll = undefined }
+    if (task.abort) { try { task.abort.abort() } catch { /* ignore */ } task.abort = undefined }
     for (const res of task.subscribers) { try { res.end() } catch { /* already closed */ } }
     task.subscribers.clear()
     completedOrder.push(task.taskId)
@@ -216,16 +237,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     let all: RunEvent[]
     try { all = readEvents(task.taskId) } catch { return }
     for (let i = task.emittedRunEvents; i < all.length; i++) {
-      const te = runEventToTaskEvent(all[i], task.nextSeq)
-      if (te) {
-        task.nextSeq++
-        pushEvent(task, te)
-        if (te.type === 'task.completed' || te.type === 'task.failed' || te.type === 'task.cancelled') {
-          task.emittedRunEvents = i + 1
-          finishTask(task)
-          return
-        }
-      }
+      if (ingest(task, all[i])) { task.emittedRunEvents = i + 1; return }
     }
     task.emittedRunEvents = all.length
   }
@@ -234,6 +246,110 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     drain(task)
     if (task.terminal) return
     task.poll = setInterval(() => drain(task), EVENT_POLL_MS)
+  }
+
+  /** Emit exactly one canonical terminal event and finish the task. Guarded so
+   *  the stream pump and a GET-status reconciliation racing to the same terminal
+   *  state can never produce two terminal events. */
+  function finishWithTerminal(task: GatewayTask, ev: TaskEvent): void {
+    if (task.terminal) return
+    pushEvent(task, ev)
+    finishTask(task)
+  }
+
+  /** Emit one already-decoded RunEvent into a task's canonical stream. Shared by
+   *  the local poller (via drain) and the remote pump. Returns true if terminal. */
+  function ingest(task: GatewayTask, event: RunEvent): boolean {
+    if (task.terminal) return true
+    const te = runEventToTaskEvent(event, task.nextSeq)
+    if (!te) return false
+    task.nextSeq++
+    if (te.type === 'task.completed' || te.type === 'task.failed' || te.type === 'task.cancelled') {
+      finishWithTerminal(task, te)
+      return true
+    }
+    pushEvent(task, te)
+    return false
+  }
+
+  /**
+   * Fold an AUTHORITATIVE remote RunRecord into gateway state. Preserves terminal
+   * monotonicity (a terminal task never regresses) and, the FIRST time a record
+   * becomes terminal, emits exactly one matching canonical terminal event and
+   * finishes the task (freeing the slot, aborting the pump, closing subscribers,
+   * entering completed-retention). Tolerates repeated identical terminal records
+   * and stream/GET races. Used by GET, cancel, and stream give-up reconciliation.
+   */
+  function reconcileRemoteRecord(task: GatewayTask, record: RunRecord): void {
+    task.lastRecord = record
+    if (task.terminal) return
+    const status = runStatusToTaskStatus(record.status)
+    if (!isTerminalTaskStatus(status)) return
+    const type: TaskEventType = status === 'completed' ? 'task.completed' : status === 'failed' ? 'task.failed' : 'task.cancelled'
+    finishWithTerminal(task, synthEvent(task, type, {}))
+  }
+
+  /**
+   * Remote event source: subscribe to the node's run stream over the relay and
+   * feed each RunEvent into the same canonical buffer/subscribers. The relay does
+   * not buffer pre-subscribe events, so streaming begins at subscription (same as
+   * `vibe run stream`); GET (remoteRunStatus) stays authoritative. A transport
+   * give-up is NOT treated as a task failure (`emitDisconnectTerminal:false`) —
+   * instead it triggers bounded authoritative status reconciliation.
+   */
+  function startRemotePump(task: GatewayTask): void {
+    if (task.terminal || task.pumpActive) return
+    const abort = new AbortController()
+    task.abort = abort
+    task.pumpActive = true
+    void remoteStream(relay!, relayToken!, task.taskId, {
+      suppressStdout: true,
+      signal: abort.signal,
+      emitDisconnectTerminal: false, // a dropped transport is not a run result
+      onRunEvent: (event) => { if (!task.terminal) ingest(task, event) },
+      onGiveUp: () => { void reconcileViaStatus(task) },
+    })
+      .catch(() => { /* aborted/failed; terminal handled via ingest or reconcile */ })
+      .finally(() => { task.pumpActive = false })
+  }
+
+  /**
+   * After the stream gives up, discover the authoritative state with BOUNDED
+   * backoff (never poll indefinitely):
+   *   - terminal    -> reconcileRemoteRecord emits one terminal event + finishes;
+   *   - running/queued -> keep the task non-terminal and RESUME the live pump
+   *                       (bounded by REMOTE_MAX_RESUMES);
+   *   - node offline / relay unavailable -> preserve last known state, back off,
+   *     retry; after the bound, leave the task non-terminal with no live pump — a
+   *     later GET reconciles, and a new SSE subscriber resumes the pump.
+   */
+  async function reconcileViaStatus(task: GatewayTask): Promise<void> {
+    if (task.terminal || task.reconciling) return
+    task.reconciling = true
+    try {
+      for (let attempt = 0; attempt < REMOTE_RECONCILE_ATTEMPTS && !task.terminal; attempt++) {
+        try {
+          const record = await remoteRunStatus(relay!, relayToken!, task.taskId)
+          reconcileRemoteRecord(task, record)
+          if (task.terminal) return
+          if ((task.resumeCount ?? 0) < REMOTE_MAX_RESUMES) { task.resumeCount = (task.resumeCount ?? 0) + 1; startRemotePump(task) }
+          return
+        } catch {
+          await new Promise((r) => setTimeout(r, REMOTE_RECONCILE_BACKOFF_MS * (attempt + 1)))
+        }
+      }
+      // Bounded attempts exhausted: leave the task non-terminal (last known state
+      // preserved). GET returns the authoritative error; a new SSE subscriber
+      // (handleEvents) restarts the pump.
+    } finally { task.reconciling = false }
+  }
+
+  /** Map a caught remote-run error to a canonical ApiError + HTTP status. */
+  function remoteApiError(err: unknown, taskId?: string): { error: ApiError; status: number } {
+    const code = classifyRunError(err)
+    const message = err instanceof Error ? err.message : String(err)
+    const error = runErrorToApiError(code, message, taskId ? { task_id: taskId } : {})
+    return { error, status: apiErrorHttpStatus(error.code) }
   }
 
   // ── route handlers ─────────────────────────────────────────────────────────
@@ -252,57 +368,113 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     if (!v.ok) return sendError(res, v.error, 400)
     const reqv = v.value
 
-    if (reqv.node_id && reqv.node_id !== 'local' && reqv.node_id !== 'auto') {
-      return sendError(res, apiError('invalid_request', 'remote node execution is not available on this local gateway (deferred); omit node_id to run locally', { details: { node_id: reqv.node_id } }), 400)
+    // A concrete node_id routes to a REMOTE node; local/auto/absent runs the mock
+    // agent locally. Remote execution requires the gateway to be relay-configured.
+    const isRemote = Boolean(reqv.node_id && reqv.node_id !== 'local' && reqv.node_id !== 'auto')
+    if (isRemote && !remoteEnabled) {
+      return sendError(res, apiError('invalid_request', 'remote node execution requires a relay-configured gateway (start `vibe api serve` with --relay / a connect profile); omit node_id to run the local mock', { details: { node_id: reqv.node_id } }), 400)
     }
-    if (!GATEWAY_LOCAL_AGENTS.includes(reqv.agent)) {
-      return sendError(res, apiError('agent_unavailable', `agent "${reqv.agent}" is not available on this local gateway (only: ${GATEWAY_LOCAL_AGENTS.join(', ')})`), 422)
+    if (!isRemote && !GATEWAY_LOCAL_AGENTS.includes(reqv.agent)) {
+      return sendError(res, apiError('agent_unavailable', `agent "${reqv.agent}" is not available for local execution (only: ${GATEWAY_LOCAL_AGENTS.join(', ')}); target a remote node with node_id for other agents`), 422)
     }
+    // Remote agent validity is enforced by the target node (agent_not_supported).
 
     // Active-task cap. Count + reserve atomically (this block has no await), so
     // concurrent creates cannot exceed the cap. Existing tasks are NOT evicted.
     if (activeCount + pendingCreates >= maxActive) {
       return sendError(res, apiError('service_unavailable', `too many active tasks (limit ${maxActive}); retry once a task completes`), 503)
     }
-    pendingCreates++ // reservation held until the task registers or startRun fails
+    pendingCreates++ // reservation held until the task registers or start fails
+    const release = (): void => { pendingCreates-- }
 
-    // Prompt text -> a private temp file (startRun takes a prompt-file path).
+    // Remote preflight: ENCRYPTED execution is mandatory. Fetch the registry, require
+    // the node online + advertising the agent, and obtain its encryption key. The
+    // preflight is advisory (can race), so authoritative start errors are still
+    // mapped below. NEVER fall back to a plaintext run_start.
+    let encryptionPublicKey: string | undefined
+    if (isRemote) {
+      let nodes
+      try { nodes = await fetchRemoteNodes(relay!, relayToken!) }
+      catch (err) { release(); const m = remoteApiError(err, undefined); return sendError(res, m.error, m.status) }
+      const node = nodes.find((n) => n.node_id === reqv.node_id)
+      if (!node || node.status !== 'online') { release(); return sendError(res, apiError('node_offline', `node ${reqv.node_id} is offline or unknown`, { details: { node_id: reqv.node_id } }), 503) }
+      if (!Array.isArray(node.agents) || !node.agents.includes(reqv.agent)) { release(); return sendError(res, apiError('agent_unavailable', `node ${reqv.node_id} does not advertise agent "${reqv.agent}"`, { details: { node_id: reqv.node_id } }), 422) }
+      if (!node.encryption_public_key) { release(); return sendError(res, apiError('service_unavailable', `secure remote execution unavailable: node ${reqv.node_id} advertises no encryption key`, { retryable: false, details: { node_id: reqv.node_id } }), 503) }
+      encryptionPublicKey = node.encryption_public_key
+    }
+
+    // Prompt text -> a private temp file (both startRun and remoteRunStart take a
+    // prompt-file path; remoteRunStart reads it and sends the ENCRYPTED content).
     const promptFile = path.join(os.tmpdir(), `vibe-api-prompt-${crypto.randomBytes(8).toString('hex')}.txt`)
     fs.writeFileSync(promptFile, reqv.input.text, { mode: 0o600 })
 
-    let record
+    let record: RunRecord
+    let started = false
+    const mode: 'local' | 'remote' = isRemote ? 'remote' : 'local'
     try {
-      // agent === 'mock' and node 'local' are guaranteed here, so startRun cannot
-      // hit its process.exit error paths (unsupported agent / unresolved node).
-      record = await startRun({
-        agent: reqv.agent as AgentBackend,
-        node: 'local',
-        promptFile,
-        workspaceKey: reqv.workspace?.workspace_key,
-        permissionMode: reqv.execution?.permission_mode,
-        extraMetadata: reqv.metadata,
-      })
+      if (isRemote) {
+        record = await remoteRunStart(relay!, relayToken!, reqv.node_id!, {
+          agent: reqv.agent as AgentBackend,
+          promptFile,
+          workspaceKey: reqv.workspace?.workspace_key,
+          // repo_url/branch are DEFERRED in Gateway v1 (rejected at validation) —
+          // the node does not clone/prepare a repo before the backend starts.
+          permissionMode: reqv.execution?.permission_mode,
+          metadata: reqv.metadata,
+          encryptionPublicKey, // mandatory — run_start payload is encrypted for the node
+        })
+      } else {
+        // agent === 'mock' and node 'local' are guaranteed here, so startRun cannot
+        // hit its process.exit error paths (unsupported agent / unresolved node).
+        record = await startRun({
+          agent: reqv.agent as AgentBackend,
+          node: 'local',
+          promptFile,
+          workspaceKey: reqv.workspace?.workspace_key,
+          permissionMode: reqv.execution?.permission_mode,
+          extraMetadata: reqv.metadata,
+        })
+      }
+      started = true
     } catch (err) {
-      pendingCreates-- // release the reserved slot; the task never registered
+      release() // release the reserved slot; the task never registered
+      if (isRemote) { const m = remoteApiError(err); return sendError(res, m.error, m.status) }
       return sendError(res, apiError('internal_error', `failed to start task: ${(err as Error).message}`), 500)
+    } finally {
+      // Remote: remoteRunStart has already read + encrypted the prompt, so the
+      // plaintext temp file is no longer needed — remove it. Local: the detached
+      // supervisor may read prompt_file AFTER start (the run owns it), so keep it
+      // on success and remove it only if start failed.
+      if (isRemote || !started) { try { fs.unlinkSync(promptFile) } catch { /* best effort */ } }
     }
 
     const task: GatewayTask = {
-      taskId: record.run_id, agent: record.agent, events: [], nextSeq: 0,
+      taskId: record.run_id, agent: record.agent, mode, events: [], nextSeq: 0,
       emittedRunEvents: 0, subscribers: new Set(), terminal: false, cancelInFlight: false,
     }
     tasks.set(task.taskId, task)
     pendingCreates-- // reservation becomes a live active task
     activeCount++
     pushEvent(task, synthEvent(task, 'task.created', { agent: record.agent }))
-    startPoll(task)
+    if (mode === 'remote') startRemotePump(task); else startPoll(task)
     sendJson(res, 202, runRecordToTask(record))
   }
 
-  function handleGet(res: http.ServerResponse, taskId: string): void {
-    if (!tasks.has(taskId)) return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
-    let record
-    try { record = readRun(taskId) } catch { return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404) }
+  async function handleGet(res: http.ServerResponse, taskId: string): Promise<void> {
+    const task = tasks.get(taskId)
+    if (!task) return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    let record: RunRecord
+    try {
+      record = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, taskId) : readRun(taskId)
+    } catch (err) {
+      // Node offline / relay unavailable: preserve last known state and surface
+      // the structured error (do NOT mark the task terminal).
+      if (task.mode === 'remote') { const m = remoteApiError(err, taskId); return sendError(res, m.error, m.status) }
+      return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    }
+    // Authoritative GET may be the first to observe a terminal state — fold it in
+    // (emits one terminal event, frees the slot, stops the pump) exactly once.
+    if (task.mode === 'remote') reconcileRemoteRecord(task, record)
     sendJson(res, 200, runRecordToTask(record))
   }
 
@@ -331,16 +503,24 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
     if (task.terminal) { res.end(); return } // terminal already delivered above
     task.subscribers.add(res)
+    // A remote task whose transport gave up has no live pump; a new subscriber
+    // resumes it (the relay doesn't replay, so live events flow from here on).
+    if (task.mode === 'remote' && !task.pumpActive) startRemotePump(task)
     // Disconnecting a subscriber must NOT cancel the task — just prune the listener.
     req.on('close', () => { task.subscribers.delete(res) })
   }
 
-  function handleCancel(res: http.ServerResponse, taskId: string): void {
+  async function handleCancel(res: http.ServerResponse, taskId: string): Promise<void> {
     const task = tasks.get(taskId)
     if (!task) return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
 
-    let record
-    try { record = readRun(taskId) } catch { return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404) }
+    let record: RunRecord
+    try {
+      record = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, taskId) : readRun(taskId)
+    } catch (err) {
+      if (task.mode === 'remote') { const m = remoteApiError(err, taskId); return sendError(res, m.error, m.status) }
+      return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    }
 
     // Already terminal (completed/failed/cancelled): return the existing task
     // unchanged — cancellation is idempotent and never re-stops.
@@ -350,20 +530,48 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
     task.cancelInFlight = true // guard against concurrent duplicate stop operations
     try {
-      const stopped = stopRun(taskId)
-      drain(task) // process the terminal event now: frees the active slot + notifies subscribers promptly
-      sendJson(res, 200, runRecordToTask(stopped))
-    } catch {
+      if (task.mode === 'remote') {
+        const stopped = await remoteStop(relay!, relayToken!, taskId)
+        // Reconcile the authoritative stopped record NOW — do not rely on the event
+        // pump to deliver the stopped event (it may be lost). This emits the one
+        // terminal event and frees the active slot even if the stream never sees it.
+        reconcileRemoteRecord(task, stopped)
+        sendJson(res, 200, runRecordToTask(stopped))
+      } else {
+        const stopped = stopRun(taskId)
+        drain(task) // process the terminal event now: frees the active slot + notifies subscribers promptly
+        sendJson(res, 200, runRecordToTask(stopped))
+      }
+    } catch (err) {
       // Lost a race to a terminal transition — return the current projection.
-      try { sendJson(res, 200, runRecordToTask(readRun(taskId))) }
-      catch { sendError(res, apiError('internal_error', 'failed to cancel task'), 500) }
+      try {
+        const cur = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, taskId) : readRun(taskId)
+        sendJson(res, 200, runRecordToTask(cur))
+      } catch {
+        if (task.mode === 'remote') { const m = remoteApiError(err, taskId); sendError(res, m.error, m.status) }
+        else sendError(res, apiError('internal_error', 'failed to cancel task'), 500)
+      }
     } finally {
       task.cancelInFlight = false
     }
   }
 
-  function handleAgents(res: http.ServerResponse): void {
-    sendJson(res, 200, { agents: buildAgentDescriptors([...GATEWAY_LOCAL_AGENTS]) })
+  async function handleAgents(res: http.ServerResponse): Promise<void> {
+    // Local mock is always available. When relay-configured, also list agents
+    // advertised by ONLINE remote nodes (best-effort; relay hiccups never fail
+    // this endpoint — they just omit remote agents).
+    const descriptors = buildAgentDescriptors([...GATEWAY_LOCAL_AGENTS])
+    if (remoteEnabled) {
+      try {
+        const nodes = await fetchRemoteNodes(relay!, relayToken!)
+        for (const node of nodes) {
+          if (node.status === 'online' && Array.isArray(node.agents)) {
+            descriptors.push(...buildAgentDescriptors(node.agents, { node_id: node.node_id }))
+          }
+        }
+      } catch { /* relay unreachable — return local agents only */ }
+    }
+    sendJson(res, 200, { agents: descriptors })
   }
 
   // ── server ──────────────────────────────────────────────────────────────────
@@ -381,7 +589,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         // /v1/agents
         if (parts.length === 2 && parts[0] === 'v1' && parts[1] === 'agents') {
           if (method !== 'GET') return methodNotAllowed(res, ['GET'])
-          return handleAgents(res)
+          return await handleAgents(res)
         }
         // /v1/tasks
         if (parts.length === 2 && parts[0] === 'v1' && parts[1] === 'tasks') {
@@ -394,7 +602,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           if (!taskId) return sendError(res, apiError('invalid_request', 'missing task id'), 400)
           if (parts.length === 3) {
             if (method !== 'GET') return methodNotAllowed(res, ['GET'])
-            return handleGet(res, taskId)
+            return await handleGet(res, taskId)
           }
           if (parts.length === 4 && parts[3] === 'events') {
             if (method !== 'GET') return methodNotAllowed(res, ['GET'])
@@ -402,7 +610,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           }
           if (parts.length === 4 && parts[3] === 'cancel') {
             if (method !== 'POST') return methodNotAllowed(res, ['POST'])
-            return handleCancel(res, taskId)
+            return await handleCancel(res, taskId)
           }
         }
         sendError(res, apiError('task_not_found', 'not found'), 404)
@@ -440,6 +648,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           clearInterval(heartbeat)
           for (const task of tasks.values()) {
             if (task.poll) { clearInterval(task.poll); task.poll = undefined }
+            if (task.abort) { try { task.abort.abort() } catch { /* ignore */ } task.abort = undefined }
             for (const sres of task.subscribers) { try { sres.end() } catch { /* ignore */ } }
             task.subscribers.clear()
           }

@@ -169,6 +169,37 @@ test('POST /v1/tasks validation: invalid body, arrays, unsupported agent, remote
   assert.equal(remote.status, 400); assert.equal(remote.body.code, 'invalid_request')
 })
 
+test('request semantics: deferred/unsafe fields fail CLOSED at the HTTP layer before any start', async () => {
+  const bad: Record<string, unknown>[] = [
+    { agent: 'mock', input: { text: 'x' }, workspace: { path: '/etc/passwd' } },        // deferred
+    { agent: 'mock', input: { text: 'x' }, workspace: { repo_url: 'https://secret/r.git' } }, // deferred
+    { agent: 'mock', input: { text: 'x' }, workspace: { branch: 'topsecret' } },         // deferred
+    { agent: 'mock', input: { text: 'x' }, execution: { timeout_seconds: 30 } },         // deferred
+    { agent: 'mock', input: { text: 'x' }, workspace: { workspace_key: '../escape' } },  // traversal
+    { agent: 'mock', input: { text: 'x' }, workspace: { workspace_key: '/abs/path' } },  // absolute
+    { agent: 'mock', input: { text: 'x' }, workspace: { workspace_key: 'a' + String.fromCharCode(92) + 'b' } }, // backslash
+    { agent: 'mock', input: { text: 'x' }, workspace: { workspace_key: 'x'.repeat(200) } }, // oversized
+  ]
+  for (const body of bad) {
+    const r = await jreq('POST', '/v1/tasks', { body: JSON.stringify(body) })
+    assert.equal(r.status, 400, `reject ${JSON.stringify(body).slice(0, 60)}`)
+    assert.equal(r.body.code, 'invalid_request')
+    assert.ok(!r.body.task_id, 'no task created')
+    assert.ok(!JSON.stringify(r.body).includes('secret') && !JSON.stringify(r.body).includes('/etc/passwd'), 'no submitted value echoed')
+  }
+  // a safe opaque workspace_key is accepted
+  assert.equal((await createTask({ workspace: { workspace_key: 'safe.key-1' } })).status, 202)
+
+  // no-start proof: a rejected request must NOT consume an active-cap slot
+  const capped = await startAgentGateway({ host: '127.0.0.1', port: 0, apiToken: TOKEN, maxActiveTasks: 1 })
+  try {
+    const rej = await jreq('POST', '/v1/tasks', { port: capped.port, body: JSON.stringify({ agent: 'mock', input: { text: 'x' }, workspace: { workspace_key: '/bad' } }) })
+    assert.equal(rej.status, 400)
+    const good = await jreq('POST', '/v1/tasks', { port: capped.port, body: JSON.stringify({ agent: 'mock', input: { text: 'x' } }) })
+    assert.equal(good.status, 202, 'the rejected request did not consume the single active slot (no start occurred)')
+  } finally { await capped.close() }
+})
+
 test('GET unknown task -> 404 task_not_found', async () => {
   const r = await jreq('GET', '/v1/tasks/run_does_not_exist')
   assert.equal(r.status, 404); assert.equal(r.body.code, 'task_not_found')

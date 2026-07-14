@@ -40,6 +40,31 @@ or any `*_aes_key`.
 }
 ```
 
+**Gateway v1 supported fields** (everything else **fails closed** — see below):
+
+- `agent` (required)
+- `node_id` (optional)
+- `input.text` (required)
+- `workspace.workspace_key` (optional; an **opaque** key, matched against
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` — **not** a filesystem path; omit it and the
+  runtime generates its own)
+- `execution.permission_mode` (`default` | `unsafe-skip`)
+- `metadata`
+
+**Reserved / deferred fields (rejected with `invalid_request` / 400):**
+`workspace.path`, `workspace.repo_url`, `workspace.branch`,
+`execution.timeout_seconds`. These have no runtime implementation in v1
+(`workspace.path` is unmapped; `timeout_seconds` has no structured runtime;
+local execution passes no repo, and the remote node records `repo_url`/`branch`
+but does not clone/prepare a repo before starting the backend). The API
+**fails closed** — it rejects these rather than silently ignoring them — and the
+error **never echoes** the submitted path/URL/branch/timeout or an unsafe
+`workspace_key`.
+
+> Follow-up: the remote node should enforce workspace-root containment for **all**
+> relay clients (not just Agent Gateway callers); the gateway `workspace_key`
+> validation here is defense in depth.
+
 Deliberately **excluded** for the MVP arc: approvals, follow-up messages,
 artifacts, file transfer, multi-user ownership.
 
@@ -131,10 +156,12 @@ service_unavailable`); `apiErrorHttpStatus` suggests a REST status per code.
 
 ## Local gateway (`vibe api serve`)
 
-The first working implementation of this contract is a **local HTTP gateway**
-over the existing run lifecycle. It runs the **mock agent on the local node
-only** — remote Claude Code / Codex execution over the relay is deferred to a
-later PR, and a concrete `node_id` in a request is rejected.
+The first working implementation of this contract is an **HTTP gateway** over the
+existing run lifecycle. It runs the **mock agent on the local node**, and — when
+started relay-configured — executes **Claude Code / Codex on an online remote Vibe
+Node** by reusing the existing `vibe run` remote contract (`remoteRunStart`,
+`remoteStream`, `remoteRunStatus`, `remoteStop`). No second remote protocol is
+introduced.
 
 ### Start it
 
@@ -245,12 +272,64 @@ SSE event history. Concretely:
   `vibe run status/stream` continue to work against them.
 - **Durable gateway recovery is deferred** to a later PR.
 
+### Remote execution (Claude Code / Codex on a remote node)
+
+Start the gateway **relay-configured** to enable remote execution — relay URL and
+token come from flags, `VIBE_RELAY_TOKEN`, or the connect profile (`vibe connect`):
+
+```bash
+vibe api serve --host 127.0.0.1 --port 8787 \
+  --relay ws://192.168.1.89:7433 --relay-token-file ~/.config/vibe/relay-token
+```
+
+- The **relay token is separate** from the API bearer token (`--token-file`) and
+  is never printed.
+- **Target a node** by passing `node_id` in `POST /v1/tasks` (and any `agent` the
+  node advertises — e.g. `claude-code`, `codex`). The mapping is:
+  `POST /v1/tasks` → `remoteRunStart`; SSE ← `remoteStream` (fed into the same
+  buffer/subscriber/replay machinery); `GET /v1/tasks/:id` → `remoteRunStatus`
+  (authoritative); `POST …/cancel` → `remoteStop`. All later calls route by
+  `task_id` (== `run_id`) over the relay.
+- `GET /v1/agents` lists **local mock** plus the agents advertised by each
+  **online** remote node (each with its `node_id`); a relay hiccup simply omits
+  remote agents (the endpoint never hard-fails).
+- **Errors** are the canonical remote-run errors mapped to `ApiError`:
+  offline/unknown node → `node_offline`/503, unknown run → `task_not_found`/404,
+  bad token → `unauthorized`/401, agent not advertised → `agent_unavailable`/422,
+  relay unreachable → `service_unavailable`/503.
+- **Subscribe gap:** the relay does not buffer pre-subscribe events, so remote SSE
+  begins at subscription (same as `vibe run stream`); `GET /v1/tasks/:id` remains
+  authoritative for the terminal state. Without `--relay`, a concrete `node_id` is
+  rejected (`invalid_request`) and the gateway is local/mock-only.
+
+**Encrypted execution is mandatory.** Before starting a remote task the gateway
+runs a preflight against the node registry: the node must be **online**, must
+**advertise the requested agent**, and must expose an **`encryption_public_key`**.
+The `run_start` payload (prompt, workspace key, permission mode, metadata) is then
+**encrypted** for that node — the relay only ever sees ciphertext. There is **no
+plaintext fallback**: a node without an encryption key is rejected
+(`service_unavailable`, non-retryable). The preflight is advisory (it can race), so
+authoritative start errors are still mapped. The controller-side temporary prompt
+file is deleted immediately after the (encrypted) start; local mock tasks leave the
+prompt file for the run to own (mock/dev only).
+
+**Transport failure ≠ task failure.** If the event stream cannot be re-established,
+the gateway does **not** fabricate a terminal status (unlike the CLI default). It
+reconciles the **authoritative** status (`remoteRunStatus`) with bounded backoff:
+completed/failed/cancelled → one canonical terminal event (emitted exactly once);
+still running → the task stays non-terminal and the pump resumes (a later SSE
+subscriber also resumes it); node offline / relay down → the last known state is
+preserved and `node_offline` / `service_unavailable` is surfaced on status/cancel.
+`GET`, a successful `cancel`, and stream terminal events all fold through one
+`reconcileRemoteRecord` that preserves terminal monotonicity (a terminal task never
+regresses) and never emits two terminal events.
+
 ### Scope
 
-Local **mock** agent only. Remote Vibe Node execution (Claude Code / Codex over
-the relay) is **deferred to the next PR**. No browser UI, cookies, approvals,
-follow-up messages, artifacts, persistence, multi-user accounts, or public
-internet exposure.
+No browser UI, cookies, approvals, follow-up messages, artifacts, persistence,
+multi-user accounts, or public internet exposure. Auth, SSE, retention,
+cancellation, HTTP behavior, and the active-task cap are shared by the local and
+remote paths.
 
 ## Boundary (important)
 

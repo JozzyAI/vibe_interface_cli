@@ -188,18 +188,30 @@ export interface CreateTaskRequest {
   agent: string
   node_id?: string
   input: { text: string }
+  // Gateway v1 honours only `workspace.workspace_key` and
+  // `execution.permission_mode`. Other workspace/execution fields
+  // (path/repo_url/branch, timeout_seconds) are DEFERRED and FAIL CLOSED —
+  // validateCreateTaskRequest rejects them rather than silently dropping them.
   workspace?: {
-    path?: string
-    repo_url?: string
-    branch?: string
     workspace_key?: string
   }
   execution?: {
     permission_mode?: PermissionMode
-    timeout_seconds?: number
   }
   metadata?: Record<string, unknown>
 }
+
+/**
+ * Opaque workspace key: an identifier the runtime uses to key a run's workspace —
+ * NOT a filesystem path. Must start alphanumeric, then alphanumeric/`.`/`_`/`-`,
+ * max 128 chars. This rejects `/`, `\`, absolute paths, leading-`.` (so `.`/`..`
+ * and traversal), control characters, empty, and oversized keys.
+ */
+export const WORKSPACE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+/** Workspace/execution fields recognised but DEFERRED in Gateway v1 (fail closed). */
+const DEFERRED_WORKSPACE_FIELDS = ['path', 'repo_url', 'branch'] as const
+const DEFERRED_EXECUTION_FIELDS = ['timeout_seconds'] as const
 
 /**
  * True only for a real JSON object — rejects `null`, arrays, and primitives.
@@ -232,11 +244,12 @@ export function validateCreateTaskRequest(
   if (b.execution !== undefined) {
     if (!isPlainObject(b.execution)) return fail('`execution` must be an object')
     exec = b.execution
+    // Fail closed on deferred execution fields (no runtime implementation in v1).
+    for (const f of DEFERRED_EXECUTION_FIELDS) {
+      if (exec[f] !== undefined) return fail(`\`execution.${f}\` is not supported by Agent Gateway v1 (reserved/deferred)`)
+    }
     if (exec.permission_mode !== undefined && exec.permission_mode !== 'default' && exec.permission_mode !== 'unsafe-skip') {
       return fail('`execution.permission_mode` must be "default" or "unsafe-skip"')
-    }
-    if (exec.timeout_seconds !== undefined && (typeof exec.timeout_seconds !== 'number' || !Number.isInteger(exec.timeout_seconds) || exec.timeout_seconds <= 0)) {
-      return fail('`execution.timeout_seconds` must be a positive integer')
     }
   }
 
@@ -244,23 +257,25 @@ export function validateCreateTaskRequest(
   if (b.workspace !== undefined) {
     if (!isPlainObject(b.workspace)) return fail('`workspace` must be an object')
     workspace = b.workspace
+    // Fail closed on deferred workspace fields (not mapped to execution in v1).
+    for (const f of DEFERRED_WORKSPACE_FIELDS) {
+      if (workspace[f] !== undefined) return fail(`\`workspace.${f}\` is not supported by Agent Gateway v1 (reserved/deferred)`)
+    }
+    // workspace_key must be an opaque safe key — never a path. The submitted value
+    // is NEVER echoed back in the error (defense in depth against traversal).
+    if (workspace.workspace_key !== undefined) {
+      if (typeof workspace.workspace_key !== 'string' || !WORKSPACE_KEY_RE.test(workspace.workspace_key)) {
+        return fail('`workspace.workspace_key` must be an opaque key matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ (not a path)')
+      }
+    }
   }
 
   if (b.metadata !== undefined && !isPlainObject(b.metadata)) return fail('`metadata` must be an object')
 
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }
   if (typeof b.node_id === 'string') value.node_id = b.node_id
-  if (workspace) {
-    value.workspace = {}
-    for (const k of ['path', 'repo_url', 'branch', 'workspace_key'] as const) {
-      if (typeof workspace[k] === 'string') value.workspace[k] = workspace[k] as string
-    }
-  }
-  if (exec) {
-    value.execution = {}
-    if (exec.permission_mode) value.execution.permission_mode = exec.permission_mode as PermissionMode
-    if (exec.timeout_seconds) value.execution.timeout_seconds = exec.timeout_seconds as number
-  }
+  if (workspace && typeof workspace.workspace_key === 'string') value.workspace = { workspace_key: workspace.workspace_key }
+  if (exec && exec.permission_mode) value.execution = { permission_mode: exec.permission_mode as PermissionMode }
   if (isPlainObject(b.metadata)) value.metadata = b.metadata
   return { ok: true, value }
 }
