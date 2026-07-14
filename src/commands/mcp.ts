@@ -10,8 +10,8 @@
  */
 import { Command } from 'commander'
 import path from 'path'
-import { createRequire } from 'module'
 import { vibeDir } from '../config.js'
+import { readPackageVersion } from '../lib/pkg-version.js'
 import { GatewayClient, readGatewayToken, isLoopbackGatewayUrl } from '../mcp/gateway-client.js'
 import { runStdioMcpServer } from '../mcp/server.js'
 
@@ -21,11 +21,6 @@ function fail(code: string, message: string): never {
   // stderr only — stdout is reserved for MCP protocol messages.
   process.stderr.write(`error: ${code}: ${message}\n`)
   process.exit(1)
-}
-
-function serverVersion(): string {
-  try { return (createRequire(import.meta.url)('../../package.json') as { version?: string }).version ?? '0.0.0' }
-  catch { return '0.0.0' }
 }
 
 export function registerMcpCommand(program: Command): void {
@@ -51,6 +46,6 @@ export function registerMcpCommand(program: Command): void {
 
       const client = new GatewayClient(opts.gatewayUrl, tok.token)
       process.stderr.write(`vibe mcp: serving MCP over stdio -> Agent Gateway ${opts.gatewayUrl} (token from ${tokenPath}). Diagnostics on stderr; MCP protocol on stdout.\n`)
-      runStdioMcpServer(client, serverVersion())
+      runStdioMcpServer(client, readPackageVersion())
     })
 }
