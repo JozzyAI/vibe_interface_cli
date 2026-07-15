@@ -203,6 +203,9 @@ class ThrowingStore implements GatewayTaskStore {
   latestTaskEventSequence(id: string) { return this.inner.latestTaskEventSequence(id) }
   markTaskHistoryIncomplete(id: string, reason: string, b: number) { return this.inner.markTaskHistoryIncomplete(id, reason, b) }
   clearTaskHistoryIncomplete(id: string) { return this.inner.clearTaskHistoryIncomplete(id) }
+  initReplayCursor(id: string) { return this.inner.initReplayCursor(id) }
+  ingestSourceEventDurable(id: string, s: number, e: Parameters<GatewayTaskStore['ingestSourceEventDurable']>[2]) { return this.inner.ingestSourceEventDurable(id, s, e) }
+  advanceSourceCursor(id: string, s: number) { return this.inner.advanceSourceCursor(id, s) }
   closeSync() { this.inner.closeSync() }
 }
 

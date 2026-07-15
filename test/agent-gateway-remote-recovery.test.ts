@@ -103,13 +103,10 @@ test('remote task recovers across a Gateway restart: same id, reconcile, termina
     assert.equal(recovered.body.status, 'running', 'authoritative remote status is running')
     // recovered running task holds the only active slot
     assert.equal((await reqRaw(gw.port, 'POST', '/v1/tasks', { agent: 'mock', node_id: NODE_ID, input: { text: 'x' } })).status, 503)
-    // resuming a remote pump without node replay marks history incomplete at the boundary
-    await delay(300)
-    const recH = store.getTaskRecord(id)
-    assert.equal(recH?.history_incomplete, true)
-    assert.equal(recH?.history_reason, 'gateway_restart_without_node_replay')
-    assert.equal(recH?.history_boundary_sequence, cursorBefore)
-    assert.equal(recovered.body.history === undefined || recovered.body.history.complete !== undefined, true)
+    // Replay-capable recovery: the Gateway resumes from the durable source cursor
+    // and replays missing NODE source events (untruncated journal), so verified
+    // catch-up CLEARS incompleteness — asserted after completion below.
+    void cursorBefore
 
     // replay boundary: events after Last-Event-ID replay from durable, future live
     // events continue, with no gap/duplicate at the boundary
@@ -119,6 +116,11 @@ test('remote task recovers across a Gateway restart: same id, reconcile, termina
 
     const done = await waitStatus(gw.port, id, 'completed')
     assert.equal(done.status, 'completed')
+    // verified gap-free replay catch-up cleared the incomplete marker → complete
+    let complete = false
+    for (let i = 0; i < 40 && !complete; i++) { complete = store.getTaskRecord(id)?.history_incomplete === false; if (!complete) await delay(150) }
+    assert.ok(complete, 'replay catch-up cleared history_incomplete (history complete)')
+    assert.equal((await reqRaw(gw.port, 'GET', `/v1/tasks/${id}`)).body.history?.complete, true)
     // terminal recorded exactly once, durably
     assert.equal(store.getTaskRecord(id)?.terminal_event_recorded, true)
     const terminals = store.loadTaskEvents(id).filter((e) => ['task.completed', 'task.failed', 'task.cancelled'].includes(e.event_type))

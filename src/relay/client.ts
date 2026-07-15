@@ -1115,6 +1115,15 @@ export interface RemoteStreamControl {
    *  consumer trigger authoritative status reconciliation without treating the
    *  transport drop as a terminal run result. */
   onGiveUp?: (reason: string) => void
+  /** NODE source cursor for journaled replay (run_event_replay_v1). When set, the
+   *  subscribe carries `after_sequence`; the node serves replay+live via
+   *  run_replay_event (source_sequence). NOT a Gateway task cursor. */
+  afterSequence?: number
+  /** Called once with the node's ReplayMetadata (before any replay event). */
+  onReplayMeta?: (meta: Record<string, unknown> | null) => void
+  /** Called for each replay/live source event with its NODE source_sequence
+   *  (encrypted runs are decrypted first). Used instead of onRunEvent in replay mode. */
+  onSourceEvent?: (event: RunEvent, sourceSequence: number) => void
 }
 
 /** Outcome of a single subscriber connection attempt. */
@@ -1211,6 +1220,7 @@ export async function remoteStream(
       sendMsg(ws, {
         version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(),
         type: 'run_stream_subscribe', run_id: runId,
+        ...(control?.afterSequence !== undefined ? { after_sequence: control.afterSequence } : {}),
       })
       // Keep-alive: a half-open socket never fires 'close'. If the previous ping
       // went unanswered, terminate so the reconnect loop takes over.
@@ -1243,6 +1253,22 @@ export async function remoteStream(
           } catch (err) {
             process.stderr.write(`[vibe] failed to decrypt event: ${(err as Error).message}\n`)
           }
+        } else if (msg.type === 'run_replay_meta' && (msg as { run_id?: string }).run_id === runId) {
+          try { control?.onReplayMeta?.((msg as { metadata: Record<string, unknown> | null }).metadata) } catch { /* consumer error must not kill the stream */ }
+        } else if (msg.type === 'run_replay_event' && (msg as { run_id?: string }).run_id === runId) {
+          // Journaled replay/live event with its NODE source_sequence. Encrypted runs
+          // arrive as an `encrypted` envelope — decrypt with the run event key; the
+          // relay never saw plaintext.
+          const rm = msg as { source_sequence: number; event?: RunEvent; encrypted?: { nonce: string; ciphertext: string } }
+          let ev: RunEvent | undefined = rm.event
+          if (!ev && rm.encrypted) {
+            if (!eventAesKey) { process.stderr.write('[vibe] received encrypted run_replay_event but run has no local event key\n'); return }
+            try { ev = decryptEvent(eventAesKey, rm.encrypted) as RunEvent } catch (err) { process.stderr.write(`[vibe] failed to decrypt replay event: ${(err as Error).message}\n`); return }
+          }
+          if (!ev) return
+          try { control?.onSourceEvent?.(ev, rm.source_sequence) } catch { /* consumer error must not kill the stream */ }
+          if (!control?.suppressStdout) safeWrite(JSON.stringify(ev) + '\n')
+          if (isTerminal(ev)) { try { ws.close() } catch { /* ignore */ } ; finish({ kind: 'terminal' }) }
         } else if (msg.type === 'relay_error') {
           try { ws.terminate() } catch { /* ignore */ }
           finish({ kind: 'fatal', reason: `${msg.code}: ${msg.message}` })

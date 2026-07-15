@@ -76,10 +76,16 @@ export interface TaskRecord {
   history_reason: string | null
   /** Greatest sequence durably consumed BEFORE the known-missing interval. */
   history_boundary_sequence: number | null
+  /** Greatest durably-mapped NODE source cursor: NULL = unknown, -1 = known but
+   *  nothing consumed, >=0 = a real source sequence. NOT the Gateway task cursor. */
+  last_remote_event_sequence: number | null
 }
 
 /** Stable reason codes for an incomplete persisted event history. */
-export type HistoryIncompleteReason = 'gateway_restart_without_node_replay'
+export type HistoryIncompleteReason =
+  | 'gateway_restart_without_node_replay'
+  | 'remote_source_cursor_unknown'
+  | 'node_journal_truncated'
 
 export interface CreateTaskInput {
   task_id: string
@@ -110,6 +116,9 @@ export interface TaskEventInput {
   event_type: string
   ts: string
   payload: unknown
+  /** Optional NODE source sequence this canonical event maps to (NULL for
+   *  Gateway-generated / non-Node events). Unique per task when present. */
+  source_sequence?: number | null
 }
 
 export interface TaskEventRecord extends TaskEventInput { task_id: string; created_at: string }

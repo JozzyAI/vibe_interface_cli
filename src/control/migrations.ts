@@ -110,7 +110,20 @@ ALTER TABLE tasks ADD COLUMN history_reason TEXT;
 ALTER TABLE tasks ADD COLUMN history_boundary_sequence INTEGER;
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }]
+/** Schema v3 — Gateway ⇄ Node source-event replay. `last_remote_event_sequence`
+ *  is the greatest durably-mapped NODE source cursor (NULL = unknown, -1 = known
+ *  but nothing consumed, >=0 = a real cursor). `source_sequence` maps a persisted
+ *  canonical task event to its NODE source sequence (NULL for Gateway-generated /
+ *  non-Node events). The partial unique index enforces one canonical event per
+ *  (task, source_sequence). Additive only — v1/v2 are never rewritten. NODE source
+ *  sequence and Gateway TaskEvent sequence remain DISTINCT domains. */
+const V3 = `
+ALTER TABLE tasks ADD COLUMN last_remote_event_sequence INTEGER;
+ALTER TABLE task_events ADD COLUMN source_sequence INTEGER;
+CREATE UNIQUE INDEX idx_task_events_source ON task_events(task_id, source_sequence) WHERE source_sequence IS NOT NULL;
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
