@@ -200,6 +200,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" $BASE/v1/tasks/$TASK/cancel
 - **MCP:** `vibe mcp serve` exposes the gateway as MCP tools for local hosts (Claude Desktop, Cursor) — a pure HTTP client of the gateway: see [`docs/mcp-server.md`](docs/mcp-server.md). Host setup (Claude Code, Cursor), the seven-tool reference, and the recommended run/wait/resume workflow: [`docs/mcp-client-integrations.md`](docs/mcp-client-integrations.md).
 - **Workflow contract (v1):** a declarative, JSON-first multi-agent workflow spec (e.g. a Codex-planner → Claude-Code-executor → Codex-review loop) — types + a pure validator only, no runtime yet: see [`docs/workflow-contract.md`](docs/workflow-contract.md).
 - **Durable control store:** a local SQLite (`better-sqlite3`, WAL) persistence layer for tasks/events and workflow/execution state — foundation only, not yet wired into the running gateway: see [`docs/durable-control-store.md`](docs/durable-control-store.md).
+- **Node run event journal:** a durable, Node-local SQLite journal of remote-run events (append-before-publish) so a Node captures output without a Gateway attached and a reconnecting client can resume via a Node `after_sequence` cursor — distinct from the Gateway task-event domain: see [`docs/node-run-journal.md`](docs/node-run-journal.md).
 
 ## Backends
 

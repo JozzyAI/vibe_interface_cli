@@ -17,6 +17,22 @@ import { codexBackend } from '../backends/codex.js'
 import { resolveAgents, resolveAdvertisedAgents } from '../agent-registry.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
+import { openNodeJournal } from '../node-journal/sqlite-journal.js'
+import { RUN_EVENT_REPLAY_CAPABILITY } from '../node-journal/contract.js'
+import { isIsoUtc as journalIsoOk, nowIso as journalNowIso } from '../node-journal/serialization.js'
+import type { NodeJournal } from '../node-journal/store.js'
+
+/** Node-local durable run-event journal (opened once per daemon; journal-BEFORE-
+ *  publish for remote run events). Undefined when unavailable — the node then
+ *  streams live-only (backward-compatible), never silently in-memory-journaling. */
+let nodeJournal: NodeJournal | undefined
+/** run_id → event AES key for ENCRYPTED runs, so journaled replay can be
+ *  re-encrypted (the relay/journal never see plaintext for an encrypted run). */
+const runEventKeys = new Map<string, string>()
+/** subscriber_ref → open journal replay subscription (for run_replay_close). */
+const replaySubs = new Map<string, { close(): void }>()
+/** Status implied by a RunEvent, for journal run metadata. */
+function journalStatusOf(ev: RunEvent): string | undefined { return ev.type === 'status' ? (ev as { status?: string }).status : undefined }
 import type { RelayMessage, RunStartMsg, RunStopRequestMsg, RunStatusRequestMsg, EncryptedRunStartMsg, EncryptedRunEventMsg, EncryptedRunStopRequestMsg, EncryptedRunStopAckMsg, EncryptedApprovalResponseMsg, EncryptedApprovalResponseAckMsg, RunStartPayload, RunStopPayload, RunStopAckPayload, ApprovalResponsePayload, ApprovalResponseAckPayload } from './types.js'
 import { ensureIdentity, toPublicIdentity, type IdentityFile } from '../identity.js'
 import { signEnvelope, encryptPayload, decryptPayload, deriveRunEventKey, deriveRunStopKey, deriveApprovalKey, encryptEvent, decryptEvent, type EnvelopeSignature } from '../crypto.js'
@@ -81,6 +97,9 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   }
 
   const runId = generateRunId()
+  // Remember the run's event key (encrypted runs) so journaled replay can be
+  // re-encrypted per subscriber; cleared when the run's tailer finishes.
+  if (eventAesKey) runEventKeys.set(runId, eventAesKey)
   // The node is the filesystem trust boundary for every relay client. Contain the
   // (untrusted) workspace_key within workspace_root BEFORE creating any directory,
   // writing the run record, or starting a backend. Omitting the key uses the safe
@@ -262,6 +281,15 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
         for (const line of lines) {
           try {
             const event = JSON.parse(line) as RunEvent
+            // Journal BEFORE publish: durably append the NODE source event (the
+            // journal assigns the contiguous per-run sequence), THEN send with that
+            // source_sequence. On a journal failure do NOT publish an un-replayable
+            // event (skip it).
+            let sourceSeq: number | undefined
+            if (nodeJournal) {
+              try { sourceSeq = nodeJournal.append(runId, { type: event.type, timestamp: journalIsoOk(event.ts) ? event.ts : journalNowIso(), payload: event, terminal: isTerminal(event), status: journalStatusOf(event) }).sequence }
+              catch { continue }
+            }
             if (eventAesKey) {
               // MVP 4C: encrypt event payload — relay sees only routing metadata.
               const enc = encryptEvent(eventAesKey, event)
@@ -281,6 +309,7 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
               sendMsg(ws, {
                 version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
                 type: 'run_event', run_id: runId, event,
+                ...(sourceSeq !== undefined ? { source_sequence: sourceSeq } : {}),
               })
             }
             if (isTerminal(event)) {
@@ -348,6 +377,10 @@ export async function relayNodeDaemon(
   // per-connection buildNode and risking a reconnect busy-loop.
   const advertisedAgents = resolveAdvertisedAgents(advertiseAgents)
 
+  // Open the node-local run-event journal ONCE. On any open failure the node runs
+  // live-only (no in-memory fallback) and does not advertise the replay capability.
+  try { nodeJournal = openNodeJournal() } catch { nodeJournal = undefined }
+
   // Terminal session CREATION opt-in (default OFF). Creating a session spawns a
   // login shell on this node, so the operator must explicitly enable it via
   // VIBE_TERMINAL_ALLOW_CREATE=1 (or `vibe node daemon --allow-terminal-create`,
@@ -368,7 +401,9 @@ export async function relayNodeDaemon(
     name: identity?.display_name ?? os.hostname(),
     status: 'online',
     transport: 'relay',
-    capabilities: ['run', 'stream', 'stop', 'workspace'],
+    // Advertise journaled replay only when the journal actually opened, so a
+    // client can detect replay support (absence ⇒ live-only, older behavior).
+    capabilities: nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY] : ['run', 'stream', 'stop', 'workspace'],
     agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
@@ -388,6 +423,7 @@ export async function relayNodeDaemon(
   const requestStop = (): void => {
     stopped = true
     if (activeWs) { try { activeWs.close() } catch { /* ignore */ } }
+    try { nodeJournal?.close() } catch { /* ignore */ } finally { nodeJournal = undefined }
   }
   if (control?.signal) {
     if (control.signal.aborted) stopped = true
@@ -534,6 +570,37 @@ export async function relayNodeDaemon(
               error: err.message, code: 'internal_error',
             })
           })
+        } else if (msg.type === 'run_replay_open') {
+          // Journaled replay (run_event_replay_v1): serve THIS subscriber replay+live
+          // race-free from the node journal. Events for an ENCRYPTED run are
+          // re-encrypted with the run's event key (never plaintext over the relay).
+          // Failures are sanitized: a null metadata, no path/SQL/token/stack.
+          const rid = (msg as { run_id: string }).run_id
+          const subRef = (msg as { subscriber_ref: string }).subscriber_ref
+          const afterSeq = (msg as { after_sequence?: number }).after_sequence ?? -1
+          if (!nodeJournal) { sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_replay_meta', run_id: rid, subscriber_ref: subRef, metadata: null }); }
+          else {
+            try {
+              const key = runEventKeys.get(rid)
+              const sub = nodeJournal.subscribe(rid, {
+                afterSequence: Number.isInteger(afterSeq) ? afterSeq : -1,
+                onEstablished: (meta) => sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_replay_meta', run_id: rid, subscriber_ref: subRef, metadata: meta as unknown as Record<string, unknown> }),
+                onEvent: (jev) => {
+                  const rev = jev.payload as RunEvent
+                  // A plaintext ROUTING envelope; for an encrypted run the `encrypted`
+                  // sub-field carries the ciphertext (relay never decrypts).
+                  const base = { version: 1 as const, kind: 'plaintext' as const, from: nodeId, to: 'relay', ts: t(), type: 'run_replay_event' as const, run_id: rid, subscriber_ref: subRef, source_sequence: jev.sequence }
+                  if (key) { const enc = encryptEvent(key, rev); sendMsg(ws, { ...base, encrypted: { nonce: enc.nonce, ciphertext: enc.ciphertext } }) }
+                  else sendMsg(ws, { ...base, event: rev })
+                },
+                onOverflow: () => { replaySubs.delete(subRef) },
+              })
+              replaySubs.set(subRef, sub)
+            } catch { sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_replay_meta', run_id: rid, subscriber_ref: subRef, metadata: null }) }
+          }
+        } else if (msg.type === 'run_replay_close') {
+          const subRef = (msg as { subscriber_ref: string }).subscriber_ref
+          try { replaySubs.get(subRef)?.close() } catch { /* ignore */ } finally { replaySubs.delete(subRef) }
         } else if (rawKind === 'encrypted' && (msg as { type?: string }).type === 'encrypted_approval_response') {
           const enc = msg as EncryptedApprovalResponseMsg
           handleEncryptedApprovalResponse(ws, nodeId, enc).catch((err: Error) => {
