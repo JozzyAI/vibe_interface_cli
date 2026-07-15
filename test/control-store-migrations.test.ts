@@ -9,7 +9,7 @@ import os from 'os'
 import path from 'path'
 import Database from 'better-sqlite3'
 import { openControlStore } from '../src/control/sqlite-store.js'
-import { runMigrations, LATEST_SCHEMA_VERSION } from '../src/control/migrations.js'
+import { runMigrations, MIGRATIONS, LATEST_SCHEMA_VERSION } from '../src/control/migrations.js'
 import { ControlStoreError } from '../src/control/records.js'
 
 const tmpDbPath = (): string => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ctl-mig-')), 'control.sqlite')
@@ -31,6 +31,32 @@ test('data survives close + reopen (migrate no-op)', async () => {
   s = openControlStore({ path: p }) // reopen re-runs migrate() as a no-op
   assert.equal((await s.getTask('run_1'))?.agent, 'mock')
   await s.close()
+})
+
+test('v4 (idempotency) migration is additive: existing v1-v3 task/event data is preserved', () => {
+  const p = tmpDbPath()
+  // Build a DB at schema v3 by applying ONLY migrations 1..3, then seed data.
+  const raw = new Database(p)
+  raw.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)')
+  for (const m of MIGRATIONS.filter((x) => x.version <= 3)) {
+    raw.transaction(() => { raw.exec(m.sql); raw.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)').run(m.version, new Date().toISOString()) })()
+  }
+  const now = new Date().toISOString()
+  raw.prepare(`INSERT INTO tasks (task_id,revision,agent,status,created_at,updated_at,last_event_sequence,earliest_retained_sequence,terminal_event_recorded)
+    VALUES ('run_old',1,'mock','completed',?,?,0,0,1)`).run(now, now)
+  raw.prepare(`INSERT INTO task_events (task_id,sequence,event_type,ts,payload_json,created_at) VALUES ('run_old',0,'task.created',?,'{}',?)`).run(now, now)
+  raw.close()
+  // Now upgrade to LATEST (adds v4) — pre-existing rows must survive untouched.
+  const s = openControlStore({ path: p })
+  const rec = s.getTaskRecord('run_old')
+  assert.equal(rec?.status, 'completed')
+  assert.equal(rec?.idempotency_key, null)         // new column defaults NULL for legacy rows
+  assert.equal(rec?.request_fingerprint, null)
+  assert.equal(s.loadTaskEvents('run_old').length, 1) // event history intact
+  s.closeSync()
+  const raw2 = new Database(p)
+  assert.equal((raw2.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v, LATEST_SCHEMA_VERSION)
+  raw2.close()
 })
 
 test('unknown NEWER schema version fails closed', async () => {

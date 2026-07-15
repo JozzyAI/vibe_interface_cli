@@ -62,9 +62,12 @@ explicit transactions.
   `permission_mode?`, `status`, `remote_run_id?` (internal), `input_text?`
   (bounded canonical input), `metadata_json`, timestamps, `terminal_at?`,
   `last_event_sequence`, `earliest_retained_sequence`, `terminal_event_recorded`,
-  `error_code?`, `error_message?` (sanitized).
+  `error_code?`, `error_message?` (sanitized), `last_remote_event_sequence?` (v3
+  Node source cursor), `idempotency_key?` + `request_fingerprint?` (v4; unique per
+  non-null key).
 - **task_events** — (`task_id`,`sequence`) pk, `event_type`, `ts`,
-  `payload_json`, FK→tasks (cascade). Append-only.
+  `payload_json`, `source_sequence?` (v3; unique per task when set), FK→tasks
+  (cascade). Append-only.
 - **workflows** — `workflow_id` (pk), `revision`, `spec_version`,
   `workflow_name`, `spec_json` (the exact validated `WorkflowSpec`), `status`,
   `current_step_id?`, `current_round`, `total_tasks`, `total_failures`,
@@ -171,8 +174,61 @@ failing migration rolls back and records no version. A DB reporting a **newer**
 schema version than supported **fails closed** (`unsupported_schema_version`);
 there is no destructive downgrade. Corrupt schema metadata returns a structured
 `corruption` error. **Schema v2** adds the task event-history completeness columns
-(`history_incomplete`, `history_reason`, `history_boundary_sequence`) as an
-additive `ALTER TABLE … ADD COLUMN` migration — v1 is never rewritten.
+(`history_incomplete`, `history_reason`, `history_boundary_sequence`); **schema v3**
+adds the Node source-replay columns (`tasks.last_remote_event_sequence`,
+`task_events.source_sequence` + a partial unique index); **schema v4** adds the
+idempotent-creation columns (`tasks.idempotency_key`, `tasks.request_fingerprint`
++ a partial unique index on non-null `idempotency_key`). Every version is an
+additive `ALTER TABLE … ADD COLUMN` (+ index) migration — earlier versions are
+never rewritten, and legacy rows keep `NULL` in the new columns.
+
+## Idempotent task creation (schema v4)
+
+A caller may supply an **`idempotency_key`** on task creation. Retrying the same
+creation request with the same key returns the **same durable task** instead of
+starting a second Claude Code / Codex / mock run. The intended future caller is
+the WorkflowRuntime, which will pass a step's stable **`step_execution_id`** as
+the key so a re-driven step never double-executes.
+
+- **Key** — an optional, bounded, ASCII-safe identifier (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`,
+  ≤128 chars, no whitespace/control/path-separators/Unicode). It is a first-class
+  validated request field (never hidden in metadata). It is **not** the public
+  `task_id`, **not** a credential, and is **never** forwarded to the relay, node,
+  or backend. A malformed key is `invalid_request` (400), not an internal error.
+- **Request fingerprint** — a deterministic SHA-256 over the *normalized semantic*
+  request (agent, node_id, `input.text`, `workspace.workspace_key`,
+  `execution.permission_mode`, metadata), **excluding the key itself**. It is a
+  bounded digest — **not** a second copy of the prompt — and the canonical input,
+  prompt, and fingerprint input are never logged.
+- **Create-or-return** — `createTaskIdempotently(input, createdEvent)` runs in one
+  transaction: look up the key; if absent, create the durable task + `task.created`
+  and return `created:true`; if present with the **same** fingerprint, return the
+  existing task `created:false` (no second task, event, run, or active slot); if
+  present with a **different** fingerprint, throw `idempotency_conflict` → the API
+  returns **409** `idempotency_conflict` (without echoing either request, the
+  fingerprints, DB paths, SQL, or stack traces). Only the `created:true` caller may
+  start execution.
+- **Concurrency** — the partial unique index on `idempotency_key` is the **final
+  authority**. Two same-key requests across two Gateway process/store connections
+  resolve to exactly one durable task and exactly one `created:true`; the loser
+  reads and returns the existing task. This is not a JS in-memory mutex — SQLite
+  uniqueness (and a constraint-violation retry that re-reads the winner) enforces
+  it. An in-process pre-check only reduces contention; it is not the correctness
+  mechanism.
+- **Active-slot behavior** — an idempotent **replay is checked before allocating a
+  slot**, so replaying an existing running task succeeds even when the active-task
+  limit is full and consumes no additional slot; a terminal replay consumes none.
+  Only a genuinely new key/request is subject to the normal capacity check.
+- **Crash windows** — a lost response after a successful create/start, a Gateway
+  crash after durable creation but before remote start (recovery rules apply; an
+  unbound remote start stays an ambiguous, never-restarted recovery), and a crash
+  after remote start but before `remote_run_id` binding all resolve on retry with
+  the same key to the **same** durable task with **no** second run. A request that
+  never reached the Gateway creates the task normally on retry.
+- **Retention / key reuse** — the key stays **reserved while the task record is
+  retained**. Retention never deletes an active task, so an active task's key is
+  never released. When explicit retention permanently deletes a terminal task, its
+  key becomes reusable. There is no separate eternal idempotency ledger.
 
 ## Gateway wiring & restart recovery
 

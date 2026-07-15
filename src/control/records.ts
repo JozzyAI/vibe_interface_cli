@@ -20,6 +20,7 @@ export type ControlStoreErrorCode =
   | 'too_large'
   | 'forbidden_field'
   | 'unsupported_schema_version'
+  | 'idempotency_conflict'
   | 'closed'
 
 /** Structured store error. `code` is stable; `message` never echoes payloads. */
@@ -79,6 +80,13 @@ export interface TaskRecord {
   /** Greatest durably-mapped NODE source cursor: NULL = unknown, -1 = known but
    *  nothing consumed, >=0 = a real source sequence. NOT the Gateway task cursor. */
   last_remote_event_sequence: number | null
+  /** OPTIONAL client-supplied idempotency key (unique per non-null value). NOT the
+   *  public task_id, NOT a credential, NOT a remote run id. */
+  idempotency_key: string | null
+  /** Deterministic digest of the normalized semantic request (excludes the key
+   *  itself; never the raw prompt). Detects a same-key request whose meaning
+   *  changed. */
+  request_fingerprint: string | null
 }
 
 /** Stable reason codes for an incomplete persisted event history. */
@@ -97,6 +105,9 @@ export interface CreateTaskInput {
   remote_run_id?: string | null
   input_text?: string | null
   metadata?: Record<string, unknown> | null
+  /** Set ONLY through createTaskIdempotently. Non-idempotent creates leave both NULL. */
+  idempotency_key?: string | null
+  request_fingerprint?: string | null
 }
 
 /** Mutable task fields (identity fields are intentionally absent — immutable). */

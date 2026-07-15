@@ -34,7 +34,7 @@ test('create + reopen preserves task and workflow records', async () => {
 test('WAL + foreign_keys + busy_timeout enabled; healthCheck reports schema version', async () => {
   const s = openControlStore({ path: tmpDbPath() })
   const h = await s.healthCheck()
-  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 3)
+  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 4)
   assert.equal(h.busy_timeout, 5000) // default bounded busy timeout
   const s2 = openControlStore({ path: tmpDbPath(), busyTimeoutMs: 1234 })
   assert.equal((await s2.healthCheck()).busy_timeout, 1234) // configurable
@@ -257,6 +257,60 @@ test('source-event ingestion: cursor init, atomic map, idempotent/conflict/gap, 
   // canonical events carry source_sequence; canonical seq != source seq
   const evs = s.loadTaskEvents('run_1')
   assert.deepEqual(evs.map((e) => e.sequence), [0, 1, 2, 3]) // Gateway sequences
+  await s.close()
+})
+
+test('createTaskIdempotently: create-or-return, conflict, uniqueness across connections, retention release', async () => {
+  const p = tmpDbPath()
+  let s = openControlStore({ path: p })
+  const mk = (taskId: string, fp: string, over: Record<string, unknown> = {}) =>
+    ({ task_id: taskId, agent: 'mock', status: 'running', idempotency_key: 'step:abc-1', request_fingerprint: fp, ...over })
+  const created = { sequence: 0, event_type: 'task.created', ts: iso(), payload: {} }
+  // new key → created
+  const r1 = s.createTaskIdempotently(mk('run_a', 'fp-1'), created)
+  assert.equal(r1.created, true); assert.equal(r1.record.task_id, 'run_a'); assert.equal(r1.record.idempotency_key, 'step:abc-1')
+  // same key + same fingerprint → the SAME task, created=false, NO second task/event
+  const r2 = s.createTaskIdempotently(mk('run_b', 'fp-1'), created)
+  assert.equal(r2.created, false); assert.equal(r2.record.task_id, 'run_a')
+  assert.equal(s.getTaskRecord('run_b'), null) // the losing task_id was never inserted
+  assert.equal(s.loadTaskEvents('run_a').length, 1) // exactly one task.created
+  // same key + DIFFERENT fingerprint → conflict (never echoes the request)
+  assert.equal(await code(async () => s.createTaskIdempotently(mk('run_c', 'fp-2'), created)), 'idempotency_conflict')
+  // read-only pre-check
+  assert.equal(s.getTaskByIdempotencyKey('step:abc-1')?.task_id, 'run_a')
+  assert.equal(s.getTaskByIdempotencyKey('nope'), null)
+  // key + fingerprint survive close/reopen; uniqueness persists
+  await s.close(); s = openControlStore({ path: p })
+  assert.equal(s.getTaskByIdempotencyKey('step:abc-1')?.request_fingerprint, 'fp-1')
+  assert.equal(s.createTaskIdempotently(mk('run_d', 'fp-1'), created).record.task_id, 'run_a') // still deduped after restart
+  // legacy/non-idempotent tasks have NULL idempotency fields
+  await s.createTask({ task_id: 'run_legacy', agent: 'mock', status: 'running' })
+  assert.equal(s.getTaskRecord('run_legacy')?.idempotency_key, null)
+  assert.equal(s.getTaskRecord('run_legacy')?.request_fingerprint, null)
+
+  // SQLite uniqueness is the final authority across a SECOND connection.
+  const s2 = openControlStore({ path: p })
+  assert.equal(s2.createTaskIdempotently(mk('run_e', 'fp-1'), created).created, false) // sees the durable winner
+  assert.equal(s2.getTaskByIdempotencyKey('step:abc-1')?.task_id, 'run_a')
+  s2.closeSync()
+
+  // retention deletion of the task releases the key for reuse; active tasks are safe.
+  await s.updateTask('run_a', s.getTaskRecord('run_a')!.revision, { status: 'completed', terminal_at: iso() })
+  await s.deleteTask('run_a')
+  assert.equal(s.getTaskByIdempotencyKey('step:abc-1'), null) // key released once the task is gone
+  const reuse = s.createTaskIdempotently(mk('run_f', 'fp-9'), created)
+  assert.equal(reuse.created, true); assert.equal(reuse.record.task_id, 'run_f') // key reusable after deletion
+  await s.close()
+})
+
+test('createTaskIdempotently validates the key and fingerprint (bounded before DB writes)', async () => {
+  const s = openControlStore({ path: tmpDbPath() })
+  const ev = { sequence: 0, event_type: 'task.created', ts: iso(), payload: {} }
+  const base = { task_id: 'run_1', agent: 'mock', status: 'running' as const }
+  assert.equal(await code(async () => s.createTaskIdempotently({ ...base, request_fingerprint: 'fp' }, ev)), 'invalid_record') // missing key
+  assert.equal(await code(async () => s.createTaskIdempotently({ ...base, idempotency_key: 'bad key', request_fingerprint: 'fp' }, ev)), 'invalid_record') // whitespace
+  assert.equal(await code(async () => s.createTaskIdempotently({ ...base, idempotency_key: 'a/b', request_fingerprint: 'fp' }, ev)), 'invalid_record') // path sep
+  assert.equal(await code(async () => s.createTaskIdempotently({ ...base, idempotency_key: 'ok', request_fingerprint: '' }, ev)), 'invalid_record') // empty fingerprint
   await s.close()
 })
 

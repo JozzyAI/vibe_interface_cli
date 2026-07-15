@@ -23,6 +23,22 @@ import type {
 export interface GatewayTaskStore {
   /** Atomically persist a new task record + its `task.created` event. */
   createTaskDurable(input: CreateTaskInput, createdEvent: TaskEventInput): TaskRecord
+  /** Look up a durable task by its client-supplied idempotency key (null if none).
+   *  A read-only pre-check so an idempotent REPLAY can be served WITHOUT reserving
+   *  an active slot. */
+  getTaskByIdempotencyKey(key: string): TaskRecord | null
+  /**
+   * Atomic create-or-return keyed by `input.idempotency_key` (which MUST be set).
+   * In ONE transaction: look up the key; if absent, create the durable task +
+   * `task.created` and return `{ created: true }`; if present with the SAME
+   * `request_fingerprint`, return the existing task `{ created: false }` WITHOUT a
+   * second task or event. A present key with a DIFFERENT fingerprint throws
+   * `idempotency_conflict`. SQLite's partial unique index is the FINAL authority —
+   * a concurrent cross-connection insert of the same key resolves to `created:false`
+   * (or a conflict), never two durable tasks. Only the `created:true` caller may
+   * start execution.
+   */
+  createTaskIdempotently(input: CreateTaskInput, createdEvent: TaskEventInput): { record: TaskRecord; created: boolean }
   /** Append an accepted canonical event (idempotent/gap-checked) BEFORE publish. */
   appendTaskEventDurable(taskId: string, event: TaskEventInput): void
   updateTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch): TaskRecord
