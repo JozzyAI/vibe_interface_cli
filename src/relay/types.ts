@@ -217,6 +217,48 @@ export interface NodeListRequestMsg extends RelayMsgBase {
 export interface RunStreamSubscribeMsg extends RelayMsgBase {
   type: 'run_stream_subscribe'
   run_id: string
+  /** OPTIONAL NODE source cursor (domain 1) for journaled replay: return only
+   *  events with NODE sequence > after_sequence (-1 = from 0). Absent ⇒ the
+   *  existing live-only behavior (backward-compatible). NEVER a Gateway task
+   *  cursor. Honored only when the owning Node advertises run_event_replay_v1. */
+  after_sequence?: number
+}
+
+// ── journaled replay (run_event_replay_v1): per-subscriber replay→live ────────
+// The relay forwards run_replay_open to the owning node and routes the node's
+// run_replay_meta / run_replay_event back to the requesting subscriber by
+// subscriber_ref; such a subscriber is EXCLUDED from the general run_event
+// fan-out (it receives replay+live via run_replay_event instead).
+
+export interface RunReplayOpenMsg extends RelayMsgBase {
+  type: 'run_replay_open'
+  run_id: string
+  after_sequence: number
+  subscriber_ref: string
+}
+export interface RunReplayCloseMsg extends RelayMsgBase {
+  type: 'run_replay_close'
+  run_id: string
+  subscriber_ref: string
+}
+export interface RunReplayMetaMsg extends RelayMsgBase {
+  type: 'run_replay_meta'
+  run_id: string
+  subscriber_ref: string
+  /** ReplayMetadata (earliest_retained_sequence, latest_sequence,
+   *  history_complete_for_request, status, terminal, replay_capability), or null
+   *  when replay is unavailable for this run. */
+  metadata: Record<string, unknown> | null
+}
+export interface RunReplayEventMsg extends RelayMsgBase {
+  type: 'run_replay_event'
+  run_id: string
+  subscriber_ref: string
+  /** NODE source sequence of this event (domain 1). */
+  source_sequence: number
+  /** Plaintext event (plaintext runs), OR an encrypted envelope (encrypted runs). */
+  event?: RunEvent
+  encrypted?: { nonce: string; ciphertext: string }
 }
 
 // ── cli → relay → node daemon ──────────────────────────────────────────────
@@ -257,6 +299,9 @@ export interface RunEventMsg extends RelayMsgBase {
   type: 'run_event'
   run_id: string
   event: RunEvent
+  /** OPTIONAL NODE source sequence (domain 1) assigned by the node journal.
+   *  Additive — older subscribers ignore it. NOT the Gateway task sequence. */
+  source_sequence?: number
 }
 
 export interface RunStopAckMsg extends RelayMsgBase {
@@ -411,6 +456,10 @@ export type RelayMessage =
   | RunStopRequestMsg
   | RunStatusRequestMsg
   | RunEventMsg
+  | RunReplayOpenMsg
+  | RunReplayCloseMsg
+  | RunReplayMetaMsg
+  | RunReplayEventMsg
   | NodeRegisterAckMsg
   | NodeHeartbeatAckMsg
   | NodeListResponseMsg

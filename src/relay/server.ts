@@ -96,6 +96,12 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const runOwnership = new Map<string, string>()
     // run_id → set of subscriber ws, for streaming run events to CLI clients
     const subscribers = new Map<string, Set<WebSocket>>()
+    // subscriber_ref → { requesting subscriber ws, run_id } for JOURNALED REPLAY
+    // subscribers (run_event_replay_v1). Such a subscriber is served replay+live
+    // via run_replay_event routed by ref, and is EXCLUDED from the run_event
+    // fan-out set above (so it never receives an event twice).
+    const replayRefs = new Map<string, { ws: WebSocket; runId: string }>()
+    let replaySeq = 0
     // session_id → set of gateway ws, for fanning terminal_output/error/open_ack
     // back to the terminal gateway. Kept separate from `subscribers` (run events)
     // for this skeleton. Relay never inspects/logs terminal payload `data`.
@@ -335,6 +341,19 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
           }
 
           case 'run_stream_subscribe': {
+            const afterSeq = (msg as { after_sequence?: number }).after_sequence
+            const ownerId = runOwnership.get(msg.run_id)
+            const owner = ownerId ? registry.get(ownerId) : undefined
+            if (afterSeq !== undefined && owner) {
+              // JOURNALED REPLAY: serve this subscriber via the owning node's
+              // journal (replay→live), routed by subscriber_ref. It is NOT added to
+              // the run_event fan-out set (avoids double delivery).
+              const ref = `sr_${Date.now().toString(36)}_${(replaySeq++).toString(36)}`
+              replayRefs.set(ref, { ws, runId: msg.run_id })
+              sendMsg(ws, { version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(), type: 'run_stream_subscribe_ack', run_id: msg.run_id, ok: true })
+              sendMsg(owner.ws, { version: 1, kind: 'plaintext', from: 'relay', to: ownerId!, ts: now(), type: 'run_replay_open', run_id: msg.run_id, after_sequence: afterSeq, subscriber_ref: ref })
+              break
+            }
             const subs = subscribers.get(msg.run_id) ?? new Set<WebSocket>()
             subs.add(ws)
             subscribers.set(msg.run_id, subs)
@@ -350,6 +369,15 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             if (subs) {
               for (const sub of subs) sendMsg(sub, msg)
             }
+            break
+          }
+
+          // Node → relay → replay subscriber: route by subscriber_ref (the relay
+          // never reads/decrypts the event payload).
+          case 'run_replay_meta':
+          case 'run_replay_event': {
+            const ref = replayRefs.get((msg as { subscriber_ref: string }).subscriber_ref)
+            if (ref) sendMsg(ref.ws, msg)
             break
           }
 
@@ -550,6 +578,15 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         for (const [runId, subs] of subscribers) {
           subs.delete(ws)
           if (subs.size === 0) subscribers.delete(runId)
+        }
+        // A disconnecting REPLAY subscriber: tell the owning node to close its
+        // journal subscription (capture continues; the run is never cancelled).
+        for (const [ref, entry] of replayRefs) {
+          if (entry.ws !== ws) continue
+          const ownerId = runOwnership.get(entry.runId)
+          const owner = ownerId ? registry.get(ownerId) : undefined
+          if (owner) sendMsg(owner.ws, { version: 1, kind: 'plaintext', from: 'relay', to: ownerId!, ts: now(), type: 'run_replay_close', run_id: entry.runId, subscriber_ref: ref })
+          replayRefs.delete(ref)
         }
         for (const [sid, subs] of terminalSubscribers) {
           subs.delete(ws)
