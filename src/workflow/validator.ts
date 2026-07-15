@@ -8,7 +8,7 @@
  */
 import {
   KNOWN_SPEC_FIELDS, LIMIT_MAXIMA, SAFE_ID_RE, NODE_ID_RE, TERMINAL_TARGETS,
-  MAX_ENUM_VALUES, MAX_ENUM_VALUE_LENGTH, CONTEXT_FIELDS,
+  MAX_ENUM_VALUES, MAX_ENUM_VALUE_LENGTH, CONTEXT_FIELDS, CONTEXT_GROUPS,
   isTerminalTarget,
   type ContextGroup, type WorkflowInputType, type SchemaFieldType,
 } from './contract.js'
@@ -125,7 +125,7 @@ export function validateWorkflowSpec(input: unknown): ValidationResult {
   const agentRoles = validateAgents(spec.agents, err)
   const inputTypes = validateInputs(spec.inputs, err)
   const { schemaNames, schemaFields, schemaFieldDefs } = validateOutputSchemas(spec.output_schemas, err)
-  const { stepIds, stepOutputSchema } = validateSteps(spec.steps, agentRoles, schemaNames, err)
+  const { stepIds, stepOutputSchema } = validateSteps(spec.steps, agentRoles, schemaNames, schemaFieldDefs, err)
 
   if (!isStr(spec.entry_step) || !stepIds.has(spec.entry_step)) err('unknown_entry_step', 'entry_step must reference an existing step id', '/entry_step')
 
@@ -228,7 +228,23 @@ function validateEnumValues(en: unknown, path: string, err: Err): void {
 
 // ── steps ──────────────────────────────────────────────────────────────────────
 
-function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set<string>, err: Err): { stepIds: Set<string>; stepOutputSchema: Map<string, string> } {
+/** Structural compatibility of a bound step's output schema with a destination
+ *  context slot: every declared output field must belong to the destination shape,
+ *  and the core `status` + `summary` fields must be present and required (so a
+ *  successful output can always replace the slot deterministically). */
+function checkContextBindingCompat(group: ContextGroup, schemaName: string | undefined, defs: Map<string, FieldDef> | undefined, path: string, err: Err): void {
+  const allowed = CONTEXT_FIELDS[group]
+  if (!schemaName || !defs) return // an unknown schema is already reported elsewhere
+  for (const fname of defs.keys()) {
+    if (!allowed.includes(fname)) err('context_binding_incompatible_schema', `output field "${fname}" is not part of context.${group}; bound output schema must be structurally compatible`, path)
+  }
+  for (const core of ['status', 'summary']) {
+    const d = defs.get(core)
+    if (!d || !d.required) err('context_binding_incompatible_schema', `context.${group} binding requires a required "${core}" output field`, path)
+  }
+}
+
+function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set<string>, schemaFieldDefs: Map<string, Map<string, FieldDef>>, err: Err): { stepIds: Set<string>; stepOutputSchema: Map<string, string> } {
   const stepIds = new Set<string>()
   const stepOutputSchema = new Map<string, string>()
   if (!Array.isArray(steps) || steps.length === 0) { err('steps_missing', 'steps must be a non-empty array', '/steps'); return { stepIds, stepOutputSchema } }
@@ -245,9 +261,13 @@ function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set
     if (step.permission_mode !== undefined && step.permission_mode !== 'default' && step.permission_mode !== 'unsafe-skip') err('bad_permission_mode', 'permission_mode must be "default" or "unsafe-skip"', `${p}/permission_mode`)
     if (!isStr(step.prompt_template)) err('bad_prompt_template', 'prompt_template must be a string', `${p}/prompt_template`)
     if (step.workspace_key_template !== undefined && !isStr(step.workspace_key_template)) err('bad_workspace_key_template', 'workspace_key_template must be a string', `${p}/workspace_key_template`)
+    if (step.context_binding !== undefined) {
+      if (!isStr(step.context_binding) || !CONTEXT_GROUPS.includes(step.context_binding as ContextGroup)) err('bad_context_binding', `context_binding must be one of: ${CONTEXT_GROUPS.join(', ')}`, `${p}/context_binding`)
+      else if (isStr(step.output_schema)) checkContextBindingCompat(step.context_binding as ContextGroup, step.output_schema, schemaFieldDefs.get(step.output_schema), `${p}/context_binding`, err)
+    }
     if (step.label !== undefined && !isStr(step.label)) err('bad_field_type', 'step.label must be a string', `${p}/label`)
     if (step.description !== undefined && !isStr(step.description)) err('bad_field_type', 'step.description must be a string', `${p}/description`)
-    for (const k of Object.keys(step)) if (!['id', 'type', 'agent_role', 'prompt_template', 'output_schema', 'permission_mode', 'workspace_key_template', 'label', 'description'].includes(k)) err('step_unknown_field', `unknown step field: ${k}`, `${p}/${k}`)
+    for (const k of Object.keys(step)) if (!['id', 'type', 'agent_role', 'prompt_template', 'output_schema', 'permission_mode', 'workspace_key_template', 'context_binding', 'label', 'description'].includes(k)) err('step_unknown_field', `unknown step field: ${k}`, `${p}/${k}`)
   })
   return { stepIds, stepOutputSchema }
 }

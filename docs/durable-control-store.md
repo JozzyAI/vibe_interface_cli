@@ -72,7 +72,8 @@ explicit transactions.
   `workflow_name`, `spec_json` (the exact validated `WorkflowSpec`), `status`,
   `current_step_id?`, `current_round`, `total_tasks`, `total_failures`,
   timestamps, `terminal_at?`, `last_event_sequence`, `context_revision`,
-  `context_json?`, `earliest_retained_sequence`.
+  `context_json?`, `earliest_retained_sequence`, `input_values_json?` (v5;
+  immutable validated input values), `cancel_requested` (v5; durable cancel intent).
 - **workflow_step_executions** — `step_execution_id` (pk),
   unique(`workflow_id`,`step_id`,`round`,`attempt`), `task_id?`, `revision`,
   `status`, `output_json?`, `error_json?` (sanitized), timestamps; FK→workflows
@@ -178,9 +179,21 @@ there is no destructive downgrade. Corrupt schema metadata returns a structured
 adds the Node source-replay columns (`tasks.last_remote_event_sequence`,
 `task_events.source_sequence` + a partial unique index); **schema v4** adds the
 idempotent-creation columns (`tasks.idempotency_key`, `tasks.request_fingerprint`
-+ a partial unique index on non-null `idempotency_key`). Every version is an
-additive `ALTER TABLE … ADD COLUMN` (+ index) migration — earlier versions are
-never rewritten, and legacy rows keep `NULL` in the new columns.
++ a partial unique index on non-null `idempotency_key`); **schema v5** adds the
+Workflow Runtime columns (`workflows.input_values_json` — immutable validated
+input values — and `workflows.cancel_requested` — durable cancellation intent).
+Every version is an additive `ALTER TABLE … ADD COLUMN` (+ index) migration —
+earlier versions are never rewritten, and legacy rows keep `NULL` / `0` in the new
+columns.
+
+The narrow **workflow-runtime composites** (`createWorkflowWithLifecycleEvents`,
+`startWorkflowDurably`, `ensureStepStarted`, `bindStepTaskOnce`,
+`completeStepAndCheckpoint`, `advanceWorkflow`, `terminalizeWorkflow`,
+`failStepAndWorkflow`, `recordCancellationIntent`, `cancelStepAndWorkflow`) each run
+in one transaction, auto-assign the next contiguous workflow event sequence, and are
+**idempotent** (status / step-existence guards) so a Runtime restart re-running them
+never duplicates a step, task, edge, terminal event, or counter. See
+[`docs/workflow-runtime.md`](./workflow-runtime.md).
 
 ## Idempotent task creation (schema v4)
 

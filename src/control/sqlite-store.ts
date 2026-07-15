@@ -23,9 +23,9 @@ import {
   type WorkflowSnapshot,
 } from './records.js'
 import {
-  SIZE_LIMITS, nowIso, isIsoUtc, encodeJson, boundString, decodeJson, assertValidContext,
+  SIZE_LIMITS, nowIso, isIsoUtc, encodeJson, boundString, decodeJson, assertValidContext, assertNoForbiddenFields,
 } from './serialization.js'
-import type { ControlStore, GatewayTaskStore, IngestSourceEvent, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
+import type { ControlStore, GatewayTaskStore, IngestSourceEvent, WorkflowEventDraft, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
 
 export interface OpenControlStoreOptions {
   /** DB path; defaults to `<vibe_dir>/control.sqlite`. Configurable for tests. */
@@ -304,6 +304,164 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     })()
   }
 
+  // ── workflow-runtime composites (atomic; idempotent for crash recovery) ──────
+  // Each runs in ONE transaction and auto-assigns the next contiguous workflow
+  // event sequence. Idempotency guards (status / step-existence) make a re-run
+  // after a crash a safe no-op, so recovery never duplicates a step, task, edge,
+  // terminal event, or counter increment.
+
+  private appendWorkflowEventAuto(workflowId: string, draft: WorkflowEventDraft): void {
+    const cur = this.workflowRow(workflowId); if (!cur) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+    this.appendWorkflowEventSync(workflowId, { ...draft, sequence: cur.last_event_sequence + 1 })
+  }
+  private stepExecByKey(workflowId: string, stepId: string, round: number, attempt: number): StepRow | undefined {
+    return this.db.prepare('SELECT * FROM workflow_step_executions WHERE workflow_id=? AND step_id=? AND round=? AND attempt=?').get(workflowId, stepId, round, attempt) as StepRow | undefined
+  }
+
+  async createWorkflowWithLifecycleEvents(input: CreateWorkflowInput, context: unknown, createdEvent: WorkflowEventDraft, validatedEvent: WorkflowEventDraft): Promise<WorkflowRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      this.createWorkflowSync({ ...input, status: 'ready', current_round: input.current_round ?? 1 })
+      if (context !== undefined) this.saveContextSync(input.workflow_id, 0, context)
+      this.appendWorkflowEventAuto(input.workflow_id, createdEvent)
+      this.appendWorkflowEventAuto(input.workflow_id, validatedEvent)
+      return this.toWorkflow(this.workflowRow(input.workflow_id)!)
+    })()
+  }
+
+  async startWorkflowDurably(workflowId: string, startedEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; started: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.workflowRow(workflowId); if (!cur) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      if (cur.status === 'running') return { workflow: this.toWorkflow(cur), started: false } // coalesce a duplicate start
+      if (cur.status !== 'ready') throw new ControlStoreError('invalid_transition', `workflow cannot start from status ${cur.status}`)
+      this.updateWorkflowSync(workflowId, cur.revision, { status: 'running', started_at: cur.started_at ?? nowIso() })
+      this.appendWorkflowEventAuto(workflowId, startedEvent)
+      return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), started: true }
+    })()
+  }
+
+  async getStepExecutionByKey(workflowId: string, stepId: string, round: number, attempt: number): Promise<StepExecutionRecord | null> {
+    this.open(); const r = this.stepExecByKey(workflowId, stepId, round, attempt); return r ? this.toStep(r) : null
+  }
+
+  async ensureStepStarted(step: CreateStepExecutionInput, currentStepId: string, startedEvent: WorkflowEventDraft): Promise<{ step: StepExecutionRecord; workflow: WorkflowRecord; created: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const existing = this.stepExecByKey(step.workflow_id, step.step_id, step.round, step.attempt)
+      const wf0 = this.workflowRow(step.workflow_id); if (!wf0) throw new ControlStoreError('not_found', `workflow not found: ${step.workflow_id}`)
+      if (existing) return { step: this.toStep(existing), workflow: this.toWorkflow(wf0), created: false } // idempotent
+      this.createStepSync(step)
+      if (wf0.current_step_id !== currentStepId) this.updateWorkflowSync(step.workflow_id, wf0.revision, { current_step_id: currentStepId })
+      this.appendWorkflowEventAuto(step.workflow_id, startedEvent)
+      return { step: this.toStep(this.stepRow(step.step_execution_id)!), workflow: this.toWorkflow(this.workflowRow(step.workflow_id)!), created: true }
+    })()
+  }
+
+  async bindStepTaskOnce(stepExecutionId: string, taskId: string, workflowId: string, event: WorkflowEventDraft): Promise<{ step: StepExecutionRecord; bound: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const step = this.stepRow(stepExecutionId); if (!step) throw new ControlStoreError('not_found', `step execution not found: ${stepExecutionId}`)
+      if (step.task_id === taskId) return { step: this.toStep(step), bound: false } // idempotent recovery re-bind
+      if (step.task_id !== null) throw new ControlStoreError('invalid_transition', 'step is already bound to a different task')
+      this.updateStepSync(stepExecutionId, step.revision, { task_id: taskId })
+      const wf = this.workflowRow(workflowId); if (!wf) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      this.updateWorkflowSync(workflowId, wf.revision, { total_tasks: wf.total_tasks + 1 })
+      this.appendWorkflowEventAuto(workflowId, event)
+      return { step: this.toStep(this.stepRow(stepExecutionId)!), bound: true }
+    })()
+  }
+
+  async completeStepAndCheckpoint(stepExecutionId: string, output: unknown, workflowId: string, contextExpectedRevision: number | null, context: unknown | undefined, event: WorkflowEventDraft): Promise<{ step: StepExecutionRecord; completed: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const step = this.stepRow(stepExecutionId); if (!step) throw new ControlStoreError('not_found', `step execution not found: ${stepExecutionId}`)
+      if (step.status === 'completed') return { step: this.toStep(step), completed: false } // idempotent
+      this.updateStepSync(stepExecutionId, step.revision, { status: 'completed', output, terminal_at: nowIso() })
+      if (contextExpectedRevision !== null && context !== undefined) this.saveContextSync(workflowId, contextExpectedRevision, context)
+      this.appendWorkflowEventAuto(workflowId, event)
+      return { step: this.toStep(this.stepRow(stepExecutionId)!), completed: true }
+    })()
+  }
+
+  async advanceWorkflow(workflowId: string, edgeSelectedEvent: WorkflowEventDraft, roundAdvancedEvent: WorkflowEventDraft | null, nextStep: CreateStepExecutionInput, currentStepId: string, stepStartedEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; step: StepExecutionRecord; advanced: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      // The destination round is derived from the SOURCE step's IMMUTABLE round, so
+      // this guard is stable across recovery even after current_round advanced.
+      const existing = this.stepExecByKey(nextStep.workflow_id, nextStep.step_id, nextStep.round, nextStep.attempt)
+      if (existing) return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), step: this.toStep(existing), advanced: false } // idempotent
+      this.appendWorkflowEventAuto(workflowId, edgeSelectedEvent)
+      if (roundAdvancedEvent) {
+        const wf = this.workflowRow(workflowId)!
+        this.updateWorkflowSync(workflowId, wf.revision, { current_round: nextStep.round })
+        this.appendWorkflowEventAuto(workflowId, roundAdvancedEvent)
+      }
+      this.createStepSync(nextStep)
+      const wf2 = this.workflowRow(workflowId)!
+      if (wf2.current_step_id !== currentStepId) this.updateWorkflowSync(workflowId, wf2.revision, { current_step_id: currentStepId })
+      this.appendWorkflowEventAuto(workflowId, stepStartedEvent)
+      return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), step: this.toStep(this.stepRow(nextStep.step_execution_id)!), advanced: true }
+    })()
+  }
+
+  async terminalizeWorkflow(workflowId: string, status: string, edgeSelectedEvent: WorkflowEventDraft | null, terminalEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; terminalized: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.workflowRow(workflowId); if (!cur) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      if (cur.status === status || WORKFLOW_TERMINAL_STATUSES.has(cur.status)) return { workflow: this.toWorkflow(cur), terminalized: false } // idempotent
+      if (edgeSelectedEvent) this.appendWorkflowEventAuto(workflowId, edgeSelectedEvent)
+      const terminal = WORKFLOW_TERMINAL_STATUSES.has(status)
+      this.updateWorkflowSync(workflowId, cur.revision, { status, ...(terminal ? { terminal_at: nowIso() } : {}) })
+      this.appendWorkflowEventAuto(workflowId, terminalEvent)
+      return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), terminalized: true }
+    })()
+  }
+
+  async failStepAndWorkflow(stepExecutionId: string, workflowId: string, stepFailedEvent: WorkflowEventDraft, terminalEvent: WorkflowEventDraft, stepError: unknown): Promise<WorkflowRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const step = this.stepRow(stepExecutionId); if (!step) throw new ControlStoreError('not_found', `step execution not found: ${stepExecutionId}`)
+      if (step.status !== 'failed' && !STEP_TERMINAL_STATUSES.has(step.status)) {
+        this.updateStepSync(stepExecutionId, step.revision, { status: 'failed', error: stepError, terminal_at: nowIso() })
+        const wf = this.workflowRow(workflowId)!
+        this.updateWorkflowSync(workflowId, wf.revision, { total_failures: wf.total_failures + 1 }) // increment exactly once
+        this.appendWorkflowEventAuto(workflowId, stepFailedEvent)
+      }
+      const wf2 = this.workflowRow(workflowId)!
+      if (!WORKFLOW_TERMINAL_STATUSES.has(wf2.status)) {
+        this.updateWorkflowSync(workflowId, wf2.revision, { status: 'failed', terminal_at: nowIso() })
+        this.appendWorkflowEventAuto(workflowId, terminalEvent)
+      }
+      return this.toWorkflow(this.workflowRow(workflowId)!)
+    })()
+  }
+
+  async recordCancellationIntent(workflowId: string): Promise<WorkflowRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.workflowRow(workflowId); if (!cur) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      if (cur.cancel_requested === 1 || WORKFLOW_TERMINAL_STATUSES.has(cur.status)) return this.toWorkflow(cur)
+      this.updateWorkflowSync(workflowId, cur.revision, { cancel_requested: true })
+      return this.toWorkflow(this.workflowRow(workflowId)!)
+    })()
+  }
+
+  async cancelStepAndWorkflow(stepExecutionId: string | null, workflowId: string, terminalEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; cancelled: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.workflowRow(workflowId); if (!cur) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      if (WORKFLOW_TERMINAL_STATUSES.has(cur.status)) return { workflow: this.toWorkflow(cur), cancelled: false } // already terminal wins
+      if (stepExecutionId) {
+        const step = this.stepRow(stepExecutionId)
+        if (step && !STEP_TERMINAL_STATUSES.has(step.status)) this.updateStepSync(stepExecutionId, step.revision, { status: 'cancelled', terminal_at: nowIso() })
+      }
+      this.updateWorkflowSync(workflowId, cur.revision, { status: 'cancelled', terminal_at: nowIso() })
+      this.appendWorkflowEventAuto(workflowId, terminalEvent)
+      return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), cancelled: true }
+    })()
+  }
+
   // ── retention (bounded; never touches active records; no scheduler) ──────────
   async pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult> {
     this.open()
@@ -406,10 +564,17 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     validateCreateWorkflow(input)
     if (this.workflowRow(input.workflow_id)) throw new ControlStoreError('duplicate', `workflow already exists: ${input.workflow_id}`)
     const spec_json = encodeJson(input.spec, SIZE_LIMITS.spec_json, 'workflow.spec')
+    // Input values are immutable, bounded, and must never carry credential/token/
+    // key/PID field names (defense in depth; the runtime validates against the spec).
+    let input_values_json: string | null = null
+    if (input.input_values != null) {
+      assertNoForbiddenFields(input.input_values, 'workflow.input_values')
+      input_values_json = encodeJson(input.input_values, SIZE_LIMITS.metadata_json, 'workflow.input_values')
+    }
     const now = nowIso()
-    this.db.prepare(`INSERT INTO workflows (workflow_id,revision,spec_version,workflow_name,spec_json,status,current_step_id,current_round,total_tasks,total_failures,started_at,created_at,updated_at,terminal_at,last_event_sequence,context_revision,context_json,earliest_retained_sequence)
-      VALUES (@workflow_id,1,@spec_version,@workflow_name,@spec_json,@status,@current_step_id,@current_round,0,0,NULL,@now,@now,NULL,-1,0,NULL,0)`)
-      .run({ workflow_id: input.workflow_id, spec_version: input.spec_version, workflow_name: input.workflow_name, spec_json, status: input.status ?? 'draft', current_step_id: input.current_step_id ?? null, current_round: input.current_round ?? 1, now })
+    this.db.prepare(`INSERT INTO workflows (workflow_id,revision,spec_version,workflow_name,spec_json,status,current_step_id,current_round,total_tasks,total_failures,started_at,created_at,updated_at,terminal_at,last_event_sequence,context_revision,context_json,earliest_retained_sequence,input_values_json,cancel_requested)
+      VALUES (@workflow_id,1,@spec_version,@workflow_name,@spec_json,@status,@current_step_id,@current_round,0,0,NULL,@now,@now,NULL,-1,0,NULL,0,@input_values_json,0)`)
+      .run({ workflow_id: input.workflow_id, spec_version: input.spec_version, workflow_name: input.workflow_name, spec_json, status: input.status ?? 'draft', current_step_id: input.current_step_id ?? null, current_round: input.current_round ?? 1, input_values_json, now })
     return this.toWorkflow(this.workflowRow(input.workflow_id)!)
   }
 
@@ -429,9 +594,11 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
       total_failures: patch.total_failures ?? cur.total_failures,
       started_at: patch.started_at !== undefined ? patch.started_at : cur.started_at,
       terminal_at: patch.terminal_at !== undefined ? patch.terminal_at : cur.terminal_at,
+      // Cancellation intent is monotonic (once requested, never cleared).
+      cancel_requested: patch.cancel_requested === true || cur.cancel_requested === 1 ? 1 : 0,
       now: nowIso(), rev: cur.revision + 1, workflow_id: workflowId,
     }
-    this.db.prepare(`UPDATE workflows SET revision=@rev,status=@status,current_step_id=@current_step_id,current_round=@current_round,total_tasks=@total_tasks,total_failures=@total_failures,started_at=@started_at,terminal_at=@terminal_at,updated_at=@now WHERE workflow_id=@workflow_id`).run(next)
+    this.db.prepare(`UPDATE workflows SET revision=@rev,status=@status,current_step_id=@current_step_id,current_round=@current_round,total_tasks=@total_tasks,total_failures=@total_failures,started_at=@started_at,terminal_at=@terminal_at,cancel_requested=@cancel_requested,updated_at=@now WHERE workflow_id=@workflow_id`).run(next)
     return this.toWorkflow(this.workflowRow(workflowId)!)
   }
 
@@ -507,7 +674,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence, last_remote_event_sequence: r.last_remote_event_sequence, idempotency_key: r.idempotency_key, request_fingerprint: r.request_fingerprint }
   }
   private toWorkflow(r: WorkflowRow): WorkflowRecord {
-    return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence }
+    return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence, input_values: decodeJson(r.input_values_json, SIZE_LIMITS.metadata_json, 'workflow.input_values', true) as Record<string, unknown> | null, cancel_requested: r.cancel_requested === 1 }
   }
   private toStep(r: StepRow): StepExecutionRecord {
     return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, step_id: r.step_id, round: r.round, attempt: r.attempt, task_id: r.task_id, revision: r.revision, status: r.status, output: decodeJson(r.output_json, SIZE_LIMITS.step_output_json, 'step.output'), error: decodeJson(r.error_json, SIZE_LIMITS.step_error_json, 'step.error'), created_at: r.created_at, started_at: r.started_at, updated_at: r.updated_at, terminal_at: r.terminal_at }
@@ -517,7 +684,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 // ── row shapes ─────────────────────────────────────────────────────────────────
 interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null; idempotency_key: string | null; request_fingerprint: string | null }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
-interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number }
+interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
 

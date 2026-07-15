@@ -101,6 +101,16 @@ context value that has not yet been populated — in the example, the initial
 `plan` populates `latest_planner_decision` before `implement` reads it, and
 `implement` populates `latest_executor_handoff` before `review` reads it.
 
+**`context_binding` (which slot a step updates).** An `agent_task` step may declare
+an optional, fail-closed `context_binding` — `latest_planner_decision` or
+`latest_executor_handoff` — naming which slot its **validated** output replaces on
+success. The bound `output_schema` must be **structurally compatible** with the
+destination shape (its fields ⊆ the slot's allowed fields, with required `status` +
+`summary`). An **omitted** binding persists the step output (still referenceable via
+`steps.<id>.output.*`) but updates neither slot. Binding is never inferred from role
+names, step ids, or schema names, and an unknown value fails validation. The runtime
+uses these bindings to refresh the `context.*` namespace deterministically.
+
 ### Step-output availability (dominance)
 
 A `steps.<id>.output.<field>` reference must be **guaranteed** to be available

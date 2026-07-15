@@ -71,6 +71,7 @@ export function plannerExecutorLoopExample(): WorkflowSpec {
         label: 'Plan',
         prompt_template: 'You are the planner. Objective: {{ inputs.objective }}. Produce an implementation plan and acceptance criteria. Set status="continue" to proceed to implementation, or "complete"/"blocked"/"failed".',
         output_schema: 'planner_decision',
+        context_binding: 'latest_planner_decision',
       },
       {
         id: 'implement',
@@ -82,6 +83,7 @@ export function plannerExecutorLoopExample(): WorkflowSpec {
         // plan summary via steps.plan.output (plan dominates implement).
         prompt_template: 'You are the executor. Objective: {{ inputs.objective }}. Original plan: {{ steps.plan.output.summary }}. Latest instruction: {{ context.latest_planner_decision.next_step }}. Acceptance criteria: {{ context.latest_planner_decision.acceptance_criteria }}. Round: {{ workflow.round }}. Implement the next increment and report a structured handoff.',
         output_schema: 'executor_handoff',
+        context_binding: 'latest_executor_handoff',
         workspace_key_template: '{{ inputs.workspace_key }}',
         permission_mode: 'default',
       },
@@ -94,6 +96,7 @@ export function plannerExecutorLoopExample(): WorkflowSpec {
         // latest_planner_decision, so the looped implement gets the newest guidance.
         prompt_template: 'You are the planner reviewing the executor handoff. Objective: {{ inputs.objective }}. Executor summary: {{ context.latest_executor_handoff.summary }}. Changed files: {{ context.latest_executor_handoff.changed_files }}. Remaining work: {{ context.latest_executor_handoff.remaining_work }}. Round: {{ workflow.round }}. Decide status="continue" (loop back with a next_step), "complete", "blocked", or "failed".',
         output_schema: 'planner_decision',
+        context_binding: 'latest_planner_decision',
       },
     ],
     edges: [

@@ -100,6 +100,16 @@ export interface AgentTaskStep {
   permission_mode?: 'default' | 'unsafe-skip'
   /** A safe opaque workspace key, OR a single `{{ inputs.<name> }}` reference. */
   workspace_key_template?: string
+  /**
+   * Optional, fail-closed. Declares which bounded context slot this step's
+   * VALIDATED output replaces on success — `latest_planner_decision` (planner /
+   * review steps) or `latest_executor_handoff` (executor steps). The step's
+   * `output_schema` must be structurally compatible with the destination context
+   * shape. Omitted → the output is persisted as a step output but updates NEITHER
+   * canonical handoff slot. Binding is NEVER inferred from role names, step ids, or
+   * schema names — it must be declared. Unknown values fail validation.
+   */
+  context_binding?: ContextGroup
   label?: string
   description?: string
 }
