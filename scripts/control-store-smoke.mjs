@@ -12,7 +12,7 @@ const dbPath = path.join(dir, 'control.sqlite')
 try {
   const store = openControlStore({ path: dbPath }) // loads better-sqlite3, opens + migrates
   const health = await store.healthCheck()
-  assert.equal(health.schema_version, 1, 'migrated to schema v1')
+  assert.ok(health.schema_version >= 1, 'migrated to a schema version')
   assert.equal(health.journal_mode, 'wal', 'WAL enabled')
   assert.equal(health.foreign_keys, true, 'foreign_keys enabled')
   assert.ok(health.busy_timeout > 0, 'busy_timeout set')

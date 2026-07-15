@@ -39,6 +39,30 @@ import {
   apiError, runErrorToApiError, apiErrorHttpStatus, isTerminalTaskStatus,
   type Task, type TaskEvent, type TaskEventType, type ApiError,
 } from './agent-task-contract.js'
+import type { GatewayTaskStore } from '../control/store.js'
+import type { CreateTaskInput, TaskEventInput, TaskRecord } from '../control/records.js'
+
+/** Map a canonical TaskEvent to the durable append shape (no secrets, bounded). */
+function toEventInput(ev: TaskEvent): TaskEventInput { return { sequence: ev.seq, event_type: ev.type, ts: ev.ts, payload: ev.payload } }
+/** Project a durably-stored TaskRecord to the public Task (for historical/
+ *  recovered tasks not held in the in-memory cache). */
+function taskRecordToTask(rec: TaskRecord): Task {
+  const task: Task = { task_id: rec.task_id, agent: rec.agent as AgentBackend, node_id: rec.node_id ?? 'local', status: rec.status as Task['status'], created_at: rec.created_at, updated_at: rec.updated_at, contract_version: TASK_CONTRACT_VERSION }
+  if (rec.error_code || rec.error_message) task.error = { message: rec.error_message ?? rec.error_code ?? 'error', reason: rec.error_code ?? undefined }
+  if (rec.metadata) task.metadata = rec.metadata
+  return task
+}
+/** Machine-readable event-history completeness for a durable task (backward-
+ *  compatible optional field; older clients ignore it). */
+interface TaskHistoryInfo { complete: boolean; incomplete_reason?: string; earliest_retained_sequence: number; boundary_sequence?: number }
+function historyField(rec: TaskRecord): TaskHistoryInfo {
+  return { complete: !rec.history_incomplete, ...(rec.history_reason ? { incomplete_reason: rec.history_reason } : {}), earliest_retained_sequence: rec.earliest_retained_sequence, ...(rec.history_boundary_sequence != null ? { boundary_sequence: rec.history_boundary_sequence } : {}) }
+}
+/** Gateway-owned public task id (decoupled from the relay run id for remote tasks
+ *  so the task record can be persisted BEFORE the remote start returns a run id). */
+function newGatewayTaskId(): string { return 'run_' + crypto.randomBytes(9).toString('hex') }
+const TERMINAL_EVENT_TYPES = new Set<TaskEventType>(['task.completed', 'task.failed', 'task.cancelled'])
+function terminalStatusFor(type: TaskEventType): 'completed' | 'failed' | 'cancelled' { return type === 'task.completed' ? 'completed' : type === 'task.failed' ? 'failed' : 'cancelled' }
 
 // ── documented, bounded limits (constants) ───────────────────────────────────
 
@@ -80,6 +104,11 @@ interface GatewayTask {
   resumeCount?: number         // bounded pump resumes after transport give-up
   lastRecord?: RunRecord       // last known authoritative remote projection
   completedAt?: number
+  revision: number             // durable ControlStore task revision (1 if unpersisted)
+  nodeId: string | null        // routing node id (null/'local' = local mock)
+  remoteRunId: string | null   // durable remote run correlation (null until known)
+  recovered?: boolean          // rebuilt from the durable store after a restart
+  historyTruncated?: boolean   // some early events are no longer retained (durability gap)
 }
 
 const REMOTE_RECONCILE_ATTEMPTS = 3   // bounded remoteRunStatus checks on stream give-up
@@ -107,6 +136,13 @@ export interface AgentGatewayOptions {
   relay?: string
   /** Resolved relay auth token VALUE (never logged). Required with `relay`. */
   relayToken?: string
+  /** Durable task store. When set, task identity + canonical event history are
+   *  persisted (events durably BEFORE SSE publish) and non-terminal tasks are
+   *  recovered on start. When unset, the gateway is purely in-memory (as before). */
+  taskStore?: GatewayTaskStore
+  /** Recover persisted non-terminal tasks on start (default: true when a store is
+   *  set). Rebuilds the in-memory cache/active-slot accounting and reconciles. */
+  recoverOnStart?: boolean
 }
 
 // ── auth ─────────────────────────────────────────────────────────────────────
@@ -198,6 +234,21 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   let activeCount = 0
   let pendingCreates = 0
   let shuttingDown = false
+  const persist = opts.taskStore
+  const recoverOnStart = opts.recoverOnStart ?? Boolean(persist)
+  // Relay operations target the bound remote run id (decoupled from the public
+  // task_id). Falls back to task_id for the legacy no-store path where they match.
+  const relayId = (t: GatewayTask): string => t.remoteRunId ?? t.taskId
+  const recoveryTimers = new Set<NodeJS.Timeout>() // bounded recovery/backoff timers
+
+  // Persist a NON-terminal accepted event durably BEFORE publishing it, so a
+  // client never sees an event that was not saved. Idempotent duplicates are a
+  // no-op; any other durable failure means we do NOT publish (the event isn't
+  // durable). Terminal events go through finishWithTerminal (atomic terminalize).
+  function persistThenPush(task: GatewayTask, ev: TaskEvent): void {
+    if (persist) { try { persist.appendTaskEventDurable(task.taskId, toEventInput(ev)) } catch { return } }
+    pushEvent(task, ev)
+  }
 
   // ── event emission + fan-out ───────────────────────────────────────────────
 
@@ -251,8 +302,17 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   /** Emit exactly one canonical terminal event and finish the task. Guarded so
    *  the stream pump and a GET-status reconciliation racing to the same terminal
    *  state can never produce two terminal events. */
-  function finishWithTerminal(task: GatewayTask, ev: TaskEvent): void {
+  function finishWithTerminal(task: GatewayTask, ev: TaskEvent, durableError?: { code: string; message: string }): void {
     if (task.terminal) return
+    // Persist terminal status (+ optional sanitized error) + exactly one terminal
+    // event atomically BEFORE publishing/finishing. An already-recorded terminal
+    // (idempotent) or a transient durable failure still finishes in memory.
+    if (persist) {
+      try {
+        const rec = persist.terminalizeTaskDurable(task.taskId, task.revision, { status: terminalStatusFor(ev.type), ...(durableError ? { error_code: durableError.code, error_message: durableError.message } : {}) }, toEventInput(ev))
+        task.revision = rec.revision
+      } catch { /* already terminal / storage hiccup — proceed with in-memory finish */ }
+    }
     pushEvent(task, ev)
     finishTask(task)
   }
@@ -263,12 +323,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     if (task.terminal) return true
     const te = runEventToTaskEvent(event, task.nextSeq)
     if (!te) return false
+    te.task_id = task.taskId // public gateway id (decoupled from the relay run_id)
     task.nextSeq++
-    if (te.type === 'task.completed' || te.type === 'task.failed' || te.type === 'task.cancelled') {
+    if (TERMINAL_EVENT_TYPES.has(te.type)) {
       finishWithTerminal(task, te)
       return true
     }
-    pushEvent(task, te)
+    persistThenPush(task, te)
     return false
   }
 
@@ -302,7 +363,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     const abort = new AbortController()
     task.abort = abort
     task.pumpActive = true
-    void remoteStream(relay!, relayToken!, task.taskId, {
+    void remoteStream(relay!, relayToken!, relayId(task), {
       suppressStdout: true,
       signal: abort.signal,
       emitDisconnectTerminal: false, // a dropped transport is not a run result
@@ -329,7 +390,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     try {
       for (let attempt = 0; attempt < REMOTE_RECONCILE_ATTEMPTS && !task.terminal; attempt++) {
         try {
-          const record = await remoteRunStatus(relay!, relayToken!, task.taskId)
+          const record = await remoteRunStatus(relay!, relayToken!, relayId(task))
           reconcileRemoteRecord(task, record)
           if (task.terminal) return
           if ((task.resumeCount ?? 0) < REMOTE_MAX_RESUMES) { task.resumeCount = (task.resumeCount ?? 0) + 1; startRemotePump(task) }
@@ -342,6 +403,99 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       // preserved). GET returns the authoritative error; a new SSE subscriber
       // (handleEvents) restarts the pump.
     } finally { task.reconciling = false }
+  }
+
+  // ── restart recovery (rebuild in-memory cache from the durable store) ───────
+
+  function toTaskEvent(taskId: string, sequence: number, type: string, ts: string, payload: unknown): TaskEvent {
+    return { seq: sequence, task_id: taskId, type: type as TaskEventType, ts, payload: (payload ?? {}) as Record<string, unknown>, contract_version: TASK_CONTRACT_VERSION }
+  }
+
+  /** Align a recovered LOCAL task's RunEvent cursor so `drain` continues WITHOUT
+   *  re-emitting events already persisted as TaskEvents (no gap, no duplicate). */
+  function seedRecoveredLocalCursor(task: GatewayTask): void {
+    let all: RunEvent[]; try { all = readEvents(task.taskId) } catch { return }
+    const alreadyMapped = Math.max(0, task.nextSeq - 1) // TaskEvents from RunEvents (excludes synthetic task.created)
+    let mapped = 0
+    for (let i = 0; i < all.length; i++) {
+      if (mapped >= alreadyMapped) { task.emittedRunEvents = i; return }
+      if (runEventToTaskEvent(all[i], 0)) mapped++
+    }
+    task.emittedRunEvents = all.length
+  }
+
+  /** Reconcile one recovered task with authoritative status; resume the live
+   *  source if still running. Node-offline/transport failure NEVER fabricates a
+   *  terminal — it retries with bounded backoff while the gateway is alive. */
+  async function reconcileRecovered(task: GatewayTask, attempt = 0): Promise<void> {
+    if (task.terminal || shuttingDown) return
+    try {
+      if (task.mode === 'remote') {
+        const record = await remoteRunStatus(relay!, relayToken!, task.remoteRunId!)
+        reconcileRemoteRecord(task, record)
+        if (!task.terminal) {
+          // Resuming a remote pump after a restart: the relay does not replay
+          // pre-subscribe events, and there is no Node journal yet, so events
+          // emitted during downtime may be missing. Mark the persisted history
+          // incomplete at the last durably-consumed sequence (the boundary before
+          // the missing interval). We NEVER invent or renumber events.
+          if (persist && task.recovered) {
+            const boundary = task.nextSeq - 1
+            try { persist.markTaskHistoryIncomplete(task.taskId, 'gateway_restart_without_node_replay', boundary) } catch { /* best effort */ }
+            task.historyTruncated = true
+          }
+          startRemotePump(task)
+        }
+      } else {
+        const record = readRun(task.taskId)
+        const status = runStatusToTaskStatus(record.status)
+        if (isTerminalTaskStatus(status)) finishWithTerminal(task, synthEvent(task, status === 'completed' ? 'task.completed' : status === 'failed' ? 'task.failed' : 'task.cancelled', {}))
+        else { seedRecoveredLocalCursor(task); startPoll(task) }
+      }
+    } catch {
+      // A transient read/transport error is NOT a task failure — retry with bounded
+      // backoff. Only after exhausting attempts do we conclude a LOCAL run's state
+      // is genuinely gone (sanitized failure, once); a REMOTE node stays non-terminal
+      // (a later GET / new subscriber reconciles), never fabricated as failed.
+      const lastAttempt = attempt + 1 >= REMOTE_RECONCILE_ATTEMPTS
+      if (!lastAttempt && !shuttingDown) { const t = setTimeout(() => { recoveryTimers.delete(t); void reconcileRecovered(task, attempt + 1) }, REMOTE_RECONCILE_BACKOFF_MS * (attempt + 1)); recoveryTimers.add(t); t.unref?.(); return }
+      if (task.mode === 'local') finishWithTerminal(task, synthEvent(task, 'task.failed', { reason: 'recovery_run_missing', message: 'local run state unavailable after restart' }), { code: 'recovery_run_missing', message: 'local run state unavailable after restart' })
+    }
+  }
+
+  /** Rebuild non-terminal tasks from the store: register them (immediately
+   *  addressable), rebuild active-slot accounting, fail ambiguous starts once,
+   *  and schedule authoritative reconciliation. */
+  function recoverTasks(): void {
+    if (!persist || !recoverOnStart) return
+    let records
+    try { records = persist.listNonTerminalTasks() } catch { return }
+    for (const rec of records) {
+      const isRemote = rec.remote_run_id !== null || (rec.node_id !== null && rec.node_id !== 'local' && rec.node_id !== 'auto')
+      const mode: 'local' | 'remote' = isRemote ? 'remote' : 'local'
+      let events: TaskEvent[] = []
+      try { events = persist.loadTaskEvents(rec.task_id).map((e) => toTaskEvent(rec.task_id, e.sequence, e.event_type, e.ts, e.payload)) } catch { events = [] }
+      let historyTruncated = rec.earliest_retained_sequence > 0
+      if (events.length > maxEvents) { events = events.slice(events.length - maxEvents); historyTruncated = true }
+      const task: GatewayTask = {
+        taskId: rec.task_id, agent: rec.agent as AgentBackend, mode, events,
+        nextSeq: rec.last_event_sequence + 1, emittedRunEvents: 0,
+        subscribers: new Set(), terminal: false, cancelInFlight: false,
+        revision: rec.revision, nodeId: rec.node_id, remoteRunId: rec.remote_run_id,
+        recovered: true, historyTruncated,
+      }
+      tasks.set(task.taskId, task)
+      activeCount++ // recovered non-terminal task counts against the active-task limit
+      if (mode === 'remote' && !rec.remote_run_id) {
+        // Ambiguous start: unknown whether the node began execution — do NOT resume
+        // (would risk a duplicate run) and never guess a remote run id. Sanitized
+        // recovery failure recorded exactly once.
+        finishWithTerminal(task, synthEvent(task, 'task.failed', { reason: 'recovery_unknown_start', message: 'task start outcome is unknown after gateway restart; not resumed to avoid a duplicate execution' }), { code: 'recovery_unknown_start', message: 'remote start outcome unknown after gateway restart; not resumed' })
+        continue
+      }
+      const t = setTimeout(() => { recoveryTimers.delete(t); void reconcileRecovered(task) }, 0)
+      recoveryTimers.add(t); t.unref?.()
+    }
   }
 
   /** Map a caught remote-run error to a canonical ApiError + HTTP status. */
@@ -408,6 +562,49 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     const promptFile = path.join(os.tmpdir(), `vibe-api-prompt-${crypto.randomBytes(8).toString('hex')}.txt`)
     fs.writeFileSync(promptFile, reqv.input.text, { mode: 0o600 })
 
+    // REMOTE + durable: persist the task record + task.created BEFORE attempting
+    // remote start (remote_run_id UNBOUND), then durably BIND the remote run id
+    // after a successful start. The task is durable even if the gateway crashes
+    // mid-start; recovery treats an unbound remote_run_id as an AMBIGUOUS start
+    // (never auto-restarted). The public task_id is gateway-owned and decoupled
+    // from the relay run_id.
+    if (isRemote && persist) {
+      const taskId = newGatewayTaskId()
+      const task: GatewayTask = {
+        taskId, agent: reqv.agent as AgentBackend, mode: 'remote', events: [], nextSeq: 0,
+        emittedRunEvents: 0, subscribers: new Set(), terminal: false, cancelInFlight: false,
+        revision: 1, nodeId: reqv.node_id!, remoteRunId: null,
+      }
+      const createdEv = synthEvent(task, 'task.created', { agent: reqv.agent as AgentBackend })
+      try {
+        const rec = persist.createTaskDurable({
+          task_id: taskId, node_id: reqv.node_id!, agent: reqv.agent as AgentBackend,
+          workspace_key: reqv.workspace?.workspace_key ?? null, permission_mode: reqv.execution?.permission_mode ?? null,
+          status: 'queued', remote_run_id: null, input_text: reqv.input.text, metadata: reqv.metadata ?? null,
+        } satisfies CreateTaskInput, toEventInput(createdEv))
+        task.revision = rec.revision
+      } catch { release(); try { fs.unlinkSync(promptFile) } catch { /* */ } return sendError(res, apiError('internal_error', 'failed to persist task'), 500) }
+
+      let rrec: RunRecord
+      try {
+        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, metadata: reqv.metadata, encryptionPublicKey })
+      } catch (err) {
+        release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
+        // Start DEFINITELY failed → record the canonical failure terminally, once.
+        const code = classifyRunError(err)
+        try { persist.terminalizeTaskDurable(taskId, task.revision, { status: 'failed', error_code: code, error_message: (err as Error).message }, toEventInput(synthEvent(task, 'task.failed', { reason: code }))) } catch { /* */ }
+        const m = remoteApiError(err, taskId); return sendError(res, m.error, m.status)
+      }
+      try { fs.unlinkSync(promptFile) } catch { /* */ }
+      // Durably BIND the remote run id + running status BEFORE exposing lifecycle.
+      try { const rec = persist.updateTaskDurable(taskId, task.revision, { remote_run_id: rrec.run_id, status: runStatusToTaskStatus(rrec.status) }); task.revision = rec.revision } catch { /* a durable-bind failure leaves an ambiguous row that recovery handles; the live process still knows the id */ }
+      task.remoteRunId = rrec.run_id
+      tasks.set(taskId, task); pendingCreates--; activeCount++
+      pushEvent(task, createdEv)
+      startRemotePump(task)
+      return sendJson(res, 202, { ...runRecordToTask(rrec), task_id: taskId })
+    }
+
     let record: RunRecord
     let started = false
     const mode: 'local' | 'remote' = isRemote ? 'remote' : 'local'
@@ -448,24 +645,53 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       if (isRemote || !started) { try { fs.unlinkSync(promptFile) } catch { /* best effort */ } }
     }
 
+    const nodeId = isRemote ? reqv.node_id! : null
+    const remoteRunId = isRemote ? record.run_id : null // relay routes by run_id (== task_id)
     const task: GatewayTask = {
       taskId: record.run_id, agent: record.agent, mode, events: [], nextSeq: 0,
       emittedRunEvents: 0, subscribers: new Set(), terminal: false, cancelInFlight: false,
+      revision: 1, nodeId, remoteRunId,
+    }
+    const createdEv = synthEvent(task, 'task.created', { agent: record.agent })
+    if (persist) {
+      // Atomically persist the task record + task.created BEFORE exposing the task.
+      try {
+        const rec = persist.createTaskDurable({
+          task_id: task.taskId, node_id: nodeId, agent: record.agent,
+          workspace_key: reqv.workspace?.workspace_key ?? null,
+          permission_mode: reqv.execution?.permission_mode ?? null,
+          status: runStatusToTaskStatus(record.status), remote_run_id: remoteRunId,
+          input_text: reqv.input.text, metadata: reqv.metadata ?? null,
+        } satisfies CreateTaskInput, toEventInput(createdEv))
+        task.revision = rec.revision
+      } catch { release(); return sendError(res, apiError('internal_error', 'failed to persist task'), 500) }
     }
     tasks.set(task.taskId, task)
     pendingCreates-- // reservation becomes a live active task
     activeCount++
-    pushEvent(task, synthEvent(task, 'task.created', { agent: record.agent }))
+    pushEvent(task, createdEv) // buffer + fan-out (no subscribers yet); already durable above
     if (mode === 'remote') startRemotePump(task); else startPoll(task)
     sendJson(res, 202, runRecordToTask(record))
   }
 
   async function handleGet(res: http.ServerResponse, taskId: string): Promise<void> {
     const task = tasks.get(taskId)
-    if (!task) return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    if (!task) {
+      // Not in the in-memory cache: a historical (terminal, evicted, or
+      // pre-restart) task remains queryable from the durable store.
+      if (persist) { const rec = persist.getTaskRecord(taskId); if (rec) return sendJson(res, 200, { ...taskRecordToTask(rec), history: historyField(rec) }) }
+      return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    }
+    // A terminal REMOTE task's state is FINAL — return the durable/last-known
+    // projection WITHOUT a (possibly slow/unreachable) authoritative relay call.
+    // (Local terminal tasks keep using authoritative readRun below — no relay.)
+    if (task.terminal && task.mode === 'remote') {
+      if (persist) { const rec = persist.getTaskRecord(task.taskId); if (rec) return sendJson(res, 200, { ...taskRecordToTask(rec), task_id: task.taskId, history: historyField(rec) }) }
+      if (task.lastRecord) return sendJson(res, 200, { ...runRecordToTask(task.lastRecord), task_id: task.taskId })
+    }
     let record: RunRecord
     try {
-      record = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, taskId) : readRun(taskId)
+      record = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, relayId(task)) : readRun(taskId)
     } catch (err) {
       // Node offline / relay unavailable: preserve last known state and surface
       // the structured error (do NOT mark the task terminal).
@@ -475,12 +701,33 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     // Authoritative GET may be the first to observe a terminal state — fold it in
     // (emits one terminal event, frees the slot, stops the pump) exactly once.
     if (task.mode === 'remote') reconcileRemoteRecord(task, record)
-    sendJson(res, 200, runRecordToTask(record))
+    const hist = persist ? persist.getTaskRecord(task.taskId) : null
+    // Always project the PUBLIC task_id (decoupled from remote_run_id) + attach
+    // machine-readable history completeness when the store has the record.
+    sendJson(res, 200, { ...runRecordToTask(record), task_id: task.taskId, ...(hist ? { history: historyField(hist) } : {}) })
   }
 
   function handleEvents(req: http.IncomingMessage, res: http.ServerResponse, taskId: string): void {
     const task = tasks.get(taskId)
-    if (!task) return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    if (!task) {
+      // Historical/terminal task not in memory: replay persisted events from the
+      // durable store (no live subscription — it is already terminal), applying
+      // the same Last-Event-ID cursor + truncation semantics.
+      if (persist) {
+        const rec = persist.getTaskRecord(taskId)
+        if (rec) {
+          const durable = persist.loadTaskEvents(taskId).map((e) => toTaskEvent(taskId, e.sequence, e.event_type, e.ts, e.payload))
+          res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' })
+          res.write(': connected\n\n')
+          const replay = computeSseReplay(durable, req.headers['last-event-id'])
+          if (replay.truncated || rec.earliest_retained_sequence > 0) res.write(': warning: task event history is incomplete/truncated\n\n')
+          for (const ev of replay.events) res.write(sseFrame(ev))
+          res.end()
+          return
+        }
+      }
+      return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    }
 
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -499,6 +746,11 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     if (replay.truncated) {
       res.write(': warning: requested Last-Event-ID predates the retained buffer; replaying from the oldest retained event\n\n')
     }
+    if (task.historyTruncated) {
+      // Some early events are no longer available (gateway downtime / retention).
+      // We NEVER fabricate or renumber events; the cursor stays the greatest saved.
+      res.write(': warning: task event history is incomplete (some events emitted while the gateway was unavailable are not retained)\n\n')
+    }
     for (const ev of replay.events) res.write(sseFrame(ev))
 
     if (task.terminal) { res.end(); return } // terminal already delivered above
@@ -512,11 +764,23 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
   async function handleCancel(res: http.ServerResponse, taskId: string): Promise<void> {
     const task = tasks.get(taskId)
-    if (!task) return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    if (!task) {
+      // Historical task not in memory: if durably terminal, cancel is an idempotent
+      // no-op that returns the stored task. (Non-terminal tasks are always in the
+      // cache — recovery rebuilds them — so this path never re-issues a stop.)
+      if (persist) { const rec = persist.getTaskRecord(taskId); if (rec) return sendJson(res, 200, taskRecordToTask(rec)) }
+      return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
+    }
+    // Already terminal REMOTE task: idempotent no-op — return the final projection
+    // WITHOUT an authoritative relay call (never re-stop a finished task).
+    if (task.terminal && task.mode === 'remote') {
+      if (persist) { const rec = persist.getTaskRecord(task.taskId); if (rec) return sendJson(res, 200, { ...taskRecordToTask(rec), task_id: task.taskId }) }
+      if (task.lastRecord) return sendJson(res, 200, { ...runRecordToTask(task.lastRecord), task_id: task.taskId })
+    }
 
     let record: RunRecord
     try {
-      record = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, taskId) : readRun(taskId)
+      record = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, relayId(task)) : readRun(taskId)
     } catch (err) {
       if (task.mode === 'remote') { const m = remoteApiError(err, taskId); return sendError(res, m.error, m.status) }
       return sendError(res, apiError('task_not_found', `no such task: ${taskId}`, { task_id: taskId }), 404)
@@ -531,7 +795,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     task.cancelInFlight = true // guard against concurrent duplicate stop operations
     try {
       if (task.mode === 'remote') {
-        const stopped = await remoteStop(relay!, relayToken!, taskId)
+        const stopped = await remoteStop(relay!, relayToken!, relayId(task))
         // Reconcile the authoritative stopped record NOW — do not rely on the event
         // pump to deliver the stopped event (it may be lost). This emits the one
         // terminal event and frees the active slot even if the stream never sees it.
@@ -545,7 +809,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     } catch (err) {
       // Lost a race to a terminal transition — return the current projection.
       try {
-        const cur = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, taskId) : readRun(taskId)
+        const cur = task.mode === 'remote' ? await remoteRunStatus(relay!, relayToken!, relayId(task)) : readRun(taskId)
         sendJson(res, 200, runRecordToTask(cur))
       } catch {
         if (task.mode === 'remote') { const m = remoteApiError(err, taskId); sendError(res, m.error, m.status) }
@@ -638,6 +902,9 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     server.once('error', reject)
     server.listen(port, host, () => {
       const boundPort = (server.address() as { port: number }).port
+      // Rebuild non-terminal tasks from the durable store so they are immediately
+      // addressable via GET/events/cancel; reconciliation proceeds in the background.
+      try { recoverTasks() } catch { /* recovery best-effort; never blocks startup */ }
       resolve({
         host,
         port: boundPort,
@@ -646,6 +913,8 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           // Running tasks are NOT cancelled — only the API surface stops.
           shuttingDown = true
           clearInterval(heartbeat)
+          for (const t of recoveryTimers) clearTimeout(t)
+          recoveryTimers.clear()
           for (const task of tasks.values()) {
             if (task.poll) { clearInterval(task.poll); task.poll = undefined }
             if (task.abort) { try { task.abort.abort() } catch { /* ignore */ } task.abort = undefined }

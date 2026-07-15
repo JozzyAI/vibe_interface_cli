@@ -88,12 +88,13 @@ export function registerApiCommand(program: Command): void {
     .option('--host <host>', 'bind host (default 127.0.0.1; non-loopback requires --allow-bind)', '127.0.0.1')
     .option('--port <port>', `port to listen on (default ${DEFAULT_API_PORT})`, String(DEFAULT_API_PORT))
     .option('--token-file <path>', 'path to the 0600 API bearer-token file (default: <vibe_dir>/api-token; created once if missing, reused otherwise)')
+    .option('--db-path <path>', 'durable control-store SQLite path (default: <vibe_dir>/control.sqlite). Persists task identity + event history and recovers non-terminal tasks on restart')
     .option('--allow-bind', 'permit a non-loopback bind — exposes the write-capable API on the network (discouraged)')
     .option('--relay <url>', 'relay ws URL — enables REMOTE agent execution on online nodes (else connect-profile relay_url)')
     .option('--relay-token-file <path>', 'relay auth token file for remote execution (else connect-profile token_file / VIBE_RELAY_TOKEN)')
     .option('--relay-token <token>', 'relay auth token (DEPRECATED: visible in process args; prefer --relay-token-file or VIBE_RELAY_TOKEN)')
     .option('--quiet', 'suppress the human info lines (errors still print)')
-    .action(async (opts: { host: string; port: string; tokenFile?: string; allowBind?: boolean; relay?: string; relayTokenFile?: string; relayToken?: string; quiet?: boolean }) => {
+    .action(async (opts: { host: string; port: string; tokenFile?: string; dbPath?: string; allowBind?: boolean; relay?: string; relayTokenFile?: string; relayToken?: string; quiet?: boolean }) => {
       const host = opts.host
       const port = Number.parseInt(opts.port, 10)
       if (!Number.isInteger(port) || port < 0 || port > 65535) fail('invalid_port', `--port must be 0-65535, got ${opts.port}`)
@@ -131,10 +132,26 @@ export function registerApiCommand(program: Command): void {
         }
       }
 
+      // Durable control store (task persistence + restart recovery). Defaults
+      // under the Vibe dir; on any open/migrate failure (missing/corrupt/too-new/
+      // insecure/symlinked DB) fail startup CLEARLY — never silently run
+      // memory-only. The --db-path is a filesystem path, never a token/secret.
+      const dbPath = opts.dbPath ?? path.join(vibeDir(), 'control.sqlite')
+      let store: import('../control/sqlite-store.js').SqliteControlStore
+      try {
+        const { openControlStore } = await import('../control/sqlite-store.js')
+        store = openControlStore({ path: dbPath }) // opens + migrates before we accept requests
+        await store.healthCheck()
+      } catch (err) {
+        const code = (err as { code?: string }).code ?? 'control_store_failed'
+        fail(code, `could not open the durable control store at ${dbPath}: ${(err as Error).message}`)
+      }
+
       let server
       try {
-        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken })
+        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store })
       } catch (err) {
+        try { store.closeSync() } catch { /* ignore */ }
         fail('serve_failed', `could not start the gateway: ${(err as Error).message}`)
       }
 
@@ -146,6 +163,7 @@ export function registerApiCommand(program: Command): void {
         process.stdout.write(`vibe api: serving the Agent Task API on ${base}\n`)
         process.stdout.write(`  auth: send  Authorization: Bearer <token>  on every request\n`)
         process.stdout.write(`  API token file: ${tf.path} (mode 0600, ${tf.created ? 'created' : 'reused'}) — keep it secret; the token itself is never printed\n`)
+        process.stdout.write(`  durable store: ${dbPath} (tasks + event history persisted; non-terminal tasks recovered on restart)\n`)
         if (relayUrl) {
           process.stdout.write(`  remote execution: ENABLED via relay ${relayUrl} — target a node with node_id (agents: GET /v1/agents)\n`)
         } else {
@@ -154,7 +172,7 @@ export function registerApiCommand(program: Command): void {
         process.stdout.write(`  Ctrl-C to stop.\n`)
       }
 
-      const shutdown = (): void => { void server.close().then(() => process.exit(0)) }
+      const shutdown = (): void => { void server.close().then(() => { try { store.closeSync() } catch { /* ignore */ } process.exit(0) }) }
       process.on('SIGINT', shutdown)
       process.on('SIGTERM', shutdown)
     })

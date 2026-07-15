@@ -70,7 +70,16 @@ export interface TaskRecord {
   terminal_event_recorded: boolean
   error_code: string | null
   error_message: string | null
+  /** Machine-readable event-history completeness (survives restart). */
+  history_incomplete: boolean
+  /** Sanitized reason, e.g. `gateway_restart_without_node_replay`. */
+  history_reason: string | null
+  /** Greatest sequence durably consumed BEFORE the known-missing interval. */
+  history_boundary_sequence: number | null
 }
+
+/** Stable reason codes for an incomplete persisted event history. */
+export type HistoryIncompleteReason = 'gateway_restart_without_node_replay'
 
 export interface CreateTaskInput {
   task_id: string

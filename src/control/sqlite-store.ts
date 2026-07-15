@@ -25,7 +25,7 @@ import {
 import {
   SIZE_LIMITS, nowIso, isIsoUtc, encodeJson, boundString, decodeJson, assertValidContext,
 } from './serialization.js'
-import type { ControlStore, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
+import type { ControlStore, GatewayTaskStore, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
 
 export interface OpenControlStoreOptions {
   /** DB path; defaults to `<vibe_dir>/control.sqlite`. Configurable for tests. */
@@ -58,9 +58,53 @@ export function openControlStore(opts: OpenControlStoreOptions = {}): SqliteCont
   return store
 }
 
-export class SqliteControlStore implements ControlStore {
+export class SqliteControlStore implements ControlStore, GatewayTaskStore {
   private closed = false
   constructor(private readonly db: BetterSqlite3.Database, readonly dbPath: string) {}
+
+  // ── synchronous GatewayTaskStore facade (persist-before-publish hot path) ────
+  createTaskDurable(input: CreateTaskInput, createdEvent: TaskEventInput): TaskRecord {
+    this.open()
+    return this.db.transaction(() => { this.createTaskSync(input); this.appendTaskEventSync(input.task_id, createdEvent); return this.toTask(this.taskRow(input.task_id)!) })()
+  }
+  appendTaskEventDurable(taskId: string, event: TaskEventInput): void { this.open(); this.appendTaskEventSync(taskId, event) }
+  updateTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch): TaskRecord { this.open(); return this.updateTaskSync(taskId, expectedRevision, patch) }
+  terminalizeTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch, terminalEvent: TaskEventInput): TaskRecord {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.taskRow(taskId); if (!cur) throw new ControlStoreError('not_found', `task not found: ${taskId}`)
+      if (cur.terminal_event_recorded) throw new ControlStoreError('invalid_transition', 'terminal event already recorded')
+      if (!patch.status || !TASK_TERMINAL_STATUSES.has(patch.status)) throw new ControlStoreError('invalid_transition', 'terminalizeTask requires a terminal status')
+      this.updateTaskSync(taskId, expectedRevision, { ...patch, terminal_at: patch.terminal_at ?? nowIso() })
+      this.appendTaskEventSync(taskId, terminalEvent)
+      this.db.prepare('UPDATE tasks SET terminal_event_recorded = 1 WHERE task_id = ?').run(taskId)
+      return this.toTask(this.taskRow(taskId)!)
+    })()
+  }
+  getTaskRecord(taskId: string): TaskRecord | null { this.open(); const r = this.taskRow(taskId); return r ? this.toTask(r) : null }
+  listNonTerminalTasks(): TaskRecord[] {
+    this.open()
+    return (this.db.prepare("SELECT * FROM tasks WHERE status NOT IN ('completed','failed','cancelled') ORDER BY created_at ASC").all() as TaskRow[]).map((r) => this.toTask(r))
+  }
+  loadTaskEvents(taskId: string): TaskEventRecord[] {
+    this.open()
+    return (this.db.prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY sequence ASC').all(taskId) as TaskEventRow[]).map((r) => ({ task_id: r.task_id, sequence: r.sequence, event_type: r.event_type, ts: r.ts, payload: decodeJson(r.payload_json, SIZE_LIMITS.task_event_payload, 'task_event.payload'), created_at: r.created_at }))
+  }
+  latestTaskEventSequence(taskId: string): number { this.open(); const r = this.taskRow(taskId); if (!r) throw new ControlStoreError('not_found', `task not found: ${taskId}`); return r.last_event_sequence }
+  /** Mark event history incomplete at a persisted cursor boundary (first marking
+   *  wins, preserving the earliest boundary). Does not consume an event sequence
+   *  or alter next_event_id. */
+  markTaskHistoryIncomplete(taskId: string, reason: string, boundarySequence: number): void {
+    this.open(); const r = this.taskRow(taskId); if (!r) throw new ControlStoreError('not_found', `task not found: ${taskId}`)
+    if (r.history_incomplete === 1) return
+    this.db.prepare('UPDATE tasks SET history_incomplete = 1, history_reason = ?, history_boundary_sequence = ? WHERE task_id = ?').run(reason, boundarySequence, taskId)
+  }
+  /** Clear the incomplete marker — reserved for a FUTURE Node journal that has
+   *  verified a gap-free replay past the boundary. Unused today. */
+  clearTaskHistoryIncomplete(taskId: string): void {
+    this.open(); this.db.prepare('UPDATE tasks SET history_incomplete = 0, history_reason = NULL, history_boundary_sequence = NULL WHERE task_id = ?').run(taskId)
+  }
+  closeSync(): void { if (!this.closed) { this.db.close(); this.closed = true } }
 
   // ── lifecycle ──────────────────────────────────────────────────────────────
   migrateSync(): number { this.open(); return runMigrations(this.db) }
@@ -370,7 +414,7 @@ export class SqliteControlStore implements ControlStore {
 
   // ── row → record mappers (untrusted JSON decoded defensively) ────────────────
   private toTask(r: TaskRow): TaskRecord {
-    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message }
+    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence }
   }
   private toWorkflow(r: WorkflowRow): WorkflowRecord {
     return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence }
@@ -381,7 +425,7 @@ export class SqliteControlStore implements ControlStore {
 }
 
 // ── row shapes ─────────────────────────────────────────────────────────────────
-interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null }
+interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null }

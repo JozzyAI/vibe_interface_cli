@@ -102,7 +102,15 @@ CREATE TABLE workflow_events (
 );
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }]
+/** Schema v2 — persisted task event-history completeness metadata (machine-
+ *  readable; survives restart). Additive columns only (no destructive rewrite). */
+const V2 = `
+ALTER TABLE tasks ADD COLUMN history_incomplete INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN history_reason TEXT;
+ALTER TABLE tasks ADD COLUMN history_boundary_sequence INTEGER;
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
