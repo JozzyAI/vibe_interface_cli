@@ -34,7 +34,7 @@ test('create + reopen preserves task and workflow records', async () => {
 test('WAL + foreign_keys + busy_timeout enabled; healthCheck reports schema version', async () => {
   const s = openControlStore({ path: tmpDbPath() })
   const h = await s.healthCheck()
-  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 1)
+  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 2)
   assert.equal(h.busy_timeout, 5000) // default bounded busy timeout
   const s2 = openControlStore({ path: tmpDbPath(), busyTimeoutMs: 1234 })
   assert.equal((await s2.healthCheck()).busy_timeout, 1234) // configurable
@@ -217,6 +217,23 @@ test('DB file is user-only where the platform permits (0600)', async () => {
   if (process.platform !== 'win32') assert.equal(fs.statSync(p).mode & 0o077, 0, 'no group/world bits')
   // and no secret sentinel ever lands in the DB bytes (the store never accepts tokens)
   assert.ok(!fs.readFileSync(p).includes(Buffer.from('SUPERSECRET-TOKEN-FIXTURE')))
+  await s.close()
+})
+
+test('task history-incomplete mark + clear round-trips and survives reopen', async () => {
+  const p = tmpDbPath()
+  let s = openControlStore({ path: p })
+  await s.createTask(seedTask())
+  await s.appendTaskEvent('run_1', { sequence: 0, event_type: 'task.created', ts: iso(), payload: {} })
+  s.markTaskHistoryIncomplete('run_1', 'gateway_restart_without_node_replay', 0)
+  s.markTaskHistoryIncomplete('run_1', 'gateway_restart_without_node_replay', 9) // idempotent: earliest boundary wins
+  assert.equal(s.getTaskRecord('run_1')?.history_incomplete, true)
+  assert.equal(s.getTaskRecord('run_1')?.history_boundary_sequence, 0)
+  await s.close()
+  s = openControlStore({ path: p }) // survives reopen
+  assert.equal(s.getTaskRecord('run_1')?.history_reason, 'gateway_restart_without_node_replay')
+  s.clearTaskHistoryIncomplete('run_1') // reserved future-Node-journal path
+  assert.equal(s.getTaskRecord('run_1')?.history_incomplete, false)
   await s.close()
 })
 

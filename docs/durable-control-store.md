@@ -170,10 +170,93 @@ call repeatedly; reopening an existing valid DB never drops or recreates it). A
 failing migration rolls back and records no version. A DB reporting a **newer**
 schema version than supported **fails closed** (`unsupported_schema_version`);
 there is no destructive downgrade. Corrupt schema metadata returns a structured
-`corruption` error.
+`corruption` error. **Schema v2** adds the task event-history completeness columns
+(`history_incomplete`, `history_reason`, `history_boundary_sequence`) as an
+additive `ALTER TABLE … ADD COLUMN` migration — v1 is never rewritten.
+
+## Gateway wiring & restart recovery
+
+As of the gateway-durable-tasks change, `vibe api serve` **persists Gateway
+tasks** to this store and **recovers non-terminal tasks after a restart** (this
+covers Gateway *tasks* only — the workflow runtime is still not implemented).
+
+- **Default DB & startup:** the gateway opens `<vibe_dir>/control.sqlite`
+  (override with `--db-path`, a filesystem path — never a token) and **migrates
+  before accepting requests**. If the DB is inaccessible, corrupt, too new, or
+  insecure/symlinked, startup **fails clearly** — it never silently falls back to
+  an in-memory store. The store is closed cleanly on graceful shutdown. Tests
+  inject an explicit temporary store and never touch the production DB.
+- **Persisted task lifecycle:** on create, the task record + `task.created` event
+  are persisted **atomically**; each accepted canonical event is durably appended
+  **before** it is published to SSE subscribers; terminal status + the terminal
+  event are persisted atomically and **exactly once**. Public contracts (task
+  IDs, status vocabulary, REST/SSE shapes, wait/resume cursor, cancellation,
+  Bearer auth) are unchanged; a task created before restart keeps the same
+  `task_id`.
+- **Startup recovery:** non-terminal tasks are reloaded and re-registered (so
+  they are immediately addressable via GET/events/cancel), active-slot accounting
+  is rebuilt (recovered running tasks count against the active limit; terminal
+  ones do not), and each task is reconciled against **authoritative** status
+  (`readRun` locally / `remoteRunStatus` remotely). Still-running tasks resume a
+  live pump; terminal reconciliation is monotonic and emits/persists the terminal
+  state exactly once. A node-offline / transient error is **never** fabricated as
+  a terminal failure — recovery retries with bounded backoff and shutdown aborts
+  the recovery pumps/timers cleanly. Terminal/historical tasks remain queryable
+  from the store even though they are not held in memory.
+- **Ambiguous remote-start crash window:** for a remote task the gateway persists
+  the task record + `task.created` **before** attempting remote start (with
+  `remote_run_id` unbound), using a **gateway-owned public `task_id` decoupled
+  from the relay run id**, then durably **binds** `remote_run_id` after a
+  successful start. So a crash mid-start leaves a **durable, still-queryable
+  task** — the uncertainty is only the *remote linkage*, not the task identity.
+  On restart, a task with an unbound `remote_run_id` is treated as an **ambiguous
+  start**: it is **never auto-restarted** (that could duplicate a Claude Code /
+  Codex run), no remote run id is guessed, no broad cancellation is issued, and it
+  is transitioned **exactly once** to a sanitized `recovery_unknown_start`
+  failure. Recovery is idempotent across repeated restarts.
+- **Missing events during downtime — structured completeness metadata:** there is
+  **no Node-side event journal/replay yet**, so when the gateway resumes a running
+  **remote** task after a restart, events emitted during downtime may be missing.
+  This is recorded as **machine-readable, persisted** metadata on the task
+  (schema v2): `history.complete=false`, `incomplete_reason:
+  "gateway_restart_without_node_replay"`, `earliest_retained_sequence`, and
+  `boundary_sequence` (the greatest sequence durably consumed before the missing
+  interval). It is exposed on the REST `GET /v1/tasks/:id` response (an optional
+  `history` object — older clients ignore it) and therefore through the MCP task
+  tools; the SSE stream **also** keeps a human-readable `: warning …` comment, but
+  that is no longer the only signal. This never consumes a canonical `TaskEvent`
+  sequence, never changes `next_event_id` semantics, and the gateway **never
+  invents or renumbers** events — the resume cursor stays the greatest event
+  actually persisted/consumed. It is **not** set for normally-completed
+  uninterrupted tasks, historical terminal tasks, or local tasks (whose full
+  stream is deterministically replayable from the run event log). A **future Node
+  journal** that verifies a gap-free replay past the boundary can clear the marker
+  (`clearTaskHistoryIncomplete`, reserved and unused today).
+
+## Durable recovery — requirement → test coverage
+
+| Guarantee | Directly asserted by |
+|-----------|----------------------|
+| Task identity survives store close/reopen (same `task_id`) | `agent-gateway-durable` #1, #2 |
+| Terminal task + events survive restart; gap/dup-free replay | `agent-gateway-durable` #2 |
+| Persistence-before-publish (unsaved event not published) | `agent-gateway-durable` "persistence failure …" |
+| Ambiguous start not restarted; identity survives; terminalized once; idempotent | `agent-gateway-durable` "ambiguous remote start …" |
+| Known `remote_run_id` running recovery → reconciles to completed | `agent-gateway-remote-recovery` |
+| Known `remote_run_id` terminal reconciliation, exactly-once terminal | `agent-gateway-remote-recovery` |
+| Node-offline / transient recovery stays non-terminal, bounded retry | recovery retry logic (`reconcileRecovered`) + local `recovery_run_missing` path (`agent-gateway-durable`) |
+| Recovered task cancellable (idempotent) | `agent-gateway-durable` #5 (local) + `agent-gateway-remote` cancel |
+| Recovered active-slot accounting (active counts; terminal frees) | `agent-gateway-durable` #4 + `agent-gateway-remote-recovery` |
+| Terminal event exactly once across recovery | `agent-gateway-durable` #2 + `agent-gateway-remote-recovery` |
+| Structured history-incomplete metadata survives reopen + exposed | `agent-gateway-durable` "history-incomplete …" + `control-store` mark/clear + `agent-gateway-remote-recovery` |
+| `Last-Event-ID` replay then live remote events, no boundary gap/dup | `agent-gateway-remote-recovery` |
+| `next_event_id` = greatest consumed persisted event | `agent-gateway-remote-recovery` |
+| Shutdown aborts retry timers/pumps (clean exit) | `agent-gateway-durable` (suite exits cleanly; `close()` clears `recoveryTimers` + aborts pumps) |
+| DB holds no configured token; no production DB touched | `agent-gateway-durable` #6; suite-wide temp DBs |
 
 ## Current limitations
 
-- The **live Gateway is not wired** to this store yet — tasks are not persisted
-  or recovered by the running gateway.
-- There is **no Node-side replay across Gateway downtime** yet.
+- **No Node-side event replay** across Gateway downtime — events emitted while
+  the gateway was unavailable can be permanently missing (surfaced as truncated).
+- **No workflow runtime** — workflow tables exist but nothing executes workflows.
+- The ambiguous remote-start crash window above (no pre-start correlation id
+  without a protocol redesign).

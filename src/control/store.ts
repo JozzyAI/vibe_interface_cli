@@ -13,6 +13,35 @@ import type {
   WorkflowSnapshot,
 } from './records.js'
 
+/**
+ * SYNCHRONOUS task-persistence facade used by the Agent Gateway hot path, where
+ * an event MUST be durably appended BEFORE it is published to SSE subscribers.
+ * The concrete SQLite backend is synchronous, so these can't be lost to an
+ * unresolved promise between "append" and "publish". Kept narrow so the gateway
+ * depends only on what it needs (and it can be faked in tests).
+ */
+export interface GatewayTaskStore {
+  /** Atomically persist a new task record + its `task.created` event. */
+  createTaskDurable(input: CreateTaskInput, createdEvent: TaskEventInput): TaskRecord
+  /** Append an accepted canonical event (idempotent/gap-checked) BEFORE publish. */
+  appendTaskEventDurable(taskId: string, event: TaskEventInput): void
+  updateTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch): TaskRecord
+  /** Atomically persist terminal status + exactly one terminal event. */
+  terminalizeTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch, terminalEvent: TaskEventInput): TaskRecord
+  getTaskRecord(taskId: string): TaskRecord | null
+  /** Non-terminal persisted tasks (for restart recovery). */
+  listNonTerminalTasks(): TaskRecord[]
+  loadTaskEvents(taskId: string): TaskEventRecord[]
+  latestTaskEventSequence(taskId: string): number
+  /** Mark event history incomplete at a persisted boundary (idempotent; earliest
+   *  boundary wins). Never consumes an event sequence or changes next_event_id. */
+  markTaskHistoryIncomplete(taskId: string, reason: string, boundarySequence: number): void
+  /** Clear the marker — reserved for a future Node journal after a verified
+   *  gap-free replay. */
+  clearTaskHistoryIncomplete(taskId: string): void
+  closeSync(): void
+}
+
 export interface Pagination { limit?: number; offset?: number }
 export interface TaskFilters { status?: string; node_id?: string }
 export interface WorkflowFilters { status?: string }
