@@ -40,7 +40,8 @@ or any `*_aes_key`.
   "input": { "text": "Fix the failing auth test" },   // required
   "workspace": { "path": "…", "repo_url": "…", "branch": "…", "workspace_key": "…" },
   "execution": { "permission_mode": "default", "timeout_seconds": 1800 },
-  "metadata": { "source": "symphony", "issue_id": "JOZ-21" }
+  "metadata": { "source": "symphony", "issue_id": "JOZ-21" },
+  "idempotency_key": "step:wf_1.plan.r1.a1"   // optional; create-or-return
 }
 ```
 
@@ -54,6 +55,7 @@ or any `*_aes_key`.
   runtime generates its own)
 - `execution.permission_mode` (`default` | `unsafe-skip`)
 - `metadata`
+- `idempotency_key` (optional; see **Idempotent creation** below)
 
 **Reserved / deferred fields (rejected with `invalid_request` / 400):**
 `workspace.path`, `workspace.repo_url`, `workspace.branch`,
@@ -76,6 +78,35 @@ error **never echoes** the submitted path/URL/branch/timeout or an unsafe
 
 Deliberately **excluded** for the MVP arc: approvals, follow-up messages,
 artifacts, file transfer, multi-user ownership.
+
+### Idempotent creation (`idempotency_key`)
+
+An optional client-supplied key that makes task creation **safe to retry** across
+a client/process crash. Retrying the identical creation request with the same key
+returns the **same** durable task instead of starting a second run. This requires
+a durable control store (`vibe api serve` with a control DB); without one the key
+is rejected with `invalid_request`.
+
+- **Value** — a bounded ASCII-safe identifier (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`,
+  ≤128 chars; no whitespace, control characters, path separators, or arbitrary
+  Unicode). It is a first-class validated field — never read from `metadata`. It is
+  **not** a task id, **not** a credential, and **never** reaches the relay/node/
+  backend. The future WorkflowRuntime will pass a step's `step_execution_id` here.
+- **First create** — the normal creation status (**202**), no replay header.
+- **Idempotent replay** — the identical request returns **200** with the same
+  `task_id` and its current durable state (running, terminal, or ambiguous recovery
+  state), plus a backward-compatible `Idempotency-Replayed: true` header (old
+  clients may ignore it). No second task, `task.created` event, run, or active slot;
+  a replay succeeds even when the active-task limit is full.
+- **Conflict** — the same key with a request whose execution semantics changed
+  (different agent, node_id, prompt, workspace, permission, or metadata) returns
+  **409** `idempotency_conflict`. The error never reveals the prior prompt, request
+  differences, fingerprint values, DB paths, SQL, or stack traces.
+- **Concurrency** — the store's partial unique index on the key is the final
+  authority: concurrent same-key requests (even across two Gateway connections)
+  create exactly one task and exactly one backend start; the losers receive the
+  same `task_id`. See `docs/durable-control-store.md` for the create-or-return,
+  crash-window, active-slot, and retention/key-reuse semantics.
 
 ## Task status
 

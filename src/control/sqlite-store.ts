@@ -14,7 +14,7 @@ import type BetterSqlite3 from 'better-sqlite3'
 import { vibeDir } from '../config.js'
 import { runMigrations, LATEST_SCHEMA_VERSION } from './migrations.js'
 import {
-  ControlStoreError, isStepScopedEvent, isTaskEventType, isWorkflowEventType,
+  ControlStoreError, isSafeId, isStepScopedEvent, isTaskEventType, isWorkflowEventType,
   TASK_TERMINAL_STATUSES, WORKFLOW_TERMINAL_STATUSES, STEP_TERMINAL_STATUSES,
   validateCreateTask, validateCreateWorkflow, validateCreateStepExecution,
   type TaskRecord, type CreateTaskInput, type TaskPatch, type TaskEventInput, type TaskEventRecord,
@@ -66,6 +66,43 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
   createTaskDurable(input: CreateTaskInput, createdEvent: TaskEventInput): TaskRecord {
     this.open()
     return this.db.transaction(() => { this.createTaskSync(input); this.appendTaskEventSync(input.task_id, createdEvent); return this.toTask(this.taskRow(input.task_id)!) })()
+  }
+  getTaskByIdempotencyKey(key: string): TaskRecord | null {
+    this.open()
+    const r = this.db.prepare('SELECT * FROM tasks WHERE idempotency_key = ?').get(key) as TaskRow | undefined
+    return r ? this.toTask(r) : null
+  }
+  createTaskIdempotently(input: CreateTaskInput, createdEvent: TaskEventInput): { record: TaskRecord; created: boolean } {
+    this.open()
+    const key = input.idempotency_key
+    if (typeof key !== 'string' || !isSafeId(key)) throw new ControlStoreError('invalid_record', 'createTaskIdempotently requires a safe idempotency_key')
+    if (typeof input.request_fingerprint !== 'string' || input.request_fingerprint === '') throw new ControlStoreError('invalid_record', 'createTaskIdempotently requires a request_fingerprint')
+    const fp = input.request_fingerprint
+    // Resolve an already-present key: same fingerprint → idempotent replay; a
+    // different fingerprint is a conflict (the request's MEANING changed). The
+    // message never echoes either request.
+    const resolveExisting = (row: TaskRow): { record: TaskRecord; created: boolean } => {
+      if (row.request_fingerprint !== fp) throw new ControlStoreError('idempotency_conflict', 'a task already exists for this idempotency_key with a different request')
+      return { record: this.toTask(row), created: false }
+    }
+    try {
+      return this.db.transaction(() => {
+        const existing = this.db.prepare('SELECT * FROM tasks WHERE idempotency_key = ?').get(key) as TaskRow | undefined
+        if (existing) return resolveExisting(existing)
+        this.createTaskSync(input)
+        this.appendTaskEventSync(input.task_id, createdEvent)
+        return { record: this.toTask(this.taskRow(input.task_id)!), created: true }
+      })()
+    } catch (e) {
+      if (e instanceof ControlStoreError) throw e // conflict / validation propagate unchanged
+      // A concurrent cross-connection insert won the race: the partial unique index
+      // rejected ours. Re-read outside the rolled-back txn and resolve to the winner.
+      if (isUniqueConstraintError(e)) {
+        const existing = this.db.prepare('SELECT * FROM tasks WHERE idempotency_key = ?').get(key) as TaskRow | undefined
+        if (existing) return resolveExisting(existing)
+      }
+      throw e
+    }
   }
   appendTaskEventDurable(taskId: string, event: TaskEventInput): void { this.open(); this.appendTaskEventSync(taskId, event) }
   updateTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch): TaskRecord { this.open(); return this.updateTaskSync(taskId, expectedRevision, patch) }
@@ -310,10 +347,18 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     if (this.taskRow(input.task_id)) throw new ControlStoreError('duplicate', `task already exists: ${input.task_id}`)
     const metadata_json = input.metadata != null ? encodeJson(input.metadata, SIZE_LIMITS.metadata_json, 'task.metadata') : null
     const input_text = input.input_text != null ? boundString(input.input_text, SIZE_LIMITS.input_text, 'task.input_text') : null
+    // Bound the idempotency key BEFORE any DB write (defense in depth; the gateway
+    // validates too). The stored fingerprint is a bounded digest, never the prompt.
+    let idempotency_key: string | null = null
+    if (input.idempotency_key != null) {
+      if (!isSafeId(input.idempotency_key)) throw new ControlStoreError('invalid_record', 'task.idempotency_key is not a safe id')
+      idempotency_key = input.idempotency_key
+    }
+    const request_fingerprint = input.request_fingerprint != null ? boundString(input.request_fingerprint, 256, 'task.request_fingerprint') : null
     const now = nowIso()
-    this.db.prepare(`INSERT INTO tasks (task_id,revision,node_id,agent,workspace_key,permission_mode,status,remote_run_id,input_text,metadata_json,created_at,updated_at,terminal_at,last_event_sequence,earliest_retained_sequence,terminal_event_recorded,error_code,error_message)
-      VALUES (@task_id,1,@node_id,@agent,@workspace_key,@permission_mode,@status,@remote_run_id,@input_text,@metadata_json,@now,@now,NULL,-1,0,0,NULL,NULL)`)
-      .run({ task_id: input.task_id, node_id: input.node_id ?? null, agent: input.agent, workspace_key: input.workspace_key ?? null, permission_mode: input.permission_mode ?? null, status: input.status, remote_run_id: input.remote_run_id ?? null, input_text, metadata_json, now })
+    this.db.prepare(`INSERT INTO tasks (task_id,revision,node_id,agent,workspace_key,permission_mode,status,remote_run_id,input_text,metadata_json,created_at,updated_at,terminal_at,last_event_sequence,earliest_retained_sequence,terminal_event_recorded,error_code,error_message,idempotency_key,request_fingerprint)
+      VALUES (@task_id,1,@node_id,@agent,@workspace_key,@permission_mode,@status,@remote_run_id,@input_text,@metadata_json,@now,@now,NULL,-1,0,0,NULL,NULL,@idempotency_key,@request_fingerprint)`)
+      .run({ task_id: input.task_id, node_id: input.node_id ?? null, agent: input.agent, workspace_key: input.workspace_key ?? null, permission_mode: input.permission_mode ?? null, status: input.status, remote_run_id: input.remote_run_id ?? null, input_text, metadata_json, idempotency_key, request_fingerprint, now })
     return this.toTask(this.taskRow(input.task_id)!)
   }
 
@@ -459,7 +504,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 
   // ── row → record mappers (untrusted JSON decoded defensively) ────────────────
   private toTask(r: TaskRow): TaskRecord {
-    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence, last_remote_event_sequence: r.last_remote_event_sequence }
+    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence, last_remote_event_sequence: r.last_remote_event_sequence, idempotency_key: r.idempotency_key, request_fingerprint: r.request_fingerprint }
   }
   private toWorkflow(r: WorkflowRow): WorkflowRecord {
     return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence }
@@ -470,11 +515,19 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 }
 
 // ── row shapes ─────────────────────────────────────────────────────────────────
-interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null }
+interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null; idempotency_key: string | null; request_fingerprint: string | null }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
+
+/** A better-sqlite3 UNIQUE/PRIMARYKEY constraint violation (the idempotency-key
+ *  index is the final authority under concurrent cross-connection inserts). */
+function isUniqueConstraintError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false
+  const code = (e as unknown as { code?: unknown }).code
+  return typeof code === 'string' && code.startsWith('SQLITE_CONSTRAINT')
+}
 
 function clampLimit(n?: number): number { return Number.isInteger(n) && (n as number) > 0 ? Math.min(n as number, 10000) : 1000 }
 function clampOffset(n?: number): number { return Number.isInteger(n) && (n as number) >= 0 ? (n as number) : 0 }

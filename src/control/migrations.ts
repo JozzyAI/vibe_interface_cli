@@ -123,7 +123,21 @@ ALTER TABLE task_events ADD COLUMN source_sequence INTEGER;
 CREATE UNIQUE INDEX idx_task_events_source ON task_events(task_id, source_sequence) WHERE source_sequence IS NOT NULL;
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }]
+/** Schema v4 — idempotent task creation. `idempotency_key` is an OPTIONAL client-
+ *  supplied stable identifier (e.g. a future workflow step_execution_id); the
+ *  partial unique index enforces at most one durable task per non-null key (the
+ *  authoritative create-or-return primitive). `request_fingerprint` is a
+ *  deterministic digest of the normalized semantic request (NOT the prompt) used
+ *  to detect a same-key request whose meaning changed (→ conflict). Both are
+ *  nullable (legacy/non-idempotent tasks stay NULL). The key is NOT a task id, a
+ *  credential, or a remote run id. Additive only — v1/v2/v3 are never rewritten. */
+const V4 = `
+ALTER TABLE tasks ADD COLUMN idempotency_key TEXT;
+ALTER TABLE tasks ADD COLUMN request_fingerprint TEXT;
+CREATE UNIQUE INDEX idx_tasks_idempotency_key ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

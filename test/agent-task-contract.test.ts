@@ -161,6 +161,18 @@ test('validateCreateTaskRequest accepts a valid v1 request (supported fields onl
   assert.ok(noKey.ok)
 })
 
+test('validateCreateTaskRequest accepts a valid idempotency_key and rejects malformed keys (invalid_request, no echo)', () => {
+  const ok = validateCreateTaskRequest({ agent: 'mock', input: { text: 'x' }, idempotency_key: 'step:exec-01.a-B' })
+  assert.ok(ok.ok); if (ok.ok) assert.equal(ok.value.idempotency_key, 'step:exec-01.a-B')
+  // a step_execution_id-shaped key is valid (the intended future caller value)
+  assert.ok(validateCreateTaskRequest({ agent: 'mock', input: { text: 'x' }, idempotency_key: 'wf_1.plan.r1.a1' }).ok)
+  for (const key of ['has space', 'a/b', 'a\\b', 'x'.repeat(129), '', 'ünïcode', 42, '.leading']) {
+    const r = validateCreateTaskRequest({ agent: 'mock', input: { text: 'x' }, idempotency_key: key })
+    assert.ok(!r.ok, `should reject ${JSON.stringify(key)}`)
+    if (!r.ok) assert.equal(r.error.code, 'invalid_request')
+  }
+})
+
 test('validateCreateTaskRequest rejects each malformed shape with invalid_request', () => {
   const bad: unknown[] = [
     null, 'str', 7,
@@ -270,14 +282,14 @@ test('buildAgentDescriptors: streaming only when known; node_id optional', () =>
 // ── error mapping ────────────────────────────────────────────────────────────
 
 test('apiError applies default retryability + http status per code', () => {
-  const codes: ApiErrorCode[] = ['invalid_request', 'unauthorized', 'agent_unavailable', 'node_offline', 'service_unavailable', 'task_not_found', 'invalid_state_transition', 'cancellation_conflict', 'internal_error']
+  const codes: ApiErrorCode[] = ['invalid_request', 'unauthorized', 'agent_unavailable', 'node_offline', 'service_unavailable', 'task_not_found', 'invalid_state_transition', 'cancellation_conflict', 'idempotency_conflict', 'internal_error']
   const status: Record<ApiErrorCode, number> = {
     invalid_request: 400, unauthorized: 401, task_not_found: 404, cancellation_conflict: 409,
-    invalid_state_transition: 409, agent_unavailable: 422, node_offline: 503, service_unavailable: 503, internal_error: 500,
+    invalid_state_transition: 409, idempotency_conflict: 409, agent_unavailable: 422, node_offline: 503, service_unavailable: 503, internal_error: 500,
   }
   const retryable: Record<ApiErrorCode, boolean> = {
     invalid_request: false, unauthorized: false, agent_unavailable: false, node_offline: true,
-    service_unavailable: true, task_not_found: false, invalid_state_transition: false, cancellation_conflict: false, internal_error: true,
+    service_unavailable: true, task_not_found: false, invalid_state_transition: false, cancellation_conflict: false, idempotency_conflict: false, internal_error: true,
   }
   for (const c of codes) {
     const e = apiError(c, 'msg', { ts: 'T' })

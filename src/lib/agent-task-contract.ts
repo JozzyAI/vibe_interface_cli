@@ -199,7 +199,21 @@ export interface CreateTaskRequest {
     permission_mode?: PermissionMode
   }
   metadata?: Record<string, unknown>
+  /** OPTIONAL client-supplied idempotency key. Retrying the SAME creation request
+   *  with the SAME key returns the SAME durable task instead of starting a second
+   *  run (the future WorkflowRuntime will pass a step_execution_id here). It is a
+   *  bounded safe identifier — NOT a task id, NOT a credential, NEVER forwarded to
+   *  the relay/node/backend. */
+  idempotency_key?: string
 }
+
+/**
+ * A valid idempotency key: starts alphanumeric, then alphanumeric/`.`/`_`/`:`/`-`,
+ * max 128 chars. Deliberately identical to the durable store's safe-id shape so a
+ * WorkflowStepExecutionRef.step_execution_id is a valid key. Rejects whitespace,
+ * control characters, path separators (`/`, `\`), and arbitrary Unicode.
+ */
+export const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
 /**
  * Opaque workspace key: an identifier the runtime uses to key a run's workspace —
@@ -272,11 +286,21 @@ export function validateCreateTaskRequest(
 
   if (b.metadata !== undefined && !isPlainObject(b.metadata)) return fail('`metadata` must be an object')
 
+  // Optional idempotency key — a FIRST-CLASS validated field (never hidden inside
+  // metadata). Fail closed on a malformed/oversized key (invalid_request, not an
+  // internal error). The submitted value is never echoed in the error.
+  if (b.idempotency_key !== undefined) {
+    if (typeof b.idempotency_key !== 'string' || !IDEMPOTENCY_KEY_RE.test(b.idempotency_key)) {
+      return fail('`idempotency_key` must be a bounded safe identifier matching ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ (no whitespace, control characters, path separators, or arbitrary Unicode)')
+    }
+  }
+
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }
   if (typeof b.node_id === 'string') value.node_id = b.node_id
   if (workspace && typeof workspace.workspace_key === 'string') value.workspace = { workspace_key: workspace.workspace_key }
   if (exec && exec.permission_mode) value.execution = { permission_mode: exec.permission_mode as PermissionMode }
   if (isPlainObject(b.metadata)) value.metadata = b.metadata
+  if (typeof b.idempotency_key === 'string') value.idempotency_key = b.idempotency_key
   return { ok: true, value }
 }
 
@@ -375,6 +399,7 @@ export type ApiErrorCode =
   | 'task_not_found'
   | 'invalid_state_transition'
   | 'cancellation_conflict'
+  | 'idempotency_conflict'
   | 'internal_error'
 
 // Only the opaque `task_id` is exposed on the wire — the internal `run_id` is
@@ -400,6 +425,7 @@ const RETRYABLE: Record<ApiErrorCode, boolean> = {
   task_not_found: false,
   invalid_state_transition: false,
   cancellation_conflict: false,
+  idempotency_conflict: false,
   internal_error: true,
 }
 
@@ -431,6 +457,7 @@ export function apiErrorHttpStatus(code: ApiErrorCode): number {
     case 'task_not_found': return 404
     case 'cancellation_conflict': return 409
     case 'invalid_state_transition': return 409
+    case 'idempotency_conflict': return 409
     case 'agent_unavailable': return 422
     case 'node_offline': return 503
     case 'service_unavailable': return 503

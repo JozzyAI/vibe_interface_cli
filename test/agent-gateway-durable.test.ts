@@ -194,6 +194,8 @@ function sseTypes(port: number, id: string, ms = 2000): Promise<string[]> {
 class ThrowingStore implements GatewayTaskStore {
   constructor(private readonly inner: SqliteControlStore, private readonly throwOn: string) {}
   createTaskDurable(i: CreateTaskInput, e: TaskEventInput) { return this.inner.createTaskDurable(i, e) }
+  getTaskByIdempotencyKey(k: string) { return this.inner.getTaskByIdempotencyKey(k) }
+  createTaskIdempotently(i: CreateTaskInput, e: TaskEventInput) { return this.inner.createTaskIdempotently(i, e) }
   appendTaskEventDurable(id: string, e: TaskEventInput) { if (e.event_type === this.throwOn) throw new Error('injected persistence failure'); return this.inner.appendTaskEventDurable(id, e) }
   updateTaskDurable(id: string, r: number, p: TaskPatch) { return this.inner.updateTaskDurable(id, r, p) }
   terminalizeTaskDurable(id: string, r: number, p: TaskPatch, e: TaskEventInput) { return this.inner.terminalizeTaskDurable(id, r, p, e) }

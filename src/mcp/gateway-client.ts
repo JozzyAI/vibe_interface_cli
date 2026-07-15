@@ -42,6 +42,19 @@ export class GatewayApiError extends Error {
   constructor(public readonly api: GatewayError) { super(api.message) }
 }
 
+/** Typed create-task request body. `idempotency_key` is optional; supplying it lets
+ *  a caller (e.g. a future WorkflowRuntime, keyed by step_execution_id) retry the
+ *  identical request safely and get the SAME task back instead of a second run. */
+export interface StartTaskRequest {
+  agent: string
+  node_id?: string
+  input: { text: string }
+  workspace?: { workspace_key?: string }
+  execution?: { permission_mode?: string }
+  metadata?: Record<string, unknown>
+  idempotency_key?: string
+}
+
 export function isLoopbackGatewayUrl(url: string): boolean {
   try { return LOOPBACK_HOSTS.has(new URL(url).hostname) } catch { return false }
 }
@@ -162,7 +175,9 @@ export class GatewayClient {
   }
 
   async listAgents(): Promise<unknown> { return this.request('GET', '/v1/agents') }
-  async startTask(body: unknown): Promise<unknown> { return this.request('POST', '/v1/tasks', body) }
+  /** Create a task. `idempotency_key` (optional) makes create-or-return safe across
+   *  a crash/retry — the future WorkflowRuntime passes a step_execution_id here. */
+  async startTask(body: StartTaskRequest | Record<string, unknown>): Promise<unknown> { return this.request('POST', '/v1/tasks', body) }
   async getTask(taskId: string): Promise<unknown> { return this.request('GET', `/v1/tasks/${encodeURIComponent(taskId)}`) }
   async cancelTask(taskId: string): Promise<unknown> { return this.request('POST', `/v1/tasks/${encodeURIComponent(taskId)}/cancel`) }
 

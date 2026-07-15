@@ -39,8 +39,9 @@ import {
   apiError, runErrorToApiError, apiErrorHttpStatus, isTerminalTaskStatus,
   type Task, type TaskEvent, type TaskEventType, type ApiError,
 } from './agent-task-contract.js'
+import { computeRequestFingerprint } from './request-fingerprint.js'
 import type { GatewayTaskStore } from '../control/store.js'
-import type { CreateTaskInput, TaskEventInput, TaskRecord } from '../control/records.js'
+import { ControlStoreError, type CreateTaskInput, type TaskEventInput, type TaskRecord } from '../control/records.js'
 
 /** Map a canonical TaskEvent to the durable append shape (no secrets, bounded). */
 function toEventInput(ev: TaskEvent): TaskEventInput { return { sequence: ev.seq, event_type: ev.type, ts: ev.ts, payload: ev.payload } }
@@ -163,10 +164,17 @@ function bearerMatches(req: http.IncomingMessage, apiToken: string): boolean {
 
 // ── JSON helpers (structured errors only; never leak stacks or the token) ─────
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+function sendJson(res: http.ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>): void {
   const payload = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(payload) })
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(payload), ...(extraHeaders ?? {}) })
   res.end(payload)
+}
+
+/** Backward-compatible marker on an idempotent-replay response (old clients ignore it). */
+const REPLAY_HEADERS = { 'idempotency-replayed': 'true' } as const
+/** Structured, non-echoing conflict for a same-key request whose meaning changed. */
+function idempotencyConflict(): ApiError {
+  return apiError('idempotency_conflict', 'a task already exists for this idempotency_key with a different request', { retryable: false })
 }
 
 function sendError(res: http.ServerResponse, err: ApiError, httpStatus: number): void {
@@ -622,6 +630,34 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     }
     // Remote agent validity is enforced by the target node (agent_not_supported).
 
+    // ── idempotency pre-check (BEFORE any active-slot reservation) ─────────────
+    // A client-supplied idempotency_key makes create-or-return safe across a client
+    // crash/retry. It requires a durable store (the SQLite partial unique index is
+    // the authoritative dedupe). The read-only pre-check lets an existing task REPLAY
+    // WITHOUT consuming a slot — so a retry succeeds even when the active limit is
+    // full. A genuinely new key still falls through to the normal capacity check.
+    const idemKey = reqv.idempotency_key
+    let fingerprint: string | undefined
+    if (idemKey) {
+      if (!persist) return sendError(res, apiError('invalid_request', 'idempotency_key requires a durable task store (start `vibe api serve` with a control database)'), 400)
+      fingerprint = computeRequestFingerprint(reqv)
+      let existing: TaskRecord | null = null
+      try { existing = persist.getTaskByIdempotencyKey(idemKey) } catch { existing = null }
+      if (existing) {
+        if (existing.request_fingerprint !== fingerprint) return sendError(res, idempotencyConflict(), 409)
+        // Idempotent replay: the SAME durable task (running, terminal, or ambiguous
+        // recovery state) — no new task, no second run, no slot.
+        return sendJson(res, 200, { ...taskRecordToTask(existing), history: historyField(existing) }, REPLAY_HEADERS)
+      }
+    }
+    /** Persist a new task durably. With an idempotency key this is the atomic
+     *  create-or-return (SQLite uniqueness is the final authority under a concurrent
+     *  same-key race); without one it is the plain durable create (always created). */
+    const persistCreate = (input: CreateTaskInput, createdEv: TaskEvent): { record: TaskRecord; created: boolean } => {
+      if (idemKey) return persist!.createTaskIdempotently({ ...input, idempotency_key: idemKey, request_fingerprint: fingerprint! }, toEventInput(createdEv))
+      return { record: persist!.createTaskDurable(input, toEventInput(createdEv)), created: true }
+    }
+
     // Active-task cap. Count + reserve atomically (this block has no await), so
     // concurrent creates cannot exceed the cap. Existing tasks are NOT evicted.
     if (activeCount + pendingCreates >= maxActive) {
@@ -668,13 +704,23 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       }
       const createdEv = synthEvent(task, 'task.created', { agent: reqv.agent as AgentBackend })
       try {
-        const rec = persist.createTaskDurable({
+        const r = persistCreate({
           task_id: taskId, node_id: reqv.node_id!, agent: reqv.agent as AgentBackend,
           workspace_key: reqv.workspace?.workspace_key ?? null, permission_mode: reqv.execution?.permission_mode ?? null,
           status: 'queued', remote_run_id: null, input_text: reqv.input.text, metadata: reqv.metadata ?? null,
-        } satisfies CreateTaskInput, toEventInput(createdEv))
-        task.revision = rec.revision
-      } catch { release(); try { fs.unlinkSync(promptFile) } catch { /* */ } return sendError(res, apiError('internal_error', 'failed to persist task'), 500) }
+        } satisfies CreateTaskInput, createdEv)
+        task.revision = r.record.revision
+        if (!r.created) {
+          // A concurrent same-key create already won → do NOT start a second remote
+          // run. Return the existing durable task (replay); free the reserved slot.
+          release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
+          return sendJson(res, 200, { ...taskRecordToTask(r.record), history: historyField(r.record) }, REPLAY_HEADERS)
+        }
+      } catch (err) {
+        release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
+        if (err instanceof ControlStoreError && err.code === 'idempotency_conflict') return sendError(res, idempotencyConflict(), 409)
+        return sendError(res, apiError('internal_error', 'failed to persist task'), 500)
+      }
 
       let rrec: RunRecord
       try {
@@ -750,16 +796,30 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     const createdEv = synthEvent(task, 'task.created', { agent: record.agent })
     if (persist) {
       // Atomically persist the task record + task.created BEFORE exposing the task.
+      // With an idempotency key (LOCAL path — remote+persist returned above), the
+      // cheap mock run already started; if create-or-return finds we LOST the race
+      // (or the request conflicts), COMPENSATE by stopping that duplicate run and
+      // return the winning task / a conflict — never expose a second run.
       try {
-        const rec = persist.createTaskDurable({
+        const r = persistCreate({
           task_id: task.taskId, node_id: nodeId, agent: record.agent,
           workspace_key: reqv.workspace?.workspace_key ?? null,
           permission_mode: reqv.execution?.permission_mode ?? null,
           status: runStatusToTaskStatus(record.status), remote_run_id: remoteRunId,
           input_text: reqv.input.text, metadata: reqv.metadata ?? null,
-        } satisfies CreateTaskInput, toEventInput(createdEv))
-        task.revision = rec.revision
-      } catch { release(); return sendError(res, apiError('internal_error', 'failed to persist task'), 500) }
+        } satisfies CreateTaskInput, createdEv)
+        task.revision = r.record.revision
+        if (!r.created) {
+          release(); try { stopRun(task.taskId) } catch { /* compensate the duplicate local run */ }
+          const winner = idemKey ? persist.getTaskByIdempotencyKey(idemKey) : null
+          if (winner) return sendJson(res, 200, { ...taskRecordToTask(winner), history: historyField(winner) }, REPLAY_HEADERS)
+          return sendError(res, apiError('internal_error', 'idempotency resolution failed'), 500)
+        }
+      } catch (err) {
+        release(); try { stopRun(task.taskId) } catch { /* compensate the duplicate local run */ }
+        if (err instanceof ControlStoreError && err.code === 'idempotency_conflict') return sendError(res, idempotencyConflict(), 409)
+        return sendError(res, apiError('internal_error', 'failed to persist task'), 500)
+      }
     }
     tasks.set(task.taskId, task)
     pendingCreates-- // reservation becomes a live active task
