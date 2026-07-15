@@ -13,6 +13,10 @@ import type {
   WorkflowSnapshot,
 } from './records.js'
 
+/** A workflow event without a `sequence` — the store assigns the next contiguous
+ *  sequence when it appends the event inside a runtime composite. */
+export type WorkflowEventDraft = Omit<WorkflowEventInput, 'sequence'>
+
 /**
  * SYNCHRONOUS task-persistence facade used by the Agent Gateway hot path, where
  * an event MUST be durably appended BEFORE it is published to SSE subscribers.
@@ -130,6 +134,22 @@ export interface ControlStore {
   startWorkflowStep(step: CreateStepExecutionInput, workflowExpectedRevision: number, workflowPatch: WorkflowPatch, event: WorkflowEventInput): Promise<{ step: StepExecutionRecord; workflow: WorkflowRecord }>
   bindStepTask(stepExecutionId: string, stepExpectedRevision: number, taskId: string, workflowId: string, workflowExpectedRevision: number, event: WorkflowEventInput): Promise<{ step: StepExecutionRecord; workflow: WorkflowRecord }>
   checkpointWorkflow(workflowId: string, workflowExpectedRevision: number, patch: WorkflowPatch, contextExpectedRevision: number | null, context: unknown | undefined, event: WorkflowEventInput): Promise<WorkflowRecord>
+
+  // ── workflow-runtime composites (atomic; idempotent for crash recovery) ──────
+  // These auto-assign the next contiguous workflow event sequence, so callers pass
+  // event DRAFTS (no `sequence`). Each is a single transaction; the idempotency
+  // guards make a re-run after a crash a safe no-op.
+  createWorkflowWithLifecycleEvents(input: CreateWorkflowInput, context: unknown, createdEvent: WorkflowEventDraft, validatedEvent: WorkflowEventDraft): Promise<WorkflowRecord>
+  startWorkflowDurably(workflowId: string, startedEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; started: boolean }>
+  getStepExecutionByKey(workflowId: string, stepId: string, round: number, attempt: number): Promise<StepExecutionRecord | null>
+  ensureStepStarted(step: CreateStepExecutionInput, currentStepId: string, startedEvent: WorkflowEventDraft): Promise<{ step: StepExecutionRecord; workflow: WorkflowRecord; created: boolean }>
+  bindStepTaskOnce(stepExecutionId: string, taskId: string, workflowId: string, event: WorkflowEventDraft): Promise<{ step: StepExecutionRecord; bound: boolean }>
+  completeStepAndCheckpoint(stepExecutionId: string, output: unknown, workflowId: string, contextExpectedRevision: number | null, context: unknown | undefined, event: WorkflowEventDraft): Promise<{ step: StepExecutionRecord; completed: boolean }>
+  advanceWorkflow(workflowId: string, edgeSelectedEvent: WorkflowEventDraft, roundAdvancedEvent: WorkflowEventDraft | null, nextStep: CreateStepExecutionInput, currentStepId: string, stepStartedEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; step: StepExecutionRecord; advanced: boolean }>
+  terminalizeWorkflow(workflowId: string, status: string, edgeSelectedEvent: WorkflowEventDraft | null, terminalEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; terminalized: boolean }>
+  failStepAndWorkflow(stepExecutionId: string, workflowId: string, stepFailedEvent: WorkflowEventDraft, terminalEvent: WorkflowEventDraft, stepError: unknown): Promise<WorkflowRecord>
+  recordCancellationIntent(workflowId: string): Promise<WorkflowRecord>
+  cancelStepAndWorkflow(stepExecutionId: string | null, workflowId: string, terminalEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; cancelled: boolean }>
 
   // retention primitives (bounded; never touch active records; no scheduler)
   pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult>

@@ -154,6 +154,10 @@ export interface WorkflowRecord {
   last_event_sequence: number
   context_revision: number
   earliest_retained_sequence: number
+  /** Immutable validated workflow input values (bounded). NULL for legacy rows. */
+  input_values: Record<string, unknown> | null
+  /** Durable cancellation intent (set BEFORE remote task cancellation). */
+  cancel_requested: boolean
 }
 
 export interface CreateWorkflowInput {
@@ -164,6 +168,7 @@ export interface CreateWorkflowInput {
   status?: string
   current_step_id?: string | null
   current_round?: number
+  input_values?: Record<string, unknown> | null
 }
 
 export interface WorkflowPatch {
@@ -174,6 +179,7 @@ export interface WorkflowPatch {
   total_failures?: number
   started_at?: string | null
   terminal_at?: string | null
+  cancel_requested?: boolean
 }
 
 export interface StepExecutionRecord {

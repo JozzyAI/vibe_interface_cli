@@ -2,9 +2,12 @@
  * Mock adapter — emits the same log/approval events the old mock runner did
  * (lifecycle status is owned by the supervisor). For tests it honors
  * VIBE_MOCK_FAIL_REASON to deterministically simulate a recoverable failure so
- * the fallback path can be exercised without a real agent, and
+ * the fallback path can be exercised without a real agent,
  * VIBE_MOCK_RUN_MS to control how long it takes to reach a terminal outcome
- * (for exercising "still running" / long-running behavior without a real agent).
+ * (for exercising "still running" / long-running behavior without a real agent),
+ * and VIBE_MOCK_OUTPUT to emit an exact stdout payload (e.g. a structured JSON
+ * result) as the ONLY output — used by the Workflow Runtime acceptance to drive a
+ * deterministic, parseable agent output without a real agent.
  */
 import { appendEvent } from '../../events.js'
 import type { RunRecord } from '../../types.js'
@@ -59,6 +62,16 @@ export const mockAdapter: AgentAdapter = {
       await sleep(100)
       appendEvent({ type: 'error', run_id, session_id, message: fail.message, ts: ts() })
       return { result: 'failed', failureMessage: fail.message, tailOutput: fail.message, exitCode: fail.exitCode }
+    }
+
+    // VIBE_MOCK_OUTPUT set: emit exactly that text as the SOLE stdout output and
+    // complete (no fixed logs, no approval). Lets a workflow acceptance drive a
+    // deterministic, parseable structured result without a real agent.
+    const mockOutput = process.env.VIBE_MOCK_OUTPUT
+    if (mockOutput) {
+      await sleep(50)
+      appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: mockOutput, ts: ts() })
+      return { result: 'completed', exitCode: 0 }
     }
 
     // VIBE_MOCK_RUN_MS unset: byte-identical to the original fixed timings.

@@ -137,7 +137,18 @@ ALTER TABLE tasks ADD COLUMN request_fingerprint TEXT;
 CREATE UNIQUE INDEX idx_tasks_idempotency_key ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }]
+/** Schema v5 — durable Workflow Runtime state. `input_values_json` holds the
+ *  IMMUTABLE validated workflow input values (bounded; validated against
+ *  WorkflowSpec.inputs before creation; never credentials). `cancel_requested`
+ *  durably records cancellation intent BEFORE remote task cancellation so a
+ *  runtime/Gateway restart resumes the cancellation instead of starting new steps.
+ *  Additive only — v1–v4 are never rewritten; legacy workflows keep NULL / 0. */
+const V5 = `
+ALTER TABLE workflows ADD COLUMN input_values_json TEXT;
+ALTER TABLE workflows ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
