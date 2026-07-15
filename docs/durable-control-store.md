@@ -253,10 +253,45 @@ covers Gateway *tasks* only — the workflow runtime is still not implemented).
 | Shutdown aborts retry timers/pumps (clean exit) | `agent-gateway-durable` (suite exits cleanly; `close()` clears `recoveryTimers` + aborts pumps) |
 | DB holds no configured token; no production DB touched | `agent-gateway-durable` #6; suite-wide temp DBs |
 
+## Node source-event replay recovery (Gateway ⇄ Node `run_event_replay_v1`)
+
+The Gateway now **consumes** the Node run-event journal (schema v3) to recover
+remote events across Gateway downtime. Two **independent** cursors are kept: the
+**Node source cursor** (`tasks.last_remote_event_sequence`; scoped to
+`remote_run_id`, `-1` = known-but-none, `NULL` = unknown) used only as
+`after_sequence`, and the **Gateway canonical cursor** (`next_event_id`; the
+REST/SSE/MCP public sequence) — the source cursor is never sent as `next_event_id`
+and vice-versa.
+
+- **Atomic ingestion:** each replayed/live source event is mapped to a canonical
+  TaskEvent at the **next Gateway sequence**, persisted with its `source_sequence`
+  (partial-unique per task), and the source cursor is advanced — **in one
+  transaction, before SSE publish**. Re-ingesting a mapped source sequence is
+  idempotent; a conflicting re-map is `event_conflict`; a beyond-next source is
+  `event_gap` (never normalized). A source event with no canonical mapping only
+  advances the cursor (no phantom event). The Node source sequence is never used
+  as the Gateway TaskEvent sequence.
+- **New replay-capable remote task:** the Gateway initializes
+  `last_remote_event_sequence = -1` and subscribes with `after_sequence = -1`.
+- **Restart recovery:** a non-terminal remote task with a **known** source cursor
+  replays from `after_sequence = last_remote_event_sequence`, processes
+  `run_replay_meta`, ingests missing events (**including the terminal one**) before
+  status reconciliation, then tails live via **one** authoritative pump. After a
+  **verified gap-free catch-up** (source cursor reached an untruncated cutoff), the
+  `history_incomplete` marker is **cleared** (`history.complete = true`). If the
+  node journal truncated the requested prefix, incompleteness is preserved with
+  reason `node_journal_truncated`; an **unknown** cursor (`NULL` — legacy/non-replay)
+  recovers live-only with `remote_source_cursor_unknown`, and a non-replay node
+  keeps `gateway_restart_without_node_replay`. A node/transport outage keeps the
+  task non-terminal and retries with bounded backoff (never a fabricated terminal).
+- **Encrypted:** replay events are re-encrypted by the node with the run event
+  key and decrypted by the Gateway; the relay never sees plaintext; encrypted
+  replay uses the same atomic ingestion path.
+
 ## Current limitations
 
-- **No Node-side event replay** across Gateway downtime — events emitted while
-  the gateway was unavailable can be permanently missing (surfaced as truncated).
 - **No workflow runtime** — workflow tables exist but nothing executes workflows.
 - The ambiguous remote-start crash window above (no pre-start correlation id
   without a protocol redesign).
+- **No active Claude/Codex process recovery across a Node restart** (journal data
+  survives; the external process does not).

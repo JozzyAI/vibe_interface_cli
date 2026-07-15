@@ -156,7 +156,8 @@ This PR guarantees durable **journal data**, not native-agent process recovery:
 
 ## Current limitations
 
-- The **Gateway does not consume replay yet** — persisting
-  `last_remote_event_sequence` and clearing `history_incomplete` via gap-free
-  replay is **PR #64**.
-- No active-run process recovery across a **Node** restart.
+- The **Gateway now consumes this replay** (persisting `last_remote_event_sequence`
+  and clearing `history_incomplete` after a verified gap-free catch-up) — see
+  [`durable-control-store.md`](durable-control-store.md#node-source-event-replay-recovery-gateway--node-run_event_replay_v1).
+- No active-run process recovery across a **Node** restart (journal data survives
+  and replays; the external Claude/Codex process does not reattach).

@@ -36,10 +36,39 @@ export interface GatewayTaskStore {
   /** Mark event history incomplete at a persisted boundary (idempotent; earliest
    *  boundary wins). Never consumes an event sequence or changes next_event_id. */
   markTaskHistoryIncomplete(taskId: string, reason: string, boundarySequence: number): void
-  /** Clear the marker — reserved for a future Node journal after a verified
-   *  gap-free replay. */
+  /** Clear the incomplete marker after a VERIFIED gap-free catch-up (or a future
+   *  Node journal). */
   clearTaskHistoryIncomplete(taskId: string): void
+  /** Initialize the NODE source cursor to -1 (known, nothing consumed) for a
+   *  replay-capable remote task — only if it is currently NULL (unknown). */
+  initReplayCursor(taskId: string): void
+  /**
+   * Atomically ingest ONE Node source event: map it to a canonical TaskEvent at
+   * the next Gateway sequence, record its `source_sequence`, advance the source
+   * cursor, and (if terminal) set terminal state — all in one transaction. The
+   * NODE source sequence is NEVER used as the Gateway TaskEvent sequence. Returns
+   * `applied: false` for an exact idempotent duplicate (nothing published). A
+   * source sequence beyond next-expected is `event_gap`; a conflicting re-map is
+   * `event_conflict` — neither is normalized.
+   */
+  ingestSourceEventDurable(taskId: string, sourceSequence: number, event: IngestSourceEvent): { record: TaskRecord; applied: boolean; canonicalSequence: number | null }
+  /** Advance the source cursor for a source event that maps to NO canonical
+   *  TaskEvent (so the next source event is not a false gap). Same next-expected /
+   *  gap rules; no canonical event is appended and nothing is published. */
+  advanceSourceCursor(taskId: string, sourceSequence: number): { applied: boolean }
   closeSync(): void
+}
+
+/** A Node source event offered for canonical ingestion. The store assigns the
+ *  Gateway sequence; the caller declares terminality/status/error. */
+export interface IngestSourceEvent {
+  event_type: string
+  ts: string
+  payload: unknown
+  terminal?: boolean
+  status?: string
+  error_code?: string | null
+  error_message?: string | null
 }
 
 export interface Pagination { limit?: number; offset?: number }

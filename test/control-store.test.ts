@@ -34,7 +34,7 @@ test('create + reopen preserves task and workflow records', async () => {
 test('WAL + foreign_keys + busy_timeout enabled; healthCheck reports schema version', async () => {
   const s = openControlStore({ path: tmpDbPath() })
   const h = await s.healthCheck()
-  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 2)
+  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 3)
   assert.equal(h.busy_timeout, 5000) // default bounded busy timeout
   const s2 = openControlStore({ path: tmpDbPath(), busyTimeoutMs: 1234 })
   assert.equal((await s2.healthCheck()).busy_timeout, 1234) // configurable
@@ -234,6 +234,29 @@ test('task history-incomplete mark + clear round-trips and survives reopen', asy
   assert.equal(s.getTaskRecord('run_1')?.history_reason, 'gateway_restart_without_node_replay')
   s.clearTaskHistoryIncomplete('run_1') // reserved future-Node-journal path
   assert.equal(s.getTaskRecord('run_1')?.history_incomplete, false)
+  await s.close()
+})
+
+test('source-event ingestion: cursor init, atomic map, idempotent/conflict/gap, terminal', async () => {
+  const s = openControlStore({ path: tmpDbPath() })
+  await s.createTaskWithCreatedEvent(seedTask({ node_id: 'node_x' }), { sequence: 0, event_type: 'task.created', ts: iso(), payload: {} })
+  assert.equal(s.getTaskRecord('run_1')?.last_remote_event_sequence, null) // unknown until initialized
+  s.initReplayCursor('run_1'); assert.equal(s.getTaskRecord('run_1')?.last_remote_event_sequence, -1)
+  // ingest source 0 → canonical mapped at the NEXT Gateway sequence (independent domain)
+  const r0 = s.ingestSourceEventDurable('run_1', 0, { event_type: 'task.started', ts: iso(), payload: {} })
+  assert.equal(r0.applied, true); assert.equal(r0.canonicalSequence, 1) // Gateway seq 1 (created was 0); source 0
+  assert.equal(s.getTaskRecord('run_1')?.last_remote_event_sequence, 0)
+  const ev1 = { event_type: 'agent.output.delta', ts: iso(), payload: { text: 'hi' } }
+  const r1 = s.ingestSourceEventDurable('run_1', 1, ev1); assert.equal(r1.canonicalSequence, 2)
+  assert.equal(s.ingestSourceEventDurable('run_1', 1, ev1).applied, false) // exact duplicate → idempotent
+  assert.equal((() => { try { s.ingestSourceEventDurable('run_1', 1, { ...ev1, payload: { text: 'x' } }); return 'ok' } catch (e) { return (e as any).code } })(), 'event_conflict')
+  assert.equal((() => { try { s.ingestSourceEventDurable('run_1', 9, ev1); return 'ok' } catch (e) { return (e as any).code } })(), 'event_gap') // source gap, not normalized
+  // terminal source event → terminal recorded once
+  const rt = s.ingestSourceEventDurable('run_1', 2, { event_type: 'task.completed', ts: iso(), payload: {}, terminal: true, status: 'completed' })
+  assert.equal(rt.record.terminal_event_recorded, true); assert.equal(rt.record.status, 'completed')
+  // canonical events carry source_sequence; canonical seq != source seq
+  const evs = s.loadTaskEvents('run_1')
+  assert.deepEqual(evs.map((e) => e.sequence), [0, 1, 2, 3]) // Gateway sequences
   await s.close()
 })
 

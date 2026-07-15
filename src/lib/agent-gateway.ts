@@ -109,7 +109,13 @@ interface GatewayTask {
   remoteRunId: string | null   // durable remote run correlation (null until known)
   recovered?: boolean          // rebuilt from the durable store after a restart
   historyTruncated?: boolean   // some early events are no longer retained (durability gap)
+  replayCapable?: boolean      // the owning node advertises run_event_replay_v1
+  replayMode?: boolean         // this task is served via the source-event replay pump
+  replayCutoff?: number        // node replay latest_sequence (catch-up target)
+  replayHistoryComplete?: boolean // node reported history_complete_for_request
+  catchUpCleared?: boolean     // history_incomplete already cleared after verified catch-up
 }
+const RUN_EVENT_REPLAY_CAPABILITY = 'run_event_replay_v1'
 
 const REMOTE_RECONCILE_ATTEMPTS = 3   // bounded remoteRunStatus checks on stream give-up
 const REMOTE_RECONCILE_BACKOFF_MS = 500
@@ -374,6 +380,80 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       .finally(() => { task.pumpActive = false })
   }
 
+  // ── source-event replay pump (Gateway ⇄ Node run_event_replay_v1) ────────────
+  // The ONE authoritative pump for a replay-capable task: requests journaled
+  // replay from the persisted source cursor, ingests each source event ATOMICALLY
+  // (persist source_sequence + advance the source cursor BEFORE SSE publish), then
+  // tails live. NODE source_sequence is NEVER used as the Gateway task sequence.
+  function startReplayPump(task: GatewayTask, afterSequence: number): void {
+    if (task.terminal || task.pumpActive || !persist) return
+    task.replayMode = true
+    const abort = new AbortController()
+    task.abort = abort
+    task.pumpActive = true
+    void remoteStream(relay!, relayToken!, relayId(task), {
+      suppressStdout: true,
+      signal: abort.signal,
+      emitDisconnectTerminal: false,
+      afterSequence,
+      onReplayMeta: (meta) => handleReplayMeta(task, meta),
+      onSourceEvent: (event, sourceSeq) => { if (!task.terminal) ingestSource(task, event, sourceSeq) },
+      onGiveUp: () => { void reconcileViaStatus(task) },
+    })
+      .catch(() => { /* transport failure — reconcile via status, never a fabricated terminal */ })
+      .finally(() => { task.pumpActive = false })
+  }
+
+  /** Resume the single authoritative pump for a running remote task. */
+  function resumePump(task: GatewayTask): void {
+    if (task.terminal || task.pumpActive) return
+    if (task.replayCapable && persist) startReplayPump(task, persist.getTaskRecord(task.taskId)?.last_remote_event_sequence ?? -1)
+    else startRemotePump(task)
+  }
+
+  function handleReplayMeta(task: GatewayTask, meta: Record<string, unknown> | null): void {
+    if (!persist) return
+    if (!meta) { try { persist.markTaskHistoryIncomplete(task.taskId, 'remote_source_cursor_unknown', task.nextSeq - 1) } catch { /* */ } ; task.historyTruncated = true; return }
+    task.replayCutoff = typeof meta.latest_sequence === 'number' ? meta.latest_sequence : undefined
+    task.replayHistoryComplete = meta.history_complete_for_request === true
+    if (meta.history_complete_for_request === false) {
+      // Node journal truncated the requested prefix: preserve incompleteness.
+      try { persist.markTaskHistoryIncomplete(task.taskId, 'node_journal_truncated', task.nextSeq - 1) } catch { /* */ }
+      task.historyTruncated = true
+    } else {
+      maybeClearCatchUp(task) // cutoff may already == cursor (no new event needed)
+    }
+  }
+
+  /** Atomically ingest one NODE source event and publish only on success. */
+  function ingestSource(task: GatewayTask, event: RunEvent, sourceSeq: number): void {
+    if (task.terminal || !persist) return
+    const te = runEventToTaskEvent(event, 0)
+    if (!te) { try { persist.advanceSourceCursor(task.taskId, sourceSeq) } catch { /* gap/conflict: skip */ } ; maybeClearCatchUp(task); return }
+    const terminal = TERMINAL_EVENT_TYPES.has(te.type)
+    try {
+      const r = persist.ingestSourceEventDurable(task.taskId, sourceSeq, { event_type: te.type, ts: te.ts, payload: te.payload, terminal, status: terminal ? terminalStatusFor(te.type) : undefined })
+      task.revision = r.record.revision
+      if (r.applied && r.canonicalSequence !== null) {
+        const te2: TaskEvent = { seq: r.canonicalSequence, task_id: task.taskId, type: te.type, ts: te.ts, payload: te.payload, contract_version: TASK_CONTRACT_VERSION }
+        task.nextSeq = Math.max(task.nextSeq, r.canonicalSequence + 1)
+        pushEvent(task, te2) // SSE publish AFTER durable commit
+        if (terminal) finishTask(task)
+      }
+      maybeClearCatchUp(task)
+    } catch { /* gap/conflict: do not publish; a later GET / reconcile catches up */ }
+  }
+
+  /** After a VERIFIED gap-free catch-up (cursor reached the complete cutoff),
+   *  clear the history-incomplete marker exactly once. */
+  function maybeClearCatchUp(task: GatewayTask): void {
+    if (task.catchUpCleared || !task.replayHistoryComplete || task.replayCutoff === undefined || !persist) return
+    const rec = persist.getTaskRecord(task.taskId)
+    if (rec && (rec.last_remote_event_sequence ?? -1) >= task.replayCutoff) {
+      try { persist.clearTaskHistoryIncomplete(task.taskId); task.catchUpCleared = true; task.historyTruncated = false } catch { /* */ }
+    }
+  }
+
   /**
    * After the stream gives up, discover the authoritative state with BOUNDED
    * backoff (never poll indefinitely):
@@ -393,7 +473,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           const record = await remoteRunStatus(relay!, relayToken!, relayId(task))
           reconcileRemoteRecord(task, record)
           if (task.terminal) return
-          if ((task.resumeCount ?? 0) < REMOTE_MAX_RESUMES) { task.resumeCount = (task.resumeCount ?? 0) + 1; startRemotePump(task) }
+          if ((task.resumeCount ?? 0) < REMOTE_MAX_RESUMES) { task.resumeCount = (task.resumeCount ?? 0) + 1; resumePump(task) }
           return
         } catch {
           await new Promise((r) => setTimeout(r, REMOTE_RECONCILE_BACKOFF_MS * (attempt + 1)))
@@ -431,17 +511,23 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     if (task.terminal || shuttingDown) return
     try {
       if (task.mode === 'remote') {
+        // REPLAY-CAPABLE + KNOWN cursor: replay missing source events (incl the
+        // terminal one) from the Node journal BEFORE reconciling status — output
+        // just before completion must not be lost because status was seen first.
+        if (task.replayCapable && persist) {
+          const cursor = persist.getTaskRecord(task.taskId)?.last_remote_event_sequence ?? -1
+          startReplayPump(task, cursor)
+          return
+        }
         const record = await remoteRunStatus(relay!, relayToken!, task.remoteRunId!)
         reconcileRemoteRecord(task, record)
         if (!task.terminal) {
-          // Resuming a remote pump after a restart: the relay does not replay
-          // pre-subscribe events, and there is no Node journal yet, so events
-          // emitted during downtime may be missing. Mark the persisted history
-          // incomplete at the last durably-consumed sequence (the boundary before
-          // the missing interval). We NEVER invent or renumber events.
+          // Live-only recovery (unknown cursor / non-replay node): events emitted
+          // during downtime may be missing. Mark the persisted history incomplete
+          // at the last durably-consumed sequence. We NEVER invent/renumber events.
           if (persist && task.recovered) {
             const boundary = task.nextSeq - 1
-            try { persist.markTaskHistoryIncomplete(task.taskId, 'gateway_restart_without_node_replay', boundary) } catch { /* best effort */ }
+            try { persist.markTaskHistoryIncomplete(task.taskId, 'remote_source_cursor_unknown', boundary) } catch { /* best effort */ }
             task.historyTruncated = true
           }
           startRemotePump(task)
@@ -483,6 +569,9 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         subscribers: new Set(), terminal: false, cancelInFlight: false,
         revision: rec.revision, nodeId: rec.node_id, remoteRunId: rec.remote_run_id,
         recovered: true, historyTruncated,
+        // A known durable source cursor means the task was created replay-capable
+        // (initReplayCursor ran only for replay-capable nodes) → recover via replay.
+        replayCapable: rec.last_remote_event_sequence !== null,
       }
       tasks.set(task.taskId, task)
       activeCount++ // recovered non-terminal task counts against the active-task limit
@@ -546,6 +635,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     // preflight is advisory (can race), so authoritative start errors are still
     // mapped below. NEVER fall back to a plaintext run_start.
     let encryptionPublicKey: string | undefined
+    let replayCapable = false
     if (isRemote) {
       let nodes
       try { nodes = await fetchRemoteNodes(relay!, relayToken!) }
@@ -555,6 +645,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       if (!Array.isArray(node.agents) || !node.agents.includes(reqv.agent)) { release(); return sendError(res, apiError('agent_unavailable', `node ${reqv.node_id} does not advertise agent "${reqv.agent}"`, { details: { node_id: reqv.node_id } }), 422) }
       if (!node.encryption_public_key) { release(); return sendError(res, apiError('service_unavailable', `secure remote execution unavailable: node ${reqv.node_id} advertises no encryption key`, { retryable: false, details: { node_id: reqv.node_id } }), 503) }
       encryptionPublicKey = node.encryption_public_key
+      replayCapable = Array.isArray(node.capabilities) && node.capabilities.includes(RUN_EVENT_REPLAY_CAPABILITY)
     }
 
     // Prompt text -> a private temp file (both startRun and remoteRunStart take a
@@ -599,9 +690,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       // Durably BIND the remote run id + running status BEFORE exposing lifecycle.
       try { const rec = persist.updateTaskDurable(taskId, task.revision, { remote_run_id: rrec.run_id, status: runStatusToTaskStatus(rrec.status) }); task.revision = rec.revision } catch { /* a durable-bind failure leaves an ambiguous row that recovery handles; the live process still knows the id */ }
       task.remoteRunId = rrec.run_id
+      task.replayCapable = replayCapable
+      // Replay-capable node: consume events through the DURABLE source-event replay
+      // pump (persist source_sequence + advance the source cursor BEFORE publish).
+      if (replayCapable) { try { persist.initReplayCursor(taskId) } catch { /* */ } }
       tasks.set(taskId, task); pendingCreates--; activeCount++
       pushEvent(task, createdEv)
-      startRemotePump(task)
+      if (replayCapable) startReplayPump(task, -1); else startRemotePump(task)
       return sendJson(res, 202, { ...runRecordToTask(rrec), task_id: taskId })
     }
 
@@ -757,7 +852,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     task.subscribers.add(res)
     // A remote task whose transport gave up has no live pump; a new subscriber
     // resumes it (the relay doesn't replay, so live events flow from here on).
-    if (task.mode === 'remote' && !task.pumpActive) startRemotePump(task)
+    if (task.mode === 'remote' && !task.pumpActive) resumePump(task)
     // Disconnecting a subscriber must NOT cancel the task — just prune the listener.
     req.on('close', () => { task.subscribers.delete(res) })
   }

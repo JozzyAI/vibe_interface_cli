@@ -25,7 +25,7 @@ import {
 import {
   SIZE_LIMITS, nowIso, isIsoUtc, encodeJson, boundString, decodeJson, assertValidContext,
 } from './serialization.js'
-import type { ControlStore, GatewayTaskStore, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
+import type { ControlStore, GatewayTaskStore, IngestSourceEvent, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
 
 export interface OpenControlStoreOptions {
   /** DB path; defaults to `<vibe_dir>/control.sqlite`. Configurable for tests. */
@@ -103,6 +103,51 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
    *  verified a gap-free replay past the boundary. Unused today. */
   clearTaskHistoryIncomplete(taskId: string): void {
     this.open(); this.db.prepare('UPDATE tasks SET history_incomplete = 0, history_reason = NULL, history_boundary_sequence = NULL WHERE task_id = ?').run(taskId)
+  }
+  initReplayCursor(taskId: string): void {
+    this.open(); this.db.prepare('UPDATE tasks SET last_remote_event_sequence = -1 WHERE task_id = ? AND last_remote_event_sequence IS NULL').run(taskId)
+  }
+  ingestSourceEventDurable(taskId: string, sourceSequence: number, event: IngestSourceEvent): { record: TaskRecord; applied: boolean; canonicalSequence: number | null } {
+    this.open()
+    if (!Number.isInteger(sourceSequence) || sourceSequence < 0) throw new ControlStoreError('invalid_record', 'source_sequence must be a non-negative integer')
+    if (!isTaskEventType(event.event_type)) throw new ControlStoreError('invalid_record', 'event_type is invalid')
+    if (!isIsoUtc(event.ts)) throw new ControlStoreError('invalid_record', 'ts must be ISO-8601 UTC')
+    return this.db.transaction(() => {
+      const cur = this.taskRow(taskId); if (!cur) throw new ControlStoreError('not_found', `task not found: ${taskId}`)
+      const payload_json = encodeJson(event.payload ?? null, SIZE_LIMITS.task_event_payload, 'task_event.payload')
+      const expected = (cur.last_remote_event_sequence ?? -1) + 1
+      if (sourceSequence < expected) {
+        // Below the cursor: must EXACTLY match an existing durable mapping (idempotent),
+        // else it is a conflict/corruption — never silently ignored.
+        const existing = this.db.prepare('SELECT * FROM task_events WHERE task_id = ? AND source_sequence = ?').get(taskId, sourceSequence) as TaskEventRow | undefined
+        if (!existing) throw new ControlStoreError('event_conflict', `source_sequence ${sourceSequence} below cursor with no durable mapping`)
+        if (existing.event_type !== event.event_type || existing.ts !== event.ts || existing.payload_json !== payload_json) throw new ControlStoreError('event_conflict', `conflicting canonical mapping for source_sequence ${sourceSequence}`)
+        return { record: this.toTask(cur), applied: false, canonicalSequence: existing.sequence } // idempotent
+      }
+      if (sourceSequence > expected) throw new ControlStoreError('event_gap', `source gap: expected ${expected}, got ${sourceSequence}`)
+      // sourceSequence === expected → map to the next Gateway sequence + advance cursor.
+      const gatewaySeq = cur.last_event_sequence + 1
+      this.appendTaskEventSync(taskId, { sequence: gatewaySeq, event_type: event.event_type, ts: event.ts, payload: event.payload, source_sequence: sourceSequence })
+      this.db.prepare('UPDATE tasks SET last_remote_event_sequence = ?, updated_at = ? WHERE task_id = ?').run(sourceSequence, nowIso(), taskId)
+      if (event.terminal && !this.taskRow(taskId)!.terminal_event_recorded) {
+        this.db.prepare('UPDATE tasks SET status = COALESCE(?, status), terminal_at = ?, terminal_event_recorded = 1, error_code = COALESCE(?, error_code), error_message = COALESCE(?, error_message) WHERE task_id = ?').run(event.status ?? null, nowIso(), event.error_code ?? null, event.error_message ?? null, taskId)
+      } else if (event.status) {
+        this.db.prepare('UPDATE tasks SET status = ? WHERE task_id = ?').run(event.status, taskId)
+      }
+      return { record: this.toTask(this.taskRow(taskId)!), applied: true, canonicalSequence: gatewaySeq }
+    })()
+  }
+  advanceSourceCursor(taskId: string, sourceSequence: number): { applied: boolean } {
+    this.open()
+    if (!Number.isInteger(sourceSequence) || sourceSequence < 0) throw new ControlStoreError('invalid_record', 'source_sequence must be a non-negative integer')
+    return this.db.transaction(() => {
+      const cur = this.taskRow(taskId); if (!cur) throw new ControlStoreError('not_found', `task not found: ${taskId}`)
+      const expected = (cur.last_remote_event_sequence ?? -1) + 1
+      if (sourceSequence < expected) return { applied: false } // already consumed → idempotent
+      if (sourceSequence > expected) throw new ControlStoreError('event_gap', `source gap: expected ${expected}, got ${sourceSequence}`)
+      this.db.prepare('UPDATE tasks SET last_remote_event_sequence = ?, updated_at = ? WHERE task_id = ?').run(sourceSequence, nowIso(), taskId)
+      return { applied: false }
+    })()
   }
   closeSync(): void { if (!this.closed) { this.db.close(); this.closed = true } }
 
@@ -308,7 +353,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     }
     if (ev.sequence !== last + 1) throw new ControlStoreError('event_gap', `task event gap: expected ${last + 1}, got ${ev.sequence}`)
     const now = nowIso()
-    this.db.prepare('INSERT INTO task_events (task_id,sequence,event_type,ts,payload_json,created_at) VALUES (?,?,?,?,?,?)').run(taskId, ev.sequence, ev.event_type, ev.ts, payload_json, now)
+    this.db.prepare('INSERT INTO task_events (task_id,sequence,event_type,ts,payload_json,created_at,source_sequence) VALUES (?,?,?,?,?,?,?)').run(taskId, ev.sequence, ev.event_type, ev.ts, payload_json, now, ev.source_sequence ?? null)
     this.db.prepare('UPDATE tasks SET last_event_sequence = ?, updated_at = ? WHERE task_id = ?').run(ev.sequence, now, taskId)
   }
 
@@ -414,7 +459,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 
   // ── row → record mappers (untrusted JSON decoded defensively) ────────────────
   private toTask(r: TaskRow): TaskRecord {
-    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence }
+    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence, last_remote_event_sequence: r.last_remote_event_sequence }
   }
   private toWorkflow(r: WorkflowRow): WorkflowRecord {
     return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence }
@@ -425,8 +470,8 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 }
 
 // ── row shapes ─────────────────────────────────────────────────────────────────
-interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null }
-interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string }
+interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null }
+interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
