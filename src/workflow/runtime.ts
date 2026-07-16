@@ -34,6 +34,8 @@ import { selectEdge } from './routing.js'
 import { stepExecutionId } from './recovery.js'
 import { WorkflowRuntimeError, type LimitKind } from './errors.js'
 import { TransientAgentTaskError, type AgentTaskClient, type AgentTaskTerminalRead } from './task-client.js'
+import { resolveWorkspaceTargets, TransientWorkspaceLeaseError, type WorkspaceLeaseClient, type WorkspaceTarget } from './workspace-lease-client.js'
+import { workspaceLeaseId, revisionsMatch, WorkspaceLeaseError, type WorkspaceRevision } from '../lib/workspace-lease.js'
 
 const CV = WORKFLOW_EVENT_CONTRACT_VERSION
 const MAX_CTX_LIST = 50
@@ -41,12 +43,20 @@ const MAX_CTX_LIST = 50
 export interface WorkflowRuntimeOptions {
   store: ControlStore
   taskClient: AgentTaskClient
+  /** OPTIONAL workspace-lease authority client. When present, a workspace-bound
+   *  workflow acquires all its Node workspace leases before `ready → running`,
+   *  passes the matching lease id to every Agent Task, checks revisions before/after
+   *  each step, and releases only after the workflow is terminal. When ABSENT the
+   *  runtime behaves exactly as before (no leases; no revision checks). */
+  leaseClient?: WorkspaceLeaseClient
   /** Bounded wait window per task poll (ms). Default 5000. */
   waitWindowMs?: number
   /** Backoff base for transient task-client failures (ms). Default 500. */
   backoffBaseMs?: number
   /** Max backoff (ms). Default 5000. */
   backoffMaxMs?: number
+  /** Max release attempts per lease before deferring to a later recovery. Default 8. */
+  maxReleaseAttempts?: number
   /** Injectable clock (for runtime-deadline tests). Default Date.now. */
   now?: () => number
 }
@@ -56,9 +66,11 @@ export interface CreateWorkflowResult { workflow_id: string; workflow: WorkflowR
 export class WorkflowRuntime {
   private readonly store: ControlStore
   private readonly taskClient: AgentTaskClient
+  private readonly leaseClient?: WorkspaceLeaseClient
   private readonly waitWindowMs: number
   private readonly backoffBaseMs: number
   private readonly backoffMaxMs: number
+  private readonly maxReleaseAttempts: number
   private readonly now: () => number
   private stopped = false
   private readonly pumps = new Map<string, Promise<void>>()
@@ -67,9 +79,11 @@ export class WorkflowRuntime {
   constructor(opts: WorkflowRuntimeOptions) {
     this.store = opts.store
     this.taskClient = opts.taskClient
+    this.leaseClient = opts.leaseClient
     this.waitWindowMs = opts.waitWindowMs ?? 5000
     this.backoffBaseMs = opts.backoffBaseMs ?? 500
     this.backoffMaxMs = opts.backoffMaxMs ?? 5000
+    this.maxReleaseAttempts = opts.maxReleaseAttempts ?? 8
     this.now = opts.now ?? Date.now
   }
 
@@ -106,6 +120,14 @@ export class WorkflowRuntime {
     if (wf.status === 'blocked') return wf                             // do not silently resume
     if (wf.status === 'running') { this.ensurePump(workflowId); return wf } // coalesce
     if (wf.status !== 'ready') throw new WorkflowRuntimeError('invalid_transition', `cannot start from status ${wf.status}`)
+    // Acquire ALL required workspace leases BEFORE the durable ready→running
+    // transition. On conflict the workflow stays `ready`, any partially-acquired
+    // leases are released, and no task starts — an explicit later start retries.
+    if (this.leaseClient) {
+      const spec = this.loadSpec(wf)
+      if (!spec) throw new WorkflowRuntimeError('runtime_internal', 'invalid persisted spec')
+      await this.acquireWorkflowLeases(workflowId, spec, (wf.input_values ?? {}) as Record<string, unknown>)
+    }
     const r = await this.store.startWorkflowDurably(workflowId, { event_type: 'workflow.started', ts: new Date().toISOString(), payload: {}, contract_version: CV } as WorkflowEventDraft)
     this.ensurePump(workflowId)
     return r.workflow
@@ -121,6 +143,9 @@ export class WorkflowRuntime {
   async recoverWorkflows(): Promise<string[]> {
     const running = await this.store.listWorkflows({ status: 'running' })
     for (const wf of running) this.ensurePump(wf.workflow_id)
+    // Also finish any pending lease releases for workflows that terminalized before
+    // their release completed (e.g. a crash right after terminalization). Idempotent.
+    await this.recoverLeaseReleases().catch(() => { /* best effort; retried next recover */ })
     return running.map((w) => w.workflow_id)
   }
 
@@ -133,6 +158,9 @@ export class WorkflowRuntime {
     await this.store.recordCancellationIntent(workflowId)
     this.aborts.get(workflowId)?.abort() // interrupt any in-flight wait
     await this.performCancellation(workflowId)
+    // A directly-cancelled workflow (e.g. blocked → cancelled) is not driven by a
+    // pump, so release its retained leases here. Idempotent with the pump's release.
+    if (this.leaseClient) await this.settleLeaseReleases(workflowId)
     return (await this.store.getWorkflow(workflowId))!
   }
 
@@ -161,6 +189,14 @@ export class WorkflowRuntime {
   }
 
   private async runWorkflow(workflowId: string): Promise<void> {
+    await this.driveWorkflow(workflowId)
+    // After the drive loop settles (terminal/blocked/shutdown), release any leases the
+    // workflow no longer needs. Blocked workflows RETAIN their leases; terminal
+    // (completed/failed/cancelled) workflows release them (idempotent, retryable).
+    if (this.leaseClient && !this.stopped) await this.settleLeaseReleases(workflowId)
+  }
+
+  private async driveWorkflow(workflowId: string): Promise<void> {
     const ac = new AbortController()
     this.aborts.set(workflowId, ac)
     while (!this.stopped) {
@@ -218,6 +254,18 @@ export class WorkflowRuntime {
     const ws = renderWorkspaceKey(specStep.workspace_key_template, scope)
     if (!ws.ok) { await this.failWorkflow(workflowId, 'render_error', { code: ws.code, step_id: step.step_id }); return 'stop' }
 
+    // Workspace-lease gate: for a lease-managed step, observe the CURRENT revision,
+    // compare it with the lease's expected revision, and persist revision_before —
+    // all BEFORE creating the task. An out-of-band change BLOCKS the workflow (the
+    // lease is retained) rather than letting an agent write over a diverged tree.
+    const target = this.stepLeaseTarget(spec, wf, step)
+    let leaseId: string | undefined
+    if (target) {
+      const gate = await this.revisionGateBefore(workflowId, step, target, signal)
+      if (gate !== 'ok') return 'stop' // blocked (retains lease) or shutdown
+      leaseId = target.workspace_lease_id
+    }
+
     const req = {
       agent: role.agent,
       ...(role.node_id ? { node_id: role.node_id } : {}),
@@ -227,6 +275,7 @@ export class WorkflowRuntime {
       // Deterministic, bounded observability metadata (same on every idempotent retry).
       metadata: { workflow_id: workflowId, step_execution_id: step.step_execution_id, step_id: step.step_id, round: step.round, attempt: step.attempt },
       idempotency_key: step.step_execution_id,
+      ...(leaseId ? { workspace_lease_id: leaseId } : {}),
     }
 
     // Create with bounded backoff on transient failures; a fatal failure fails the
@@ -270,6 +319,10 @@ export class WorkflowRuntime {
 
   private async handleTaskTerminal(workflowId: string, spec: WorkflowSpec, step: StepExecutionRecord, read: AgentTaskTerminalRead): Promise<boolean> {
     const wf = (await this.store.getWorkflow(workflowId))!
+    // After EVERY terminal task on a lease-managed step: observe revision_after,
+    // persist it, and advance the lease's expected current revision — BEFORE we parse
+    // the AgentTaskResult or route (so the next step compares against a fresh baseline).
+    await this.observeRevisionAfter(spec, wf, step)
     if (wf.cancel_requested) { await this.performCancellation(workflowId); return true }
 
     if (read.status === 'failed') {
@@ -383,6 +436,134 @@ export class WorkflowRuntime {
       }
     }
     await this.store.cancelStepAndWorkflow(stepExecId, workflowId, { event_type: 'workflow.cancelled', ts: new Date().toISOString(), payload: {}, contract_version: CV } as WorkflowEventDraft)
+  }
+
+  // ── workspace-lease lifecycle (workspace_lease_v1) ───────────────────────────────
+
+  /** The lease target for a workspace-bound step (null if not lease-managed or no
+   *  leaseClient). Deterministic from the spec + immutable inputs — same across
+   *  rounds and restarts, so acquisition/binding is idempotent. */
+  private stepLeaseTarget(spec: WorkflowSpec, wf: WorkflowRecord, step: StepExecutionRecord): WorkspaceTarget | null {
+    if (!this.leaseClient) return null
+    const specStep = spec.steps.find((s) => s.id === step.step_id) as { agent_role?: string; workspace_key_template?: string } | undefined
+    if (!specStep) return null
+    const role = specStep.agent_role ? spec.agents[specStep.agent_role] : undefined
+    if (!role || !role.node_id) return null
+    const inputs = (wf.input_values ?? {}) as Record<string, unknown>
+    const ws = renderWorkspaceKey(specStep.workspace_key_template, { inputs, stepOutputs: {}, round: step.round, context: {} })
+    if (!ws.ok || ws.workspaceKey === undefined) return null
+    return { node_id: role.node_id, workspace_key: ws.workspaceKey, workspace_lease_id: workspaceLeaseId(wf.workflow_id, role.node_id, ws.workspaceKey) }
+  }
+
+  /** Acquire ALL required leases (sorted node_id then workspace_key) before the
+   *  workflow starts. On conflict: release any already acquired, throw (workflow
+   *  stays `ready`). Idempotent across restarts (deterministic lease ids). */
+  private async acquireWorkflowLeases(workflowId: string, spec: WorkflowSpec, inputValues: Record<string, unknown>): Promise<void> {
+    if (!this.leaseClient) return
+    const resolved = resolveWorkspaceTargets(workflowId, spec, inputValues)
+    if (!resolved.ok) throw new WorkflowRuntimeError(resolved.code === 'workspace_node_ambiguous' ? 'workspace_node_ambiguous' : 'runtime_internal', `workspace lease target unresolved for step ${resolved.step_id}`, { step_id: resolved.step_id })
+    if (resolved.targets.length === 0) return
+    const acquired: WorkspaceTarget[] = []
+    for (const tgt of resolved.targets) {
+      await this.store.recordWorkspaceLeaseIntent({ workspace_lease_id: tgt.workspace_lease_id, workflow_id: workflowId, node_id: tgt.node_id, workspace_key: tgt.workspace_key })
+      try {
+        const { lease } = await this.leaseClient.acquire(tgt.node_id, workflowId, tgt.workspace_key)
+        await this.store.markWorkspaceLeaseActive(lease.workspace_lease_id, lease.base_revision ?? null, lease.current_revision ?? lease.base_revision ?? null, lease.acquired_at ?? new Date().toISOString())
+        acquired.push(tgt)
+      } catch (err) {
+        await this.rollbackAcquired(acquired) // free partially-acquired workspaces
+        if (err instanceof WorkspaceLeaseError && err.code === 'workspace_lease_conflict') throw new WorkflowRuntimeError('workspace_lease_conflict', 'a required workspace is already leased by another workflow', { workspace_key: tgt.workspace_key })
+        if (err instanceof TransientWorkspaceLeaseError) throw new WorkflowRuntimeError('workspace_lease_unavailable', 'workspace lease service unavailable', {})
+        throw err
+      }
+    }
+  }
+
+  private async rollbackAcquired(targets: WorkspaceTarget[]): Promise<void> {
+    for (const t of targets) {
+      try { await this.leaseClient!.release(t.node_id, t.workspace_lease_id) } catch { /* best effort — no run is bound yet */ }
+      try { await this.store.markWorkspaceLeaseReleased(t.workspace_lease_id, new Date().toISOString()) } catch { /* */ }
+    }
+  }
+
+  /** Observe the CURRENT revision and compare with the lease's expected revision
+   *  BEFORE creating a step's task; persist revision_before. An out-of-band change
+   *  blocks the workflow (lease retained). Transient observe failures back off. */
+  private async revisionGateBefore(workflowId: string, step: StepExecutionRecord, target: WorkspaceTarget, signal: AbortSignal): Promise<'ok' | 'stop'> {
+    if (!this.leaseClient) return 'ok'
+    const proj = await this.store.getWorkspaceLeaseProjection(target.workspace_lease_id)
+    const expected = (proj?.current_revision ?? proj?.base_revision) as WorkspaceRevision | undefined
+    let observed: WorkspaceRevision | null = null
+    let attempt = 0
+    while (observed === null) {
+      if (this.stopped || signal.aborted) return 'stop'
+      try { observed = await this.leaseClient.observeRevision(target.node_id, target.workspace_key) }
+      catch (err) { if (err instanceof TransientWorkspaceLeaseError) { await this.backoff(attempt++, signal); continue } throw err }
+    }
+    await this.store.setStepRevisionBefore(step.step_execution_id, observed)
+    if (expected && !revisionsMatch(expected, observed)) {
+      await this.blockWorkflow(workflowId, 'workspace_revision_conflict', { step_id: step.step_id, round: step.round, workspace_key: target.workspace_key })
+      return 'stop'
+    }
+    return 'ok'
+  }
+
+  /** After a step's task terminalizes, observe revision_after, persist it, and update
+   *  the lease's expected current revision — BEFORE the caller parses/route the
+   *  result. Best-effort + bounded: a persistent observe failure does not wedge the
+   *  workflow (recovery re-observes on the next step). */
+  private async observeRevisionAfter(spec: WorkflowSpec, wf: WorkflowRecord, step: StepExecutionRecord): Promise<void> {
+    if (!this.leaseClient) return
+    const target = this.stepLeaseTarget(spec, wf, step)
+    if (!target) return
+    for (let attempt = 0; attempt < this.maxReleaseAttempts; attempt++) {
+      if (this.stopped) return
+      try {
+        const observed = await this.leaseClient.observeRevision(target.node_id, target.workspace_key)
+        await this.store.setStepRevisionAfter(step.step_execution_id, observed)
+        await this.store.setWorkspaceLeaseRevision(target.workspace_lease_id, observed)
+        return
+      } catch (err) { if (err instanceof TransientWorkspaceLeaseError) { await this.backoff(attempt, this.aborts.get(wf.workflow_id)?.signal ?? new AbortController().signal); continue } return }
+    }
+  }
+
+  /** Release all of a TERMINAL workflow's leases (idempotent, retryable). A release
+   *  refused because a bound run is still winding down (`workspace_lease_in_use`) is
+   *  transient — retried with bounded backoff; anything unresolved stays
+   *  `release_requested` for a later recovery. Blocked workflows are NOT released. */
+  private async settleLeaseReleases(workflowId: string): Promise<void> {
+    if (!this.leaseClient) return
+    const wf = await this.store.getWorkflow(workflowId)
+    if (!wf || !['completed', 'failed', 'cancelled'].includes(wf.status)) return // retain on blocked/non-terminal
+    const leases = await this.store.listWorkspaceLeaseProjections(workflowId)
+    for (const lease of leases) {
+      if (lease.status === 'released') continue
+      await this.releaseLeaseWithRetry(lease.node_id, lease.workspace_lease_id)
+    }
+  }
+
+  private async releaseLeaseWithRetry(nodeId: string, leaseId: string): Promise<void> {
+    await this.store.requestWorkspaceLeaseRelease(leaseId, new Date().toISOString()) // durable intent first
+    for (let attempt = 0; attempt < this.maxReleaseAttempts; attempt++) {
+      if (this.stopped) return // leave release_requested for recovery
+      try {
+        await this.leaseClient!.release(nodeId, leaseId)
+        await this.store.markWorkspaceLeaseReleased(leaseId, new Date().toISOString())
+        return
+      } catch (err) {
+        if (err instanceof TransientWorkspaceLeaseError) { await this.backoff(attempt, new AbortController().signal); continue } // in_use/unavailable → retry
+        return // fatal — leave release_requested; recovery may retry
+      }
+    }
+  }
+
+  /** Recovery: complete any pending lease releases for terminal workflows (e.g. a
+   *  crash between terminalization and release). Idempotent. */
+  async recoverLeaseReleases(): Promise<number> {
+    if (!this.leaseClient) return 0
+    const pending = await this.store.listReleasableWorkspaceLeases()
+    for (const lease of pending) await this.releaseLeaseWithRetry(lease.node_id, lease.workspace_lease_id)
+    return pending.length
   }
 
   // ── scope + context ────────────────────────────────────────────────────────────

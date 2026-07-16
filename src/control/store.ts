@@ -10,7 +10,7 @@ import type {
   TaskRecord, CreateTaskInput, TaskPatch, TaskEventInput, TaskEventRecord,
   WorkflowRecord, CreateWorkflowInput, WorkflowPatch, StepExecutionRecord,
   CreateStepExecutionInput, StepExecutionPatch, WorkflowEventInput, WorkflowEventRecord,
-  WorkflowSnapshot,
+  WorkflowSnapshot, WorkflowWorkspaceLeaseRecord,
 } from './records.js'
 
 /** A workflow event without a `sequence` — the store assigns the next contiguous
@@ -164,6 +164,30 @@ export interface ControlStore {
   failStepAndWorkflow(stepExecutionId: string, workflowId: string, stepFailedEvent: WorkflowEventDraft, terminalEvent: WorkflowEventDraft, stepError: unknown): Promise<WorkflowRecord>
   recordCancellationIntent(workflowId: string): Promise<WorkflowRecord>
   cancelStepAndWorkflow(stepExecutionId: string | null, workflowId: string, terminalEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; cancelled: boolean }>
+
+  // ── workspace-lease PROJECTION + per-step revision evidence (workspace_lease_v1) ──
+  // The Node stays authoritative; these persist a durable projection so the runtime
+  // recovers acquisition/revision/release idempotently. Revisions are bounded and
+  // revalidated on read; no paths/tokens/keys are ever stored.
+  /** Record a durable acquisition INTENT (status `acquiring`) BEFORE contacting the
+   *  Node. Idempotent on the deterministic lease id — a re-run returns the same row. */
+  recordWorkspaceLeaseIntent(input: { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string }): Promise<WorkflowWorkspaceLeaseRecord>
+  /** Promote an intent to `active` with the observed base + current revision. Idempotent. */
+  markWorkspaceLeaseActive(leaseId: string, baseRevision: unknown, currentRevision: unknown, acquiredAt: string): Promise<WorkflowWorkspaceLeaseRecord>
+  /** Update the expected current revision after a step terminalizes. */
+  setWorkspaceLeaseRevision(leaseId: string, currentRevision: unknown): Promise<WorkflowWorkspaceLeaseRecord>
+  /** Persist release INTENT (status `release_requested`). Idempotent; terminal-safe. */
+  requestWorkspaceLeaseRelease(leaseId: string, ts: string): Promise<WorkflowWorkspaceLeaseRecord>
+  /** Mark the lease `released` after the Node confirms. Idempotent. */
+  markWorkspaceLeaseReleased(leaseId: string, ts: string): Promise<WorkflowWorkspaceLeaseRecord>
+  getWorkspaceLeaseProjection(leaseId: string): Promise<WorkflowWorkspaceLeaseRecord | null>
+  listWorkspaceLeaseProjections(workflowId: string): Promise<WorkflowWorkspaceLeaseRecord[]>
+  /** Non-released lease projections whose workflow is terminal (completed/failed/
+   *  cancelled) — the recovery worklist for pending releases. Never blocked/running. */
+  listReleasableWorkspaceLeases(): Promise<WorkflowWorkspaceLeaseRecord[]>
+  /** Persist the revision observed BEFORE / AFTER a step's task. Idempotent. */
+  setStepRevisionBefore(stepExecutionId: string, revision: unknown): Promise<void>
+  setStepRevisionAfter(stepExecutionId: string, revision: unknown): Promise<void>
 
   // retention primitives (bounded; never touch active records; no scheduler)
   pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult>

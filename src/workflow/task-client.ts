@@ -19,6 +19,10 @@ export interface AgentTaskCreateRequest {
   permission_mode?: 'default' | 'unsafe-skip'
   metadata?: Record<string, unknown>
   idempotency_key: string
+  /** OPTIONAL workspace_lease_v1 authorization id for a lease-managed step. Passed to
+   *  the Gateway (which forwards it to the Node for enforcement only) — NEVER reaches
+   *  the provider prompt/env. Absent for unmanaged steps. */
+  workspace_lease_id?: string
 }
 
 export interface AgentTaskRef { task_id: string }
@@ -114,6 +118,7 @@ export class GatewayAgentTaskClient implements AgentTaskClient {
         ...(req.permission_mode ? { execution: { permission_mode: req.permission_mode } } : {}),
         ...(req.metadata ? { metadata: req.metadata } : {}),
         idempotency_key: req.idempotency_key,
+        ...(req.workspace_lease_id ? { workspace_lease_id: req.workspace_lease_id } : {}),
       })
     } catch (err) { classify(err) }
     const taskId = taskIdOf(task, '')

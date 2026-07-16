@@ -196,7 +196,16 @@ CREATE UNIQUE INDEX idx_wf_ws_lease_active ON workflow_workspace_leases(workflow
   WHERE status IN ('acquiring','active','release_requested');
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }]
+/** Schema v8 — per-step workspace revision evidence for the Workflow Runtime lease
+ *  lifecycle. Additive nullable columns: the revision observed BEFORE a step's task
+ *  is created and AFTER that task terminalizes, for out-of-band change detection.
+ *  Bounded JSON (a WorkspaceRevision); no diff content, no secrets. */
+const V8 = `
+ALTER TABLE workflow_step_executions ADD COLUMN revision_before_json TEXT;
+ALTER TABLE workflow_step_executions ADD COLUMN revision_after_json TEXT;
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

@@ -209,6 +209,10 @@ export interface StepExecutionRecord {
   started_at: string | null
   updated_at: string
   terminal_at: string | null
+  /** workspace_lease_v1: the workspace revision observed BEFORE this step's task was
+   *  created, and AFTER that task terminalized (a bounded WorkspaceRevision, or null). */
+  revision_before: unknown
+  revision_after: unknown
 }
 
 export interface CreateStepExecutionInput {
@@ -236,6 +240,26 @@ export interface WorkflowEventInput {
   ts: string
   step_execution_id?: string | null
   payload: unknown
+}
+
+/** Durable ControlStore PROJECTION of a Node workspace lease held by a workflow.
+ *  The Node remains authoritative — this row supports recovery/inspection only.
+ *  Never carries tokens/keys/paths; revisions are bounded WorkspaceRevision JSON. */
+export interface WorkflowWorkspaceLeaseRecord {
+  workspace_lease_id: string
+  workflow_id: string
+  node_id: string
+  workspace_key: string
+  mode: string
+  status: string
+  revision: number
+  base_revision: unknown
+  current_revision: unknown
+  acquired_at: string | null
+  release_requested_at: string | null
+  released_at: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface WorkflowEventRecord extends Required<WorkflowEventInput> { workflow_id: string; created_at: string }

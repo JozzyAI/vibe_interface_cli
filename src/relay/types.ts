@@ -359,6 +359,25 @@ export interface WorkspaceLeaseAckMsg extends RelayMsgBase {
   code?: string
 }
 
+/** workspace_lease_v1: observe a FRESH workspace revision (read-only) for a leased
+ *  workspace. The node resolves containment + runs the read-only git observer
+ *  locally; only bounded revision evidence crosses the relay. Used by the Workflow
+ *  Runtime for before/after per-step out-of-band change detection. */
+export interface WorkspaceRevisionObserveRequestMsg extends RelayMsgBase {
+  type: 'workspace_revision_observe'
+  req_id: string
+  node_id: string
+  workspace_key: string
+}
+export interface WorkspaceRevisionAckMsg extends RelayMsgBase {
+  type: 'workspace_revision_ack'
+  req_id: string
+  ok: boolean
+  revision?: import('../lib/workspace-lease.js').WorkspaceRevision
+  error?: string
+  code?: string
+}
+
 /** run_result_v1: fetch the authoritative AgentTaskResult by exact remote_run_id. */
 export interface RunResultRequestMsg extends RelayMsgBase {
   type: 'run_result_request'
@@ -514,6 +533,7 @@ export type RelayMessage =
   | WorkspaceLeaseAcquireRequestMsg
   | WorkspaceLeaseGetRequestMsg
   | WorkspaceLeaseReleaseRequestMsg
+  | WorkspaceRevisionObserveRequestMsg
   | RunEventMsg
   | RunReplayOpenMsg
   | RunReplayCloseMsg
@@ -528,6 +548,7 @@ export type RelayMessage =
   | RunStatusAckMsg
   | RunResultAckMsg
   | WorkspaceLeaseAckMsg
+  | WorkspaceRevisionAckMsg
   | TerminalOpenMsg
   | TerminalOpenAckMsg
   | TerminalInputMsg

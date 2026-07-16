@@ -1,36 +1,40 @@
-# Workspace leases (durable storage + relay protocol + Agent-Task enforcement)
+# Workspace leases (storage + relay protocol + Agent-Task enforcement + runtime lifecycle)
 
 The goal is to prevent concurrent workflows or Vibe tasks from mutating the same Node
 workspace while a workflow owns it, via a durable exclusive lease keyed by
 `(node_id, workspace_key)` plus bounded revision evidence.
 
-> **Status — protocol + enforcement (PR #70).** Building on the PR #69 storage/contract
-> foundation, the lease authority is now reachable over the relay and Agent Tasks bind to
-> leases:
+> **Status — full vertical (PRs #69 → #71).** The lease is durable storage (#69), a
+> relay protocol + Node run-start enforcement + Agent-Task binding (#70), and now a
+> WorkflowRuntime lifecycle (#71):
 >
 > - The **`workspace_lease_v1` capability** is advertised — but **only** when the Node
 >   lease store is open, the acquire/get/release ops are registered, **and** run-start
 >   enforcement is active (never partial; a Node that cannot enforce does not advertise).
-> - Authenticated relay ops **`workspace_lease_acquire` / `get` / `release`** carry only
->   `node_id` + opaque `workspace_key`/lease metadata — the **physical filesystem path
->   never crosses the relay**; the Node computes containment + revision locally.
+> - Authenticated relay ops **`workspace_lease_acquire` / `get` / `release`** and
+>   **`workspace_revision_observe`** carry only `node_id` + opaque `workspace_key`/lease
+>   metadata — the **physical filesystem path never crosses the relay**; the Node computes
+>   containment + revision locally.
 > - Agent Tasks may carry an optional **`workspace_lease_id`** (in the request
 >   fingerprint; distinct from `task_id`/`remote_run_id`/`idempotency_key`/`workflow_id`;
 >   **never forwarded to the provider** — not in the prompt, metadata, env, or logs).
 > - The Node **enforces the lease at run start**, before any directory/prompt write or
 >   backend spawn, and **binds the run to its lease** so the lease cannot be released
 >   while a bound run is non-terminal.
+> - The **WorkflowRuntime** acquires all required leases before `ready → running`, passes
+>   the matching lease id to every workspace-bound task, checks the workspace revision
+>   before/after each step (out-of-band change → `blocked`), retains leases while
+>   running/blocked, and releases only after the workflow is terminal — all idempotent
+>   across restart.
 >
-> **Still deferred:** **WorkflowRuntime does not acquire leases** and does not observe
-> revisions — the runtime lifecycle + per-step revision checks are **PR #71**. **PR #67**
-> (Workflow API/MCP) remains **Draft/blocked** and is not modified; workflow lease tooling
-> is **not** exposed in MCP.
+> **PR #67** (Workflow API/MCP) remains **Draft/blocked** and is not modified; workflow
+> lease tooling is **not** exposed in MCP.
 
 ## Authority & layering (target design)
 
 The **Node is the authority** for whether a workspace is currently leased. The
 ControlStore keeps a durable **projection** for recovery/inspection only — it is NOT
-the authority. The end-to-end path (Runtime step completed in PR #71):
+the authority. The end-to-end path:
 
 ```
 Workflow Runtime → Gateway workspace-lease client → relay → Node workspace lease service → contained workspace
@@ -93,7 +97,11 @@ a router, never the authority):
   is **no enumeration** endpoint).
 - **`workspace_lease_release`** `{ node_id, workspace_lease_id }` → exact, idempotent,
   refused while in use.
-- **`workspace_lease_ack`** `{ req_id, ok, created?, lease?, error?, code? }`.
+- **`workspace_revision_observe`** `{ node_id, workspace_key }` → a FRESH read-only
+  revision observation (the Node runs the Git observer locally); used by the runtime for
+  before/after change detection. Bounded revision evidence only.
+- **`workspace_lease_ack`** / **`workspace_revision_ack`** carry the bounded lease /
+  revision result.
 
 Only `node_id`, the opaque `workspace_key`, and bounded lease projection data cross the
 wire — the physical path and Git diff content stay Node-local. An unknown target node →
@@ -134,21 +142,47 @@ is **system-observed**, distinct from the agent's `executor_handoff.tests_run` /
 `workspace_revision_unavailable`, `workspace_release_pending`. None expose physical
 paths, Git diff content, SQL, DB paths, tokens, or stack traces.
 
-## ControlStore projection (schema v7)
+## ControlStore projection (schema v7 + v8)
 
-Additive `workflow_workspace_leases` table (unique active projection per
+Additive `workflow_workspace_leases` table (v7 — unique active projection per
 `workflow_id, node_id, workspace_key`; optimistic `revision`; bounded base/current
-revision JSON). The Node remains authoritative; the projection supports recovery and
-inspection. Active leases are never removed by ordinary retention.
+revision JSON) plus `workflow_step_executions.revision_before_json` /
+`revision_after_json` (v8 — the per-step revision evidence). The Node remains
+authoritative; the projection supports recovery and inspection. Active leases are never
+removed by ordinary retention. All persisted revisions are revalidated on read.
 
-## Roadmap (NOT in this PR)
+## WorkflowRuntime lifecycle (PR #71)
 
-- **PR #71 — WorkflowRuntime lifecycle + revision checks.** Deterministic target
-  resolution (explicit `node_id`, else `workspace_node_ambiguous`), acquire in canonical
-  sorted order before the first Agent Task, record base revisions, observe before/after
-  each step (mismatch → `workspace_revision_conflict`, no task start), retain leases
-  across states/restarts/`blocked`, release only after all bound tasks terminalize (never
-  while a task may still be writing). No TTL auto-expiry.
+The runtime integrates leases through a narrow `WorkspaceLeaseClient` (acquire / observe
+a fresh revision / release) — it never speaks the relay protocol directly. It is
+**opt-in**: without a lease client the runtime behaves exactly as before (no leases, no
+revision checks). A workspace-bound workflow:
+
+1. **Resolves targets deterministically** — the set of `(node_id, workspace_key)` leases
+   from the spec + immutable input values alone (a workspace key is a safe literal or one
+   `{{ inputs.<name> }}`, never a step output). A workspace-bound step whose role omits an
+   explicit `node_id` fails closed with `workspace_node_ambiguous` — the runtime never
+   guesses a node.
+2. **Acquires all leases before `ready → running`**, in canonical sorted order (`node_id`,
+   then `workspace_key`). Creating a workflow acquires nothing. On conflict the workflow
+   stays `ready`, any partially-acquired leases are released, and no task starts — an
+   explicit later start retries cleanly (deterministic ids → the Node re-activates).
+3. **Passes the matching `workspace_lease_id`** to every workspace-bound Agent Task.
+4. **Observes the revision BEFORE each task**, compares it with the lease's expected
+   revision, and persists `revision_before`. A divergence (an out-of-band edit) sets the
+   workflow `blocked` with `workspace_revision_conflict` and **retains** the lease — no
+   task is created over a diverged tree.
+5. **Observes the revision AFTER each terminal task**, persists `revision_after`, and
+   advances the lease's expected current revision — before parsing the result or routing.
+6. **Retains leases while running or blocked; releases only after the workflow is
+   terminal** (completed/failed/cancelled). Release records intent first, then releases
+   asynchronously with bounded retry; a `workspace_lease_in_use` refusal (a bound run
+   still winding down) is retried, so a lease is never released while a task may still be
+   writing. A crash between terminalization and release is finished by recovery.
+
+For a non-Git workspace the revision is recorded as `unavailable` and lease **enforcement
+is preserved** (the exclusive claim still holds) — only the before/after change-detection
+degrades to "no Git-level evidence."
 
 ## Limits of protection
 
