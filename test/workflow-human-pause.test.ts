@@ -73,6 +73,7 @@ const pausedSpec = (kind: 'input' | 'approval', opts: { node?: boolean } = {}): 
     { from: 'gate', to: 'finish', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
     { from: 'finish', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
   ],
+  completion_policy: {},
 })
 const doneScript = () => ({ output: { status: 'done', summary: 'ok' } })
 
@@ -92,6 +93,7 @@ const inputBindingSpec = (): WorkflowSpec => ({
     { from: 'gate', to: 'finish', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
     { from: 'finish', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
   ],
+  completion_policy: {},
 })
 
 async function withStore(fn: (store: SqliteControlStore) => Promise<void>): Promise<void> {

@@ -191,6 +191,27 @@ export const LIMIT_MAXIMA = {
 
 // ── the spec ────────────────────────────────────────────────────────────────
 
+/** System-observed evidence types a completion policy can REQUIRE. Each names a
+ *  fact the RUNTIME observes (never an agent claim). */
+export type EvidenceType = 'task_status' | 'exit_code' | 'content_hash' | 'workspace_revision' | 'changed_files' | 'tests_passed'
+export const EVIDENCE_TYPES: readonly EvidenceType[] = ['task_status', 'exit_code', 'content_hash', 'workspace_revision', 'changed_files', 'tests_passed']
+
+/** A bounded, declarative completion policy. When present, an agent's requested
+ *  `$complete` is NOT sufficient — the runtime must first verify SYSTEM-OBSERVED
+ *  evidence. Missing evidence → `blocked` (verification_required); conflicting
+ *  evidence → fail closed. There is NO generic shell verifier and test success is
+ *  NEVER inferred from agent prose or repository changes. */
+export interface CompletionPolicy {
+  /** Evidence types that MUST be present for completion (else blocked). */
+  required_evidence?: EvidenceType[]
+  /** The workspace revision must have changed between before/after (system-owned). */
+  require_repository_change?: boolean
+  /** The completing step's declared `remaining_work` must be empty. */
+  require_no_remaining_work?: boolean
+  /** Provider-structured test evidence must show tests PASSED (never agent prose). */
+  require_tests_passed?: boolean
+}
+
 export interface WorkflowSpec {
   version: '1'
   name: string
@@ -202,12 +223,15 @@ export interface WorkflowSpec {
   limits: WorkflowLimits
   steps: WorkflowStep[]
   edges: WorkflowEdge[]
+  /** Optional, bounded. Gates `$complete` on verified evidence. Omitted → the
+   *  agent's requested completion completes the workflow directly (prior behavior). */
+  completion_policy?: CompletionPolicy
 }
 
 /** Fail-closed allow-list of top-level fields (no forward-compat extras in v1). */
 export const KNOWN_SPEC_FIELDS: readonly string[] = [
   'version', 'name', 'description', 'entry_step', 'inputs',
-  'agents', 'output_schemas', 'limits', 'steps', 'edges',
+  'agents', 'output_schemas', 'limits', 'steps', 'edges', 'completion_policy',
 ]
 
 // ── future runtime state (types only — no runtime implemented here) ──────────

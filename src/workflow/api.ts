@@ -13,7 +13,7 @@ import type { ControlStore } from '../control/store.js'
 import type { WorkflowRuntime } from './runtime.js'
 import {
   workflowApiError, mapThrownError, parseCreateWorkflowBody, preflightSpec, parseListQuery,
-  toWorkflowSummary, toWorkflowSnapshotView, reasonFromEvents,
+  toWorkflowSummary, toWorkflowSnapshotView, reasonFromEvents, completionVerificationFromEvents,
   toHumanRequestView, parseAnswerBody, parseDecisionBody,
 } from './api-contract.js'
 
@@ -27,9 +27,11 @@ async function buildSnapshotView(store: ControlStore, workflowId: string): Promi
   if (!snap) return null
   const steps = await store.listStepExecutions(workflowId)
   const rec = snap.workflow
-  const reason = END_STATES.has(rec.status) ? reasonFromEvents(await store.listWorkflowEvents(workflowId)) : null
+  const events = END_STATES.has(rec.status) ? await store.listWorkflowEvents(workflowId) : null
+  const reason = events ? reasonFromEvents(events) : null
+  const completion = rec.status === 'completed' && events ? completionVerificationFromEvents(events) : null
   const leases = await store.listWorkspaceLeaseProjections(workflowId)
-  return toWorkflowSnapshotView(rec, snap.context, snap.context_revision, steps, reason, leases)
+  return toWorkflowSnapshotView(rec, snap.context, snap.context_revision, steps, reason, leases, completion)
 }
 
 export async function listWorkflowsController(store: ControlStore, search: URLSearchParams): Promise<ControllerResult> {

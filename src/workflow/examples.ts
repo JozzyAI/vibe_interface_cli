@@ -115,5 +115,8 @@ export function plannerExecutorLoopExample(): WorkflowSpec {
       { from: 'review', to: '$blocked', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'blocked' } },
       { from: 'review', to: '$failed', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'failed' } },
     ],
+    // Completable spec → a completion_policy is required. An empty policy verifies no
+    // extra evidence (completion is still gated: conflicting evidence fails closed).
+    completion_policy: {},
   }
 }

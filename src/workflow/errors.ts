@@ -24,6 +24,7 @@ export type WorkflowErrorCode =
   | 'workspace_node_ambiguous' // a workspace-bound step's node routing is not explicit
   | 'workspace_lease_unavailable' // the workspace-lease service was unreachable at start
   | 'workspace_lease_unsupported' // a workspace-bound workflow has no lease client (fail closed)
+  | 'completion_policy_required' // a completable NEW spec omitted a required completion_policy
   | 'runtime_internal'         // an unexpected runtime error (sanitized)
 
 /** Stable reasons for a non-terminal `blocked` workflow. */

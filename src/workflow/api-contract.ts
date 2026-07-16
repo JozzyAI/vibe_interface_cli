@@ -77,6 +77,7 @@ export function mapThrownError(err: unknown): { error: WorkflowApiError; status:
   if (err instanceof WorkflowRuntimeError) {
     let code: WorkflowApiErrorCode = 'internal_error'
     if (err.code === 'invalid_spec') code = 'invalid_workflow_spec'
+    else if (err.code === 'completion_policy_required') code = 'invalid_workflow_spec'
     else if (err.code === 'invalid_input_values') code = 'invalid_workflow_inputs'
     else if (err.code === 'invalid_transition') code = 'workflow_state_conflict'
     else if (err.code === 'workspace_lease_conflict') code = 'workspace_lease_conflict'
@@ -276,6 +277,7 @@ export function toWorkflowSnapshotView(
   steps: StepExecutionRecord[],
   reason: { reason?: string } | null,
   leases: WorkflowWorkspaceLeaseRecord[] = [],
+  completionVerification: 'verified' | 'legacy_unverified' | null = null,
 ): Record<string, unknown> {
   const spec = record.spec as { description?: unknown } | null
   const currentStep = steps.find((s) => s.step_id === record.current_step_id && s.round === record.current_round)
@@ -293,9 +295,28 @@ export function toWorkflowSnapshotView(
     // true while any lease still awaits release after the workflow terminalized.
     workspace_leases: leaseViews,
     release_pending: leaseViews.some((l) => l.status === 'release_requested'),
+    // Completion verification: `verified` (a completion_policy was satisfied),
+    // `legacy_unverified` (a legacy policy-less completion — NEVER treat as verified),
+    // or null when not completed.
+    completion_verification: completionVerification,
     history: { complete: record.earliest_retained_sequence === 0, earliest_retained_sequence: record.earliest_retained_sequence },
     ...(reason?.reason ? { reason: reason.reason } : {}),
   }
+}
+
+/** Completion verification status derived from the terminal `workflow.completed`
+ *  event: `verified` (a completion_policy was satisfied), `legacy_unverified` (a
+ *  legacy policy-less workflow), or null (not completed). Exposes the unverified
+ *  status clearly so a caller never mistakes a legacy completion for a verified one. */
+export function completionVerificationFromEvents(events: WorkflowEventRecord[]): 'verified' | 'legacy_unverified' | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].event_type === 'workflow.completed') {
+      const p = events[i].payload as { verified?: unknown; legacy_unverified?: unknown } | null
+      if (p && typeof p === 'object') { if (p.verified === true) return 'verified'; if (p.legacy_unverified === true) return 'legacy_unverified' }
+      return 'legacy_unverified' // a completed event without a verified marker is legacy
+    }
+  }
+  return null
 }
 
 /** Extract the stable reason from the last terminal/blocked workflow event (safe

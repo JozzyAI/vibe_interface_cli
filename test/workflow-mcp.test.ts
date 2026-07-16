@@ -91,6 +91,7 @@ const pauseSpec = (kind: 'input' | 'approval') => ({
     { from: 'gate', to: 'finish', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
     { from: 'finish', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
   ],
+  completion_policy: {},
 })
 const waitWfStatus = async (mcp: any, id: string, want: string[], ms = 8000) => {
   const end = Date.now() + ms
@@ -146,6 +147,7 @@ const workspaceBoundSpec = () => ({
   limits: { max_tasks: 3, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 1 },
   steps: [{ id: 'solo', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do {{ inputs.objective }}', workspace_key_template: '{{ inputs.workspace_key }}', output_schema: 'o' }],
   edges: [{ from: 'solo', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }],
+  completion_policy: {},
 })
 
 test('MCP: a workspace-bound workflow cannot START without a lease authority (structured workspace_lease_unsupported, stays ready)', async () => {

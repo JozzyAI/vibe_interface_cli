@@ -276,6 +276,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
   // ── tasks ────────────────────────────────────────────────────────────────────
   async createTask(input: CreateTaskInput): Promise<TaskRecord> { this.open(); return this.createTaskSync(input) }
   async getTask(taskId: string): Promise<TaskRecord | null> { this.open(); const r = this.taskRow(taskId); return r ? this.toTask(r) : null }
+  async getTaskResult(taskId: string): Promise<TaskResultRecord | null> { this.open(); return this.getTaskResultDurable(taskId) }
   async updateTask(taskId: string, expectedRevision: number, patch: TaskPatch): Promise<TaskRecord> { this.open(); return this.updateTaskSync(taskId, expectedRevision, patch) }
   async listTasks(filters: TaskFilters = {}, page: Pagination = {}): Promise<TaskRecord[]> {
     this.open()
@@ -727,6 +728,23 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
       this.appendWorkflowEventAuto(workflowId, resumedEvent)
       return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), resumed: true }
     })()
+  }
+
+  // ── completion-policy verified evidence (workflow_completion_evidence) ────────
+  async recordCompletionEvidence(input: { step_execution_id: string; workflow_id: string; evidence: unknown; decision: string }): Promise<void> {
+    this.open()
+    this.db.transaction(() => {
+      if (this.db.prepare('SELECT 1 FROM workflow_completion_evidence WHERE step_execution_id = ?').get(input.step_execution_id)) return // first write wins (idempotent)
+      if (!this.stepRow(input.step_execution_id)) throw new ControlStoreError('not_found', `step execution not found: ${input.step_execution_id}`)
+      this.db.prepare('INSERT INTO workflow_completion_evidence (step_execution_id,workflow_id,evidence_json,decision,created_at) VALUES (@sec,@wf,@ev,@dec,@now)')
+        .run({ sec: input.step_execution_id, wf: input.workflow_id, ev: encodeJson(input.evidence, SIZE_LIMITS.metadata_json, 'completion.evidence'), dec: boundString(input.decision, 64, 'completion.decision'), now: nowIso() })
+    })()
+  }
+  async getCompletionEvidence(stepExecutionId: string): Promise<{ step_execution_id: string; workflow_id: string; evidence: unknown; decision: string; created_at: string } | null> {
+    this.open()
+    const r = this.db.prepare('SELECT * FROM workflow_completion_evidence WHERE step_execution_id = ?').get(stepExecutionId) as { step_execution_id: string; workflow_id: string; evidence_json: string; decision: string; created_at: string } | undefined
+    if (!r) return null
+    return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, evidence: decodeJson(r.evidence_json, SIZE_LIMITS.metadata_json, 'completion.evidence'), decision: r.decision, created_at: r.created_at }
   }
 
   // ── retention (bounded; never touches active records; no scheduler) ──────────
