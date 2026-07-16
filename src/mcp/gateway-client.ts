@@ -26,6 +26,8 @@ export const DEFAULT_OVERALL_WAIT_MS = 30_000
 export const OUTPUT_PREVIEW_MAX_CHARS = 4_000
 
 const TERMINAL_TASK_EVENTS = new Set(['task.completed', 'task.failed', 'task.cancelled'])
+/** End-of-forward-progress workflow events (v1 does not auto-resume `blocked`). */
+const WORKFLOW_END_EVENTS = new Set(['workflow.completed', 'workflow.failed', 'workflow.cancelled', 'workflow.blocked'])
 
 /** A structured Gateway error surfaced to MCP tool callers (never carries a token). */
 export interface GatewayError {
@@ -100,6 +102,22 @@ export interface CollectedEvents {
   truncated: boolean
   ended_by: 'terminal' | 'timeout'
 }
+
+/** BOUNDED collection of workflow events + the authoritative workflow projection.
+ *  `terminal`/`blocked` come from the durable workflow status (not a fabricated
+ *  event). Workflow event sequences are DISTINCT from task event ids. */
+export interface WorkflowCollectedEvents {
+  workflow: unknown
+  events: unknown[]
+  next_event_id: number
+  terminal: boolean
+  blocked: boolean
+  truncated: boolean
+  ended_by: 'terminal' | 'blocked' | 'timeout'
+}
+
+/** Result of a higher-level workflow wait aggregated across bounded polls. */
+export interface WorkflowWaitResult extends WorkflowCollectedEvents {}
 
 /** Result of a higher-level workflow wait — a CollectedEvents aggregated across
  *  bounded polls, plus an optional compact text preview of agent output. */
@@ -297,5 +315,106 @@ export class GatewayClient {
       ended_by: terminal ? 'terminal' : 'timeout',
       ...(preview.preview !== undefined ? { output_preview: preview.preview, output_preview_truncated: preview.truncated } : {}),
     }
+  }
+
+  // ── workflows (durable Workflow Runtime lifecycle; same Gateway + Bearer token) ─
+
+  async listWorkflows(query: { status?: string; limit?: number; offset?: number } = {}): Promise<unknown> {
+    const q = new URLSearchParams()
+    if (query.status) q.set('status', query.status)
+    if (query.limit !== undefined) q.set('limit', String(query.limit))
+    if (query.offset !== undefined) q.set('offset', String(query.offset))
+    const qs = q.toString()
+    return this.request('GET', `/v1/workflows${qs ? `?${qs}` : ''}`)
+  }
+  /** Create a workflow (validated, status `ready`) — does NOT start execution. */
+  async createWorkflow(body: { spec: unknown; input_values?: unknown }): Promise<unknown> { return this.request('POST', '/v1/workflows', body) }
+  /** Explicitly begin execution (idempotent; running/terminal return the snapshot). */
+  async startWorkflow(workflowId: string): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/start`) }
+  async getWorkflow(workflowId: string): Promise<unknown> { return this.request('GET', `/v1/workflows/${encodeURIComponent(workflowId)}`) }
+  async cancelWorkflow(workflowId: string): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/cancel`) }
+
+  /**
+   * BOUNDED collection of a workflow's events over SSE — the workflow analogue of
+   * collectEvents. Reads workflow events with sequence strictly greater than
+   * `afterId` for up to `waitMs`, returning early on an end-of-progress event. The
+   * authoritative GET workflow status decides terminal/blocked (a missed terminal
+   * SSE event is never fabricated). Closing/timing out only drops the SSE
+   * subscriber — it NEVER cancels the workflow. Workflow event sequences are
+   * DISTINCT from task event ids.
+   */
+  async collectWorkflowEvents(workflowId: string, opts: { afterId?: number; waitMs?: number } = {}): Promise<WorkflowCollectedEvents> {
+    const waitMs = Math.min(Math.max(opts.waitMs ?? DEFAULT_EVENT_WAIT_MS, EVENT_WAIT_MIN_MS), EVENT_WAIT_MAX_MS)
+    const headers = this.authHeaders({ accept: 'text/event-stream' })
+    if (opts.afterId !== undefined) headers['last-event-id'] = String(opts.afterId)
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), waitMs)
+    const events: unknown[] = []
+    let truncated = false
+    let lastSeq = opts.afterId ?? -1
+    try {
+      const res = await fetch(this.baseUrl + `/v1/workflows/${encodeURIComponent(workflowId)}/events`, { method: 'GET', headers, signal: ac.signal })
+      if (res.status >= 400) {
+        clearTimeout(timer)
+        const text = await res.text(); let json: unknown; try { json = JSON.parse(text) } catch { /* */ }
+        const api = (json && (json as { error?: unknown }).error === true) ? { ...(json as Record<string, unknown>), http_status: res.status } as unknown as GatewayError : { error: true as const, code: 'gateway_error', message: `gateway returned HTTP ${res.status}`, http_status: res.status }
+        throw new GatewayApiError(api)
+      }
+      const reader = res.body!.getReader(); const dec = new TextDecoder(); let buf = ''
+      outer: while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const f = buf.slice(0, idx); buf = buf.slice(idx + 2)
+          if (!f) continue
+          if (f.startsWith(':')) { if (f.includes('truncated')) truncated = true; continue }
+          let type = ''; let dataLine = ''; let idLine = ''
+          for (const line of f.split('\n')) { if (line.startsWith('event: ')) type = line.slice(7); else if (line.startsWith('data: ')) dataLine = line.slice(6); else if (line.startsWith('id: ')) idLine = line.slice(4) }
+          if (!type) continue
+          let payload: unknown = dataLine; try { payload = JSON.parse(dataLine) } catch { /* */ }
+          events.push(payload)
+          const seq = Number(idLine); if (Number.isFinite(seq)) lastSeq = Math.max(lastSeq, seq)
+          if (WORKFLOW_END_EVENTS.has(type)) break outer
+        }
+      }
+      try { await reader.cancel() } catch { /* */ }
+    } catch (err) {
+      if (err instanceof GatewayApiError) throw err
+      if ((err as Error).name !== 'AbortError') throw new GatewayApiError({ error: true, code: 'gateway_unreachable', message: `workflow event stream failed: ${(err as Error).message}`, retryable: true })
+    } finally { clearTimeout(timer); ac.abort() }
+
+    // Authoritative terminal/blocked decision from the durable workflow projection.
+    const workflow = await this.getWorkflow(workflowId)
+    const status = (workflow && typeof workflow === 'object') ? (workflow as { status?: unknown }).status : undefined
+    const terminal = status === 'completed' || status === 'failed' || status === 'cancelled'
+    const blocked = status === 'blocked'
+    return { workflow, events, next_event_id: lastSeq, terminal, blocked, truncated, ended_by: terminal ? 'terminal' : blocked ? 'blocked' : 'timeout' }
+  }
+
+  /**
+   * Higher-level WORKFLOW wait: resume collectWorkflowEvents from the last cursor
+   * until the workflow is terminal OR blocked (authoritative status) or ONE overall
+   * budget expires. No gap/boundary-duplicate across resumes. A timeout/disconnect
+   * NEVER cancels the workflow or its current Agent Task.
+   */
+  async waitForWorkflow(workflowId: string, opts: { afterId?: number; overallWaitMs?: number } = {}): Promise<WorkflowWaitResult> {
+    const overall = Math.min(Math.max(opts.overallWaitMs ?? DEFAULT_OVERALL_WAIT_MS, OVERALL_WAIT_MIN_MS), OVERALL_WAIT_MAX_MS)
+    const deadline = Date.now() + overall
+    let cursor = opts.afterId ?? -1
+    const events: unknown[] = []
+    let truncated = false
+    let last: WorkflowCollectedEvents | undefined
+    while (true) {
+      const remaining = deadline - Date.now()
+      if (remaining < EVENT_WAIT_MIN_MS) break
+      const r = await this.collectWorkflowEvents(workflowId, { afterId: cursor, waitMs: Math.min(remaining, EVENT_WAIT_MAX_MS) })
+      if (r.events.length) events.push(...r.events)
+      cursor = r.next_event_id; truncated = truncated || r.truncated; last = r
+      if (r.terminal || r.blocked) break
+    }
+    const terminal = last!.terminal; const blocked = last!.blocked
+    return { workflow: last!.workflow, events, next_event_id: cursor, terminal, blocked, truncated, ended_by: terminal ? 'terminal' : blocked ? 'blocked' : 'timeout' }
   }
 }

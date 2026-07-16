@@ -40,9 +40,12 @@ import {
   type Task, type TaskEvent, type TaskEventType, type ApiError,
 } from './agent-task-contract.js'
 import { computeRequestFingerprint } from './request-fingerprint.js'
-import type { GatewayTaskStore } from '../control/store.js'
+import type { GatewayTaskStore, ControlStore } from '../control/store.js'
 import { ControlStoreError, type CreateTaskInput, type TaskEventInput, type TaskRecord } from '../control/records.js'
 import { validateTaskResult, type AgentTaskResultV1, type TaskResultStatus } from './agent-task-result.js'
+import { listWorkflowsController, createWorkflowController, startWorkflowController, getWorkflowController, cancelWorkflowController } from '../workflow/api.js'
+import { streamWorkflowEvents } from '../workflow/event-stream.js'
+import { workflowApiError } from '../workflow/api-contract.js'
 
 /** Map a canonical TaskEvent to the durable append shape (no secrets, bounded). */
 function toEventInput(ev: TaskEvent): TaskEventInput { return { sequence: ev.seq, event_type: ev.type, ts: ev.ts, payload: ev.payload } }
@@ -156,6 +159,13 @@ export interface AgentGatewayOptions {
   /** Recover persisted non-terminal tasks on start (default: true when a store is
    *  set). Rebuilds the in-memory cache/active-slot accounting and reconciles. */
   recoverOnStart?: boolean
+  /** Full async ControlStore (same DB as `taskStore`) for the durable Workflow
+   *  REST routes (`/v1/workflows*`). When unset, workflow routes are disabled. */
+  controlStore?: ControlStore
+  /** Lazy accessor for the WorkflowRuntime. Lazy because the runtime's task client
+   *  targets THIS gateway over loopback, so it is constructed AFTER listen and
+   *  injected here. Returns undefined until wired (routes then answer 503). */
+  getWorkflowRuntime?: () => import('../workflow/runtime.js').WorkflowRuntime | undefined
 }
 
 // ── auth ─────────────────────────────────────────────────────────────────────
@@ -1109,6 +1119,56 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
   // ── server ──────────────────────────────────────────────────────────────────
 
+  // ── workflow routes (durable Workflow Runtime lifecycle over the SAME store) ──
+  // Enabled only when a ControlStore is provided. Mutating routes need the runtime
+  // (503 until it is wired post-listen); read routes need only the store.
+  const controlStore: ControlStore | undefined = opts.controlStore
+  const getWorkflowRuntime = opts.getWorkflowRuntime
+  const workflowStreams = new Set<http.ServerResponse>() // open workflow SSE responses (ended on shutdown)
+  function wfUnavailable(res: http.ServerResponse): void { sendJson(res, 503, workflowApiError('workflow_runtime_unavailable', 'the workflow runtime is not available yet')) }
+
+  async function handleWorkflows(req: http.IncomingMessage, res: http.ServerResponse, parts: string[], method: string): Promise<void> {
+    if (!controlStore) return sendError(res, apiError('task_not_found', 'workflows are not enabled on this gateway'), 404)
+    const runtime = getWorkflowRuntime?.()
+    // /v1/workflows
+    if (parts.length === 2) {
+      if (method === 'GET') { const r = await listWorkflowsController(controlStore, new URL(req.url ?? '/', 'http://localhost').searchParams); return sendJson(res, r.status, r.body) }
+      if (method === 'POST') {
+        if (!runtime) return wfUnavailable(res)
+        const body = await readBody(req, MAX_BODY_BYTES)
+        if (!body.ok) return sendError(res, apiError('invalid_request', `request body exceeds ${MAX_BODY_BYTES} bytes`), 413)
+        let parsed: unknown
+        try { parsed = JSON.parse(body.text) } catch { return sendJson(res, 400, workflowApiError('invalid_request', 'malformed JSON body')) }
+        const r = await createWorkflowController(runtime, parsed)
+        return sendJson(res, r.status, r.body)
+      }
+      return methodNotAllowed(res, ['GET', 'POST'])
+    }
+    const id = decodeURIComponent(parts[2])
+    if (!id) return sendError(res, apiError('invalid_request', 'missing workflow id'), 400)
+    if (parts.length === 3) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+      const r = await getWorkflowController(controlStore, id); return sendJson(res, r.status, r.body)
+    }
+    if (parts.length === 4 && parts[3] === 'start') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (!runtime) return wfUnavailable(res)
+      const r = await startWorkflowController(runtime, controlStore, id); return sendJson(res, r.status, r.body)
+    }
+    if (parts.length === 4 && parts[3] === 'events') {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+      const rec = await controlStore.getWorkflow(id)
+      if (!rec) return sendJson(res, 404, workflowApiError('workflow_not_found', `no such workflow: ${id}`))
+      return streamWorkflowEvents(req, res, controlStore, id, workflowStreams)
+    }
+    if (parts.length === 4 && parts[3] === 'cancel') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (!runtime) return wfUnavailable(res)
+      const r = await cancelWorkflowController(runtime, controlStore, id); return sendJson(res, r.status, r.body)
+    }
+    return sendError(res, apiError('task_not_found', 'not found'), 404)
+  }
+
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
@@ -1128,6 +1188,10 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         if (parts.length === 2 && parts[0] === 'v1' && parts[1] === 'tasks') {
           if (method !== 'POST') return methodNotAllowed(res, ['POST'])
           return await handleCreate(req, res)
+        }
+        // /v1/workflows and sub-resources (durable Workflow Runtime lifecycle)
+        if (parts.length >= 2 && parts[0] === 'v1' && parts[1] === 'workflows') {
+          return await handleWorkflows(req, res, parts, method)
         }
         // /v1/tasks/:id  and sub-resources
         if (parts.length >= 3 && parts[0] === 'v1' && parts[1] === 'tasks') {
@@ -1190,6 +1254,8 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
             for (const sres of task.subscribers) { try { sres.end() } catch { /* ignore */ } }
             task.subscribers.clear()
           }
+          for (const sres of workflowStreams) { try { sres.end() } catch { /* ignore */ } }
+          workflowStreams.clear()
           server.close(() => r())
         }),
       })
