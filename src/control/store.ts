@@ -121,6 +121,8 @@ export interface ControlStore {
   // tasks
   createTask(input: CreateTaskInput): Promise<TaskRecord>
   getTask(taskId: string): Promise<TaskRecord | null>
+  /** Read the durable AgentTaskResult for a task (revalidated on read; null if none). */
+  getTaskResult(taskId: string): Promise<import('./records.js').TaskResultRecord | null>
   updateTask(taskId: string, expectedRevision: number, patch: TaskPatch): Promise<TaskRecord>
   listTasks(filters?: TaskFilters, page?: Pagination): Promise<TaskRecord[]>
   deleteTask(taskId: string): Promise<void> // retention/cleanup only
@@ -188,6 +190,13 @@ export interface ControlStore {
   /** Persist the revision observed BEFORE / AFTER a step's task. Idempotent. */
   setStepRevisionBefore(stepExecutionId: string, revision: unknown): Promise<void>
   setStepRevisionAfter(stepExecutionId: string, revision: unknown): Promise<void>
+
+  // ── completion-policy verified evidence (workflow_completion_evidence) ────────
+  /** Persist the SYSTEM-OBSERVED evidence + decision used to gate `$complete` for a
+   *  completing step. Idempotent on step_execution_id (first write wins) so a restart
+   *  never re-derives or re-completes. */
+  recordCompletionEvidence(input: { step_execution_id: string; workflow_id: string; evidence: unknown; decision: string }): Promise<void>
+  getCompletionEvidence(stepExecutionId: string): Promise<{ step_execution_id: string; workflow_id: string; evidence: unknown; decision: string; created_at: string } | null>
 
   // ── human pause / approval gates (workflow_human_requests) ───────────────────
   // Durable input/approval pauses. No Agent Task runs while a workflow waits; the

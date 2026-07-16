@@ -8,9 +8,9 @@
  */
 import {
   KNOWN_SPEC_FIELDS, LIMIT_MAXIMA, SAFE_ID_RE, NODE_ID_RE, TERMINAL_TARGETS,
-  MAX_ENUM_VALUES, MAX_ENUM_VALUE_LENGTH, CONTEXT_FIELDS, CONTEXT_GROUPS,
+  MAX_ENUM_VALUES, MAX_ENUM_VALUE_LENGTH, CONTEXT_FIELDS, CONTEXT_GROUPS, EVIDENCE_TYPES,
   isTerminalTarget,
-  type ContextGroup, type WorkflowInputType, type SchemaFieldType,
+  type ContextGroup, type WorkflowInputType, type SchemaFieldType, type EvidenceType,
 } from './contract.js'
 import { checkConditionShape, parseConditionPath } from './conditions.js'
 
@@ -134,6 +134,7 @@ export function validateWorkflowSpec(input: unknown): ValidationResult {
 
   const hasLoopEdge = Array.isArray(spec.edges) && spec.edges.some((e) => isObj(e) && e.kind === 'loop')
   validateLimits(spec.limits, hasLoopEdge, err)
+  if (spec.completion_policy !== undefined) validateCompletionPolicy(spec.completion_policy, err)
 
   const graph = validateEdges(spec, stepIds, stepOutputSchema, schemaFields, err)
   const entry = isStr(spec.entry_step) && stepIds.has(spec.entry_step) ? spec.entry_step : undefined
@@ -146,6 +147,21 @@ export function validateWorkflowSpec(input: unknown): ValidationResult {
   validateRouting(graph.outgoing, stepOutputSchema, schemaFieldDefs, err)
 
   return done()
+}
+
+// ── completion policy ─────────────────────────────────────────────────────────
+
+function validateCompletionPolicy(cp: unknown, err: Err): void {
+  const p = '/completion_policy'
+  if (!isObj(cp)) { err('bad_completion_policy', 'completion_policy must be an object', p); return }
+  if (cp.required_evidence !== undefined) {
+    if (!Array.isArray(cp.required_evidence) || cp.required_evidence.length > EVIDENCE_TYPES.length) err('bad_required_evidence', `required_evidence must be an array of at most ${EVIDENCE_TYPES.length} evidence types`, `${p}/required_evidence`)
+    else for (const e of cp.required_evidence) if (!EVIDENCE_TYPES.includes(e as EvidenceType)) err('bad_evidence_type', `unknown evidence type: ${String(e)} (allowed: ${EVIDENCE_TYPES.join(', ')})`, `${p}/required_evidence`)
+  }
+  for (const k of ['require_repository_change', 'require_no_remaining_work', 'require_tests_passed']) {
+    if (cp[k] !== undefined && typeof cp[k] !== 'boolean') err('bad_completion_flag', `completion_policy.${k} must be a boolean`, `${p}/${k}`)
+  }
+  for (const k of Object.keys(cp)) if (!['required_evidence', 'require_repository_change', 'require_no_remaining_work', 'require_tests_passed'].includes(k)) err('completion_policy_unknown_field', `unknown completion_policy field: ${k}`, `${p}/${k}`)
 }
 
 // ── agents / inputs / schemas ─────────────────────────────────────────────────

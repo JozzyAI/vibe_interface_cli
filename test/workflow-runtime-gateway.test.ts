@@ -30,6 +30,7 @@ function singleStepSpec(): WorkflowSpec {
     limits: { max_tasks: 3, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 1 },
     steps: [{ id: 'solo', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do: {{ inputs.objective }}', output_schema: 'solo_out' }],
     edges: [{ from: 'solo', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }],
+    completion_policy: {},
   }
 }
 

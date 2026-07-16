@@ -36,6 +36,7 @@ import { WorkflowRuntimeError, type LimitKind } from './errors.js'
 import { TransientAgentTaskError, type AgentTaskClient, type AgentTaskTerminalRead } from './task-client.js'
 import { resolveWorkspaceTargets, TransientWorkspaceLeaseError, type WorkspaceLeaseClient, type WorkspaceTarget } from './workspace-lease-client.js'
 import { workspaceLeaseId, revisionsMatch, WorkspaceLeaseError, type WorkspaceRevision } from '../lib/workspace-lease.js'
+import { assembleEvidence, evaluateCompletion, isCompletableSpec } from './completion-policy.js'
 
 const CV = WORKFLOW_EVENT_CONTRACT_VERSION
 const MAX_CTX_LIST = 50
@@ -95,6 +96,13 @@ export class WorkflowRuntime {
     const v = validateWorkflowSpec(spec)
     if (!v.valid) throw new WorkflowRuntimeError('invalid_spec', 'workflow spec failed validation', { issues: v.issues.filter((i) => i.severity === 'error').slice(0, 10).map((i) => ({ code: i.code, path: i.path })) })
     const s = spec as WorkflowSpec
+    // Create-time gate: a NEWLY created spec that can reach $complete MUST declare a
+    // completion_policy (verified completion is not optional for new workflows). A
+    // spec with no $complete route may omit it. Legacy persisted workflows are NOT
+    // re-checked here — they execute with backward-compatible unverified completion.
+    if (isCompletableSpec(s) && s.completion_policy === undefined) {
+      throw new WorkflowRuntimeError('completion_policy_required', 'a workflow that can reach $complete must declare a completion_policy', { reason: 'completion_policy_required' })
+    }
     const norm = normalizeInputValues(s, inputValues)
     if (!norm.ok) throw new WorkflowRuntimeError('invalid_input_values', norm.message, norm.name ? { name: norm.name } : undefined)
 
@@ -387,10 +395,17 @@ export class WorkflowRuntime {
 
     if (decision.decision.kind === 'terminal') {
       const status = terminalTargetToStatus(decision.decision.target as '$complete' | '$failed' | '$blocked')
+      // Completion policy: an agent's requested $complete is a CLAIM — verify
+      // system-observed evidence before completing (missing → blocked; conflict → fail).
+      if (status === 'completed' && spec.completion_policy) return this.gateCompletion(workflowId, spec, step, decision.decision.target)
       const eventType = status === 'completed' ? 'workflow.completed' : status === 'failed' ? 'workflow.failed' : 'workflow.blocked'
+      // A completable spec WITHOUT a completion_policy can only be a LEGACY persisted
+      // workflow (new ones are rejected at create). It completes for backward
+      // compatibility but is marked `legacy_unverified` — never `verified: true`.
+      const terminalPayload = status === 'completed' ? { legacy_unverified: true } : status === 'blocked' ? { reason: 'routed_blocked' } : {}
       await this.store.terminalizeWorkflow(workflowId, status,
         { event_type: 'edge.selected', ts: new Date().toISOString(), payload: { to: decision.decision.target }, contract_version: CV } as WorkflowEventDraft,
-        { event_type: eventType, ts: new Date().toISOString(), payload: status === 'blocked' ? { reason: 'routed_blocked' } : {}, contract_version: CV } as WorkflowEventDraft)
+        { event_type: eventType, ts: new Date().toISOString(), payload: terminalPayload, contract_version: CV } as WorkflowEventDraft)
       return true
     }
     // step target (normal or loop)
@@ -408,6 +423,51 @@ export class WorkflowRuntime {
       { event_type: 'step.started', ts: new Date().toISOString(), step_execution_id: nextSecId, payload: { step_id: target, round: nextRound, attempt: 1 }, contract_version: CV } as WorkflowEventDraft,
     )
     return false // continue the pump loop at the new current step
+  }
+
+  // ── completion policy (verified evidence gate) ───────────────────────────────────
+
+  /** Gate a requested `$complete` on SYSTEM-OBSERVED evidence. Assembles + durably
+   *  records the evidence, then: satisfied → complete; missing → blocked
+   *  (verification_required); conflicting → fail closed. Terminal + idempotent. */
+  private async gateCompletion(workflowId: string, spec: WorkflowSpec, step: StepExecutionRecord, target: string): Promise<boolean> {
+    const evidence = await this.assembleStepEvidence(step)
+    const remainingWork = this.declaredRemainingWork(step)
+    const outcome = evaluateCompletion(spec.completion_policy!, evidence, remainingWork)
+    // Durable, first-write-wins evidence snapshot (audit + no re-derive on restart).
+    try { await this.store.recordCompletionEvidence({ step_execution_id: step.step_execution_id, workflow_id: workflowId, evidence, decision: outcome.decision }) } catch { /* idempotent */ }
+    const edgeEv = { event_type: 'edge.selected', ts: new Date().toISOString(), payload: { to: target, gated: true }, contract_version: CV } as WorkflowEventDraft
+    if (outcome.decision === 'complete') {
+      await this.store.terminalizeWorkflow(workflowId, 'completed', edgeEv, { event_type: 'workflow.completed', ts: new Date().toISOString(), payload: { verified: true }, contract_version: CV } as WorkflowEventDraft)
+    } else if (outcome.decision === 'blocked') {
+      await this.store.terminalizeWorkflow(workflowId, 'blocked', edgeEv, { event_type: 'workflow.blocked', ts: new Date().toISOString(), payload: { reason: outcome.reason, missing: outcome.missing }, contract_version: CV } as WorkflowEventDraft)
+    } else {
+      await this.store.terminalizeWorkflow(workflowId, 'failed', edgeEv, { event_type: 'workflow.failed', ts: new Date().toISOString(), payload: { reason: outcome.reason }, contract_version: CV } as WorkflowEventDraft)
+    }
+    return true
+  }
+
+  /** Assemble the verified evidence for a completing step from durable system facts:
+   *  authoritative task status + AgentTaskResult (exit code / content hash / provider
+   *  evidence refs) + the workspace revision observed before/after the step. */
+  private async assembleStepEvidence(step: StepExecutionRecord): Promise<import('./completion-policy.js').VerifiedEvidence> {
+    let taskStatus: string | null = null
+    let result: import('../lib/agent-task-result.js').AgentTaskResultV1 | null = null
+    if (step.task_id) {
+      try { taskStatus = (await this.store.getTask(step.task_id))?.status ?? null } catch { /* */ }
+      try { result = (await this.store.getTaskResult(step.task_id))?.result ?? null } catch { /* */ }
+    }
+    const revisionBefore = (step.revision_before ?? null) as WorkspaceRevision | null
+    const revisionAfter = (step.revision_after ?? null) as WorkspaceRevision | null
+    return assembleEvidence({ taskStatus, result, revisionBefore, revisionAfter })
+  }
+
+  /** The completing step's AGENT-DECLARED remaining work (a claim, used only for
+   *  require_no_remaining_work — never treated as verified evidence). */
+  private declaredRemainingWork(step: StepExecutionRecord): unknown[] | null {
+    const out = (step.output && typeof step.output === 'object' && !Array.isArray(step.output)) ? step.output as Record<string, unknown> : null
+    const rw = out?.remaining_work
+    return Array.isArray(rw) ? rw : null
   }
 
   // ── terminal helpers ────────────────────────────────────────────────────────────

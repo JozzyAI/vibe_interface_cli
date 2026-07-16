@@ -108,6 +108,7 @@ const pauseSpec = (kind: 'input' | 'approval'): WorkflowSpec => ({
     { from: 'gate', to: 'finish', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
     { from: 'finish', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
   ],
+  completion_policy: {},
 })
 
 const soloSpec = (): WorkflowSpec => ({
@@ -116,6 +117,7 @@ const soloSpec = (): WorkflowSpec => ({
   limits: { max_tasks: 3, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 1 },
   steps: [{ id: 'solo', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do {{ inputs.objective }}', output_schema: 'o' }],
   edges: [{ from: 'solo', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }],
+  completion_policy: {},
 })
 
 /** A workspace-bound spec: the step declares a node_id role + workspace_key_template,
@@ -128,6 +130,7 @@ const workspaceBoundSpec = (): WorkflowSpec => ({
   limits: { max_tasks: 3, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 1 },
   steps: [{ id: 'solo', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do {{ inputs.objective }}', workspace_key_template: '{{ inputs.workspace_key }}', output_schema: 'o' }],
   edges: [{ from: 'solo', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }],
+  completion_policy: {},
 })
 
 // ── REST human pause / approval ──────────────────────────────────────────────────

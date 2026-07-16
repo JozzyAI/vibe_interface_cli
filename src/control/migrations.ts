@@ -229,7 +229,23 @@ CREATE TABLE workflow_human_requests (
 CREATE INDEX idx_human_req_wf ON workflow_human_requests(workflow_id, status);
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }]
+/** Schema v10 — durable completion-policy VERIFIED EVIDENCE. One row per completing
+ *  step execution (first write wins), recording the system-observed evidence snapshot
+ *  and the resulting gate decision so a restart never re-derives or re-completes.
+ *  Additive; bounded JSON; no secrets. */
+const V10 = `
+CREATE TABLE workflow_completion_evidence (
+  step_execution_id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+  FOREIGN KEY (step_execution_id) REFERENCES workflow_step_executions(step_execution_id) ON DELETE CASCADE
+);
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

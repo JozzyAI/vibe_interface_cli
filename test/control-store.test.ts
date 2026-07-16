@@ -34,7 +34,7 @@ test('create + reopen preserves task and workflow records', async () => {
 test('WAL + foreign_keys + busy_timeout enabled; healthCheck reports schema version', async () => {
   const s = openControlStore({ path: tmpDbPath() })
   const h = await s.healthCheck()
-  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 9)
+  assert.equal(h.journal_mode, 'wal'); assert.equal(h.foreign_keys, true); assert.equal(h.schema_version, 10)
   assert.equal(h.busy_timeout, 5000) // default bounded busy timeout
   const s2 = openControlStore({ path: tmpDbPath(), busyTimeoutMs: 1234 })
   assert.equal((await s2.healthCheck()).busy_timeout, 1234) // configurable
