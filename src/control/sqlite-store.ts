@@ -20,8 +20,9 @@ import {
   type TaskRecord, type CreateTaskInput, type TaskPatch, type TaskEventInput, type TaskEventRecord,
   type WorkflowRecord, type CreateWorkflowInput, type WorkflowPatch, type StepExecutionRecord,
   type CreateStepExecutionInput, type StepExecutionPatch, type WorkflowEventInput, type WorkflowEventRecord,
-  type WorkflowSnapshot, type TaskResultRecord,
+  type WorkflowSnapshot, type TaskResultRecord, type WorkflowWorkspaceLeaseRecord,
 } from './records.js'
+import { isValidRevision } from '../lib/workspace-lease.js'
 import {
   SIZE_LIMITS, nowIso, isIsoUtc, encodeJson, boundString, decodeJson, assertValidContext, assertNoForbiddenFields,
 } from './serialization.js'
@@ -530,6 +531,116 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     })()
   }
 
+  // ── workspace-lease projection + per-step revision evidence (workspace_lease_v1) ──
+  // The Node stays authoritative; these persist a durable projection so the runtime
+  // recovers acquire/revision/release idempotently. Revisions are bounded + revalidated.
+
+  private decodeRevision(json: string | null, label: string): unknown {
+    const v = decodeJson(json, SIZE_LIMITS.metadata_json, label, true)
+    if (v == null) return null
+    if (!isValidRevision(v)) throw new ControlStoreError('invalid_record', `${label} is not a valid workspace revision`)
+    return v
+  }
+  private encodeRevision(rev: unknown, label: string): string | null {
+    if (rev == null) return null
+    if (!isValidRevision(rev)) throw new ControlStoreError('invalid_record', `${label} is not a valid workspace revision`)
+    return encodeJson(rev, SIZE_LIMITS.metadata_json, label)
+  }
+  private leaseRow(id: string): WorkspaceLeaseRow | undefined { return this.db.prepare('SELECT * FROM workflow_workspace_leases WHERE workspace_lease_id = ?').get(id) as WorkspaceLeaseRow | undefined }
+  private toLease(r: WorkspaceLeaseRow): WorkflowWorkspaceLeaseRecord {
+    return { workspace_lease_id: r.workspace_lease_id, workflow_id: r.workflow_id, node_id: r.node_id, workspace_key: r.workspace_key, mode: r.mode, status: r.status, revision: r.revision, base_revision: this.decodeRevision(r.base_revision_json, 'lease.base_revision'), current_revision: this.decodeRevision(r.current_revision_json, 'lease.current_revision'), acquired_at: r.acquired_at, release_requested_at: r.release_requested_at, released_at: r.released_at, created_at: r.created_at, updated_at: r.updated_at }
+  }
+
+  async recordWorkspaceLeaseIntent(input: { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string }): Promise<WorkflowWorkspaceLeaseRecord> {
+    this.open()
+    if (!isSafeId(input.workspace_lease_id)) throw new ControlStoreError('invalid_record', 'workspace_lease_id is not a safe identifier')
+    return this.db.transaction(() => {
+      const existing = this.leaseRow(input.workspace_lease_id)
+      if (existing) return this.toLease(existing) // idempotent on the deterministic id
+      if (!this.workflowRow(input.workflow_id)) throw new ControlStoreError('not_found', `workflow not found: ${input.workflow_id}`)
+      const now = nowIso()
+      this.db.prepare(`INSERT INTO workflow_workspace_leases (workspace_lease_id,workflow_id,node_id,workspace_key,mode,status,revision,created_at,updated_at)
+        VALUES (@id,@wf,@node,@ws,'exclusive','acquiring',1,@now,@now)`)
+        .run({ id: input.workspace_lease_id, wf: input.workflow_id, node: boundString(input.node_id, 256, 'lease.node_id'), ws: boundString(input.workspace_key, 256, 'lease.workspace_key'), now })
+      return this.toLease(this.leaseRow(input.workspace_lease_id)!)
+    })()
+  }
+  async markWorkspaceLeaseActive(leaseId: string, baseRevision: unknown, currentRevision: unknown, acquiredAt: string): Promise<WorkflowWorkspaceLeaseRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new ControlStoreError('not_found', `lease not found: ${leaseId}`)
+      // Re-acquisition after a rollback-release RE-ACTIVATES the same deterministic
+      // lease (mirrors the Node), taking a fresh base; a plain idempotent re-activate
+      // keeps the immutable base. Either way clears any release marks.
+      const reactivating = r.status === 'released' || r.status === 'release_requested'
+      const acq = isIsoUtc(acquiredAt) ? acquiredAt : nowIso()
+      const baseJson = reactivating ? this.encodeRevision(baseRevision, 'lease.base_revision') : (r.base_revision_json ?? this.encodeRevision(baseRevision, 'lease.base_revision'))
+      const curJson = this.encodeRevision(currentRevision ?? baseRevision, 'lease.current_revision')
+      this.db.prepare(`UPDATE workflow_workspace_leases SET status='active', base_revision_json=@base, current_revision_json=@cur, acquired_at=@acq2, release_requested_at=NULL, released_at=NULL, revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
+        .run({ id: leaseId, base: baseJson, cur: curJson, acq2: reactivating ? acq : (r.acquired_at ?? acq), now: nowIso() })
+      return this.toLease(this.leaseRow(leaseId)!)
+    })()
+  }
+  async setWorkspaceLeaseRevision(leaseId: string, currentRevision: unknown): Promise<WorkflowWorkspaceLeaseRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new ControlStoreError('not_found', `lease not found: ${leaseId}`)
+      this.db.prepare(`UPDATE workflow_workspace_leases SET current_revision_json=@cur, revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
+        .run({ id: leaseId, cur: this.encodeRevision(currentRevision, 'lease.current_revision'), now: nowIso() })
+      return this.toLease(this.leaseRow(leaseId)!)
+    })()
+  }
+  async requestWorkspaceLeaseRelease(leaseId: string, ts: string): Promise<WorkflowWorkspaceLeaseRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new ControlStoreError('not_found', `lease not found: ${leaseId}`)
+      if (r.status === 'released') return this.toLease(r) // idempotent
+      this.db.prepare(`UPDATE workflow_workspace_leases SET status='release_requested', release_requested_at=COALESCE(release_requested_at,@ts), revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
+        .run({ id: leaseId, ts: isIsoUtc(ts) ? ts : nowIso(), now: nowIso() })
+      return this.toLease(this.leaseRow(leaseId)!)
+    })()
+  }
+  async markWorkspaceLeaseReleased(leaseId: string, ts: string): Promise<WorkflowWorkspaceLeaseRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new ControlStoreError('not_found', `lease not found: ${leaseId}`)
+      if (r.status === 'released') return this.toLease(r) // idempotent
+      this.db.prepare(`UPDATE workflow_workspace_leases SET status='released', released_at=COALESCE(released_at,@ts), revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
+        .run({ id: leaseId, ts: isIsoUtc(ts) ? ts : nowIso(), now: nowIso() })
+      return this.toLease(this.leaseRow(leaseId)!)
+    })()
+  }
+  async getWorkspaceLeaseProjection(leaseId: string): Promise<WorkflowWorkspaceLeaseRecord | null> {
+    this.open(); const r = this.leaseRow(leaseId); return r ? this.toLease(r) : null
+  }
+  async listWorkspaceLeaseProjections(workflowId: string): Promise<WorkflowWorkspaceLeaseRecord[]> {
+    this.open()
+    return (this.db.prepare('SELECT * FROM workflow_workspace_leases WHERE workflow_id = ? ORDER BY node_id ASC, workspace_key ASC').all(workflowId) as WorkspaceLeaseRow[]).map((r) => this.toLease(r))
+  }
+  async listReleasableWorkspaceLeases(): Promise<WorkflowWorkspaceLeaseRecord[]> {
+    this.open()
+    const q = `SELECT l.* FROM workflow_workspace_leases l JOIN workflows w ON l.workflow_id = w.workflow_id
+      WHERE l.status IN ('acquiring','active','release_requested') AND w.status IN ('completed','failed','cancelled')
+      ORDER BY l.node_id ASC, l.workspace_key ASC`
+    return (this.db.prepare(q).all() as WorkspaceLeaseRow[]).map((r) => this.toLease(r))
+  }
+  async setStepRevisionBefore(stepExecutionId: string, revision: unknown): Promise<void> {
+    this.open()
+    this.db.transaction(() => {
+      if (!this.stepRow(stepExecutionId)) throw new ControlStoreError('not_found', `step execution not found: ${stepExecutionId}`)
+      this.db.prepare('UPDATE workflow_step_executions SET revision_before_json=@rev, updated_at=@now WHERE step_execution_id=@id')
+        .run({ id: stepExecutionId, rev: this.encodeRevision(revision, 'step.revision_before'), now: nowIso() })
+    })()
+  }
+  async setStepRevisionAfter(stepExecutionId: string, revision: unknown): Promise<void> {
+    this.open()
+    this.db.transaction(() => {
+      if (!this.stepRow(stepExecutionId)) throw new ControlStoreError('not_found', `step execution not found: ${stepExecutionId}`)
+      this.db.prepare('UPDATE workflow_step_executions SET revision_after_json=@rev, updated_at=@now WHERE step_execution_id=@id')
+        .run({ id: stepExecutionId, rev: this.encodeRevision(revision, 'step.revision_after'), now: nowIso() })
+    })()
+  }
+
   // ── retention (bounded; never touches active records; no scheduler) ──────────
   async pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult> {
     this.open()
@@ -745,7 +856,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence, input_values: decodeJson(r.input_values_json, SIZE_LIMITS.metadata_json, 'workflow.input_values', true) as Record<string, unknown> | null, cancel_requested: r.cancel_requested === 1 }
   }
   private toStep(r: StepRow): StepExecutionRecord {
-    return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, step_id: r.step_id, round: r.round, attempt: r.attempt, task_id: r.task_id, revision: r.revision, status: r.status, output: decodeJson(r.output_json, SIZE_LIMITS.step_output_json, 'step.output'), error: decodeJson(r.error_json, SIZE_LIMITS.step_error_json, 'step.error'), created_at: r.created_at, started_at: r.started_at, updated_at: r.updated_at, terminal_at: r.terminal_at }
+    return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, step_id: r.step_id, round: r.round, attempt: r.attempt, task_id: r.task_id, revision: r.revision, status: r.status, output: decodeJson(r.output_json, SIZE_LIMITS.step_output_json, 'step.output'), error: decodeJson(r.error_json, SIZE_LIMITS.step_error_json, 'step.error'), created_at: r.created_at, started_at: r.started_at, updated_at: r.updated_at, terminal_at: r.terminal_at, revision_before: this.decodeRevision(r.revision_before_json, 'step.revision_before'), revision_after: this.decodeRevision(r.revision_after_json, 'step.revision_after') }
   }
 }
 
@@ -754,7 +865,8 @@ interface TaskRow { task_id: string; revision: number; node_id: string | null; a
 interface TaskResultRow { task_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
-interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null }
+interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null }
+interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; created_at: string; updated_at: string }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
 
 /** A better-sqlite3 UNIQUE/PRIMARYKEY constraint violation (the idempotency-key

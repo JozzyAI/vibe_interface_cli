@@ -32,6 +32,7 @@ import {
   remoteWorkspaceLeaseAcquire, remoteWorkspaceLeaseGet, remoteWorkspaceLeaseRelease, RemoteLeaseError,
 } from '../src/relay/client.js'
 import { WORKSPACE_LEASE_CAPABILITY } from '../src/node-journal/contract.js'
+import { RelayWorkspaceLeaseClient } from '../src/workflow/workspace-lease-client.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLI = path.resolve(__dirname, '..', 'src', 'index.js')
@@ -147,6 +148,18 @@ test('workspace lease protocol: acquire/get/release + run-start enforcement (enc
     // ── the lease id never reaches the provider: the prompt the backend received is unchanged ──
     const nodePrompt = path.join(os.tmpdir(), `vibe-prompt-${runId}.md`)
     if (fs.existsSync(nodePrompt)) assert.equal(fs.readFileSync(nodePrompt, 'utf8').includes(L1), false, 'lease id absent from the provider prompt file')
+
+    // ── RelayWorkspaceLeaseClient (the WorkflowRuntime's adapter) drives acquire →
+    //    fresh revision observe → release over the REAL relay protocol ──
+    const client = new RelayWorkspaceLeaseClient(relayUrl, RTOKEN)
+    const acq = await client.acquire(NODE_ID, 'wf-runtime', 'proj-runtime')
+    assert.equal(acq.lease.status, 'active')
+    assert.match(acq.lease.workspace_lease_id, /^wl_[0-9a-f]{32}$/)
+    const observed = await client.observeRevision(NODE_ID, 'proj-runtime')
+    assert.ok(observed.revision_kind === 'git' || observed.revision_kind === 'unavailable', 'a bounded revision was observed over the relay')
+    assert.match(observed.state_hash, /^[0-9a-f]{64}$/, 'revision carries a bounded state_hash')
+    const rel3 = await client.release(NODE_ID, acq.lease.workspace_lease_id)
+    assert.equal(rel3.status, 'released')
   } finally {
     await cleanup()
   }

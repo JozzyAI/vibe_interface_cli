@@ -20,6 +20,10 @@ export type WorkflowErrorCode =
   | 'task_failed'              // the Agent Task reported a terminal failure
   | 'task_cancelled_external'  // the Agent Task was cancelled without our intent
   | 'task_result_invalid'      // the AgentTaskResult envelope itself was malformed/corrupted
+  | 'workspace_lease_conflict' // a required workspace is already leased by another workflow
+  | 'workspace_node_ambiguous' // a workspace-bound step's node routing is not explicit
+  | 'workspace_lease_unavailable' // the workspace-lease service was unreachable at start
+  | 'workspace_lease_unsupported' // a workspace-bound workflow has no lease client (fail closed)
   | 'runtime_internal'         // an unexpected runtime error (sanitized)
 
 /** Stable reasons for a non-terminal `blocked` workflow. */
@@ -28,6 +32,7 @@ export type WorkflowBlockReason =
   | 'task_history_incomplete'  // (legacy diagnostic) canonical history not complete
   | 'agent_blocked'            // an agent output declared status blocked
   | 'routed_blocked'           // routing selected the reserved $blocked target
+  | 'workspace_revision_conflict' // an out-of-band workspace change diverged from the lease's expected revision
 
 export class WorkflowRuntimeError extends Error {
   constructor(

@@ -667,6 +667,16 @@ export async function relayNodeDaemon(
               else leaseAck({ ok: false, error: 'internal error', code: 'internal_error' })
             }
           }
+        } else if (msg.type === 'workspace_revision_observe') {
+          // workspace_lease_v1: a FRESH read-only revision observation, resolved +
+          // observed LOCALLY. Only bounded revision evidence leaves the node; no path.
+          const m = msg as import('./types.js').WorkspaceRevisionObserveRequestMsg
+          const revAck = (fields: Record<string, unknown>): void => sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'workspace_revision_ack', req_id: m.req_id, ...fields } as never)
+          try {
+            const wsr = resolveContainedWorkspace(m.workspace_key, config.workspace_root)
+            if (!wsr.ok) revAck({ ok: false, error: 'invalid workspace key', code: 'workspace_revision_unavailable' })
+            else revAck({ ok: true, revision: observeWorkspaceRevision(wsr.path) })
+          } catch { revAck({ ok: false, error: 'internal error', code: 'internal_error' }) }
         } else if (msg.type === 'run_replay_open') {
           // Journaled replay (run_event_replay_v1): serve THIS subscriber replay+live
           // race-free from the node journal. Events for an ENCRYPTED run are
@@ -1819,6 +1829,30 @@ export async function remoteWorkspaceLeaseGet(relay: string, token: string, node
 }
 export async function remoteWorkspaceLeaseRelease(relay: string, token: string, nodeId: string, leaseId: string): Promise<WorkspaceLeaseV1> {
   return unwrapLease(await oneShotLease(relay, token, () => ({ type: 'workspace_lease_release', node_id: nodeId, workspace_lease_id: leaseId })))
+}
+/** workspace_lease_v1: observe a FRESH workspace revision on a node (read-only). Only
+ *  bounded revision evidence crosses the relay; the physical path stays Node-local. */
+export function remoteWorkspaceRevisionObserve(relay: string, token: string, nodeId: string, workspaceKey: string): Promise<import('../lib/workspace-lease.js').WorkspaceRevision> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+    let settled = false
+    const done = (rev?: import('../lib/workspace-lease.js').WorkspaceRevision, err?: Error): void => { if (settled) return; settled = true; clearTimeout(timeout); rev ? resolve(rev) : reject(err!) }
+    const timeout = setTimeout(() => { ws.terminate(); done(undefined, new RemoteLeaseError('timeout waiting for workspace_revision_ack', 'workspace_revision_unavailable')) }, 10_000)
+    ws.on('open', () => sendMsg(ws, { version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(), req_id: reqId, type: 'workspace_revision_observe', node_id: nodeId, workspace_key: workspaceKey } as never))
+    ws.on('message', (raw) => {
+      try {
+        const m = JSON.parse(raw.toString()) as RelayMessage
+        if ((m as { type?: string }).type === 'workspace_revision_ack' && (m as { req_id?: string }).req_id === reqId) {
+          const a = m as import('./types.js').WorkspaceRevisionAckMsg
+          ws.close()
+          if (a.ok && a.revision) done(a.revision); else done(undefined, new RemoteLeaseError(a.error ?? 'revision observation failed', a.code ?? 'workspace_revision_unavailable'))
+        }
+      } catch { /* ignore */ }
+    })
+    ws.on('close', () => done(undefined, new RemoteLeaseError('relay closed before workspace_revision_ack', 'workspace_revision_unavailable')))
+    ws.on('error', (err) => done(undefined, new RemoteLeaseError(err.message, 'workspace_revision_unavailable')))
+  })
 }
 
 /**

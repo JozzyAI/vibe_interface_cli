@@ -595,7 +595,20 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             sendMsg(target.ws, msg)
             break
           }
-          case 'workspace_lease_ack': {
+          case 'workspace_revision_observe': {
+            // workspace_lease_v1: route a fresh revision observation to the target node;
+            // only bounded revision evidence crosses back. The Node observes locally.
+            pendingLeases.set(msg.req_id, ws)
+            const target = registry.get(msg.node_id)
+            if (!target) {
+              sendMsg(ws, { version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(), type: 'workspace_revision_ack', req_id: msg.req_id, ok: false, error: `node offline or unknown: ${msg.node_id}`, code: 'workspace_revision_unavailable' })
+              pendingLeases.delete(msg.req_id); break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+          case 'workspace_lease_ack':
+          case 'workspace_revision_ack': {
             const requester = pendingLeases.get(msg.req_id)
             if (requester) { sendMsg(requester, msg); pendingLeases.delete(msg.req_id) }
             break
