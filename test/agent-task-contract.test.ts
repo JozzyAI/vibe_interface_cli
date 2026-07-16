@@ -173,6 +173,27 @@ test('validateCreateTaskRequest accepts a valid idempotency_key and rejects malf
   }
 })
 
+test('validateCreateTaskRequest accepts a bounded workspace_lease_id and rejects malformed ones (no echo)', () => {
+  const ok = validateCreateTaskRequest({ agent: 'mock', input: { text: 'x' }, workspace_lease_id: 'wl_deadbeefdeadbeefdeadbeefdeadbeef' })
+  assert.ok(ok.ok); if (ok.ok) assert.equal(ok.value.workspace_lease_id, 'wl_deadbeefdeadbeefdeadbeefdeadbeef')
+  for (const id of ['has space', 'a/b', '../etc', 'x'.repeat(129), '', 'ünïcode', 42, '.leading']) {
+    const r = validateCreateTaskRequest({ agent: 'mock', input: { text: 'x' }, workspace_lease_id: id })
+    assert.ok(!r.ok, `should reject ${JSON.stringify(id)}`)
+    if (!r.ok) { assert.equal(r.error.code, 'invalid_request'); if (id !== '') assert.ok(!String(r.error.message).includes(String(id)), 'value not echoed') }
+  }
+})
+
+test('request fingerprint binds workspace_lease_id: same idempotency key + changed lease => conflict', async () => {
+  const { computeRequestFingerprint } = await import('../src/lib/request-fingerprint.js')
+  const base = { agent: 'mock' as const, input: { text: 'go' }, node_id: 'node_x', workspace: { workspace_key: 'proj-alpha' }, idempotency_key: 'k1' }
+  const noLease = computeRequestFingerprint({ ...base })
+  const leaseA = computeRequestFingerprint({ ...base, workspace_lease_id: 'wl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
+  const leaseB = computeRequestFingerprint({ ...base, workspace_lease_id: 'wl_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' })
+  assert.notEqual(noLease, leaseA, 'adding a lease changes the semantic fingerprint')
+  assert.notEqual(leaseA, leaseB, 'changing the lease changes the fingerprint (=> idempotency_conflict)')
+  assert.equal(leaseA, computeRequestFingerprint({ ...base, workspace_lease_id: 'wl_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }), 'same lease => same fingerprint (idempotent retry)')
+})
+
 test('validateCreateTaskRequest rejects each malformed shape with invalid_request', () => {
   const bad: unknown[] = [
     null, 'str', 7,
@@ -282,14 +303,14 @@ test('buildAgentDescriptors: streaming only when known; node_id optional', () =>
 // ── error mapping ────────────────────────────────────────────────────────────
 
 test('apiError applies default retryability + http status per code', () => {
-  const codes: ApiErrorCode[] = ['invalid_request', 'unauthorized', 'agent_unavailable', 'node_offline', 'service_unavailable', 'task_not_found', 'invalid_state_transition', 'cancellation_conflict', 'idempotency_conflict', 'internal_error']
+  const codes: ApiErrorCode[] = ['invalid_request', 'unauthorized', 'agent_unavailable', 'node_offline', 'service_unavailable', 'task_not_found', 'invalid_state_transition', 'cancellation_conflict', 'idempotency_conflict', 'workspace_lease_unsupported', 'internal_error']
   const status: Record<ApiErrorCode, number> = {
     invalid_request: 400, unauthorized: 401, task_not_found: 404, cancellation_conflict: 409,
-    invalid_state_transition: 409, idempotency_conflict: 409, agent_unavailable: 422, node_offline: 503, service_unavailable: 503, internal_error: 500,
+    invalid_state_transition: 409, idempotency_conflict: 409, agent_unavailable: 422, workspace_lease_unsupported: 422, node_offline: 503, service_unavailable: 503, internal_error: 500,
   }
   const retryable: Record<ApiErrorCode, boolean> = {
     invalid_request: false, unauthorized: false, agent_unavailable: false, node_offline: true,
-    service_unavailable: true, task_not_found: false, invalid_state_transition: false, cancellation_conflict: false, idempotency_conflict: false, internal_error: true,
+    service_unavailable: true, task_not_found: false, invalid_state_transition: false, cancellation_conflict: false, idempotency_conflict: false, workspace_lease_unsupported: false, internal_error: true,
   }
   for (const c of codes) {
     const e = apiError(c, 'msg', { ts: 'T' })

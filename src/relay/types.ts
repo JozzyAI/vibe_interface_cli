@@ -58,6 +58,7 @@ export interface RunStartPayload {
   metadata?: Record<string, unknown>
   repo_url?: string
   branch?: string
+  workspace_lease_id?: string // carried INSIDE the encrypted run_start payload (relay never reads it)
 }
 
 // ── MVP 4C: encrypted run_event stream ─────────────────────────────────────
@@ -273,6 +274,7 @@ export interface RunStartMsg extends RelayMsgBase {
   prompt_content?: string  // prompt text (controller reads file, sends content — node writes local temp file)
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
+  workspace_lease_id?: string // workspace_lease_v1: authorize the run against the Node's active workspace lease (never forwarded to the provider)
 }
 
 // ── cli → relay → node daemon (bidirectional stop) ────────────────────────
@@ -320,6 +322,39 @@ export interface RunStatusAckMsg extends RelayMsgBase {
   run_id: string
   ok: boolean
   record?: RunRecord   // authoritative RunRecord from the owning node if ok=true
+  error?: string
+  code?: string
+}
+
+/** workspace_lease_v1: acquire/get/release an exclusive workspace lease on a node.
+ *  Only bounded opaque data crosses the relay; the node resolves the physical path
+ *  and observes the base revision locally. */
+export interface WorkspaceLeaseAcquireRequestMsg extends RelayMsgBase {
+  type: 'workspace_lease_acquire'
+  req_id: string
+  node_id: string
+  workflow_id: string
+  workspace_key: string
+  mode: 'exclusive'
+}
+export interface WorkspaceLeaseGetRequestMsg extends RelayMsgBase {
+  type: 'workspace_lease_get'
+  req_id: string
+  node_id: string
+  workspace_lease_id: string
+}
+export interface WorkspaceLeaseReleaseRequestMsg extends RelayMsgBase {
+  type: 'workspace_lease_release'
+  req_id: string
+  node_id: string
+  workspace_lease_id: string
+}
+export interface WorkspaceLeaseAckMsg extends RelayMsgBase {
+  type: 'workspace_lease_ack'
+  req_id: string
+  ok: boolean
+  created?: boolean
+  lease?: import('../lib/workspace-lease.js').WorkspaceLeaseV1
   error?: string
   code?: string
 }
@@ -476,6 +511,9 @@ export type RelayMessage =
   | RunStopRequestMsg
   | RunStatusRequestMsg
   | RunResultRequestMsg
+  | WorkspaceLeaseAcquireRequestMsg
+  | WorkspaceLeaseGetRequestMsg
+  | WorkspaceLeaseReleaseRequestMsg
   | RunEventMsg
   | RunReplayOpenMsg
   | RunReplayCloseMsg
@@ -489,6 +527,7 @@ export type RelayMessage =
   | RunStopAckMsg
   | RunStatusAckMsg
   | RunResultAckMsg
+  | WorkspaceLeaseAckMsg
   | TerminalOpenMsg
   | TerminalOpenAckMsg
   | TerminalInputMsg

@@ -121,6 +121,7 @@ interface GatewayTask {
 }
 const RUN_EVENT_REPLAY_CAPABILITY = 'run_event_replay_v1'
 const RUN_RESULT_CAPABILITY = 'run_result_v1'
+const WORKSPACE_LEASE_CAPABILITY = 'workspace_lease_v1'
 const REMOTE_RESULT_ATTEMPTS = 3        // bounded run_result_v1 fetch retries before deferring
 
 const REMOTE_RECONCILE_ATTEMPTS = 3   // bounded remoteRunStatus checks on stream give-up
@@ -723,6 +724,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     if (!isRemote && !GATEWAY_LOCAL_AGENTS.includes(reqv.agent)) {
       return sendError(res, apiError('agent_unavailable', `agent "${reqv.agent}" is not available for local execution (only: ${GATEWAY_LOCAL_AGENTS.join(', ')}); target a remote node with node_id for other agents`), 422)
     }
+    // A workspace_lease_id can only be enforced by a lease-capable Node at run start.
+    // A local / in-process backend cannot perform that enforcement, so a lease-carrying
+    // request MUST target an explicit lease-capable node_id — we never simulate lease
+    // safety with a Gateway-only row. Reject up front with a structured unsupported error.
+    if (reqv.workspace_lease_id && !isRemote) {
+      return sendError(res, apiError('workspace_lease_unsupported', 'workspace_lease_id requires an explicit lease-capable remote node_id; local/in-process execution cannot enforce a workspace lease'), 422)
+    }
     // Remote agent validity is enforced by the target node (agent_not_supported).
 
     // ── idempotency pre-check (BEFORE any active-slot reservation) ─────────────
@@ -779,6 +787,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       encryptionPublicKey = node.encryption_public_key
       replayCapable = Array.isArray(node.capabilities) && node.capabilities.includes(RUN_EVENT_REPLAY_CAPABILITY)
       resultCapable = Array.isArray(node.capabilities) && node.capabilities.includes(RUN_RESULT_CAPABILITY)
+      // A lease-carrying request fails closed against a Node that does not advertise
+      // run-start lease enforcement — never send the lease id to a node that would
+      // ignore it (that would silently drop the protection the caller asked for).
+      if (reqv.workspace_lease_id) {
+        const leaseCapable = Array.isArray(node.capabilities) && node.capabilities.includes(WORKSPACE_LEASE_CAPABILITY)
+        if (!leaseCapable) { release(); return sendError(res, apiError('workspace_lease_unsupported', `node ${reqv.node_id} does not advertise workspace lease enforcement (${WORKSPACE_LEASE_CAPABILITY}); a lease-protected task cannot run there`, { details: { node_id: reqv.node_id } }), 422) }
+      }
     }
 
     // Prompt text -> a private temp file (both startRun and remoteRunStart take a
@@ -821,7 +836,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
       let rrec: RunRecord
       try {
-        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, metadata: reqv.metadata, encryptionPublicKey })
+        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id })
       } catch (err) {
         release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
         // Start DEFINITELY failed → record the canonical failure terminally, once.
@@ -858,6 +873,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           permissionMode: reqv.execution?.permission_mode,
           metadata: reqv.metadata,
           encryptionPublicKey, // mandatory — run_start payload is encrypted for the node
+          workspaceLeaseId: reqv.workspace_lease_id, // enforced Node-side; never reaches the provider
         })
       } else {
         // agent === 'mock' and node 'local' are guaranteed here, so startRun cannot

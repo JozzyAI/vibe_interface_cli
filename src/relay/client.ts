@@ -18,8 +18,9 @@ import { resolveAgents, resolveAdvertisedAgents } from '../agent-registry.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import { openNodeJournal } from '../node-journal/sqlite-journal.js'
-import { RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY } from '../node-journal/contract.js'
+import { RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY } from '../node-journal/contract.js'
 import { validateTaskResult, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
+import { WorkspaceLeaseError, observeWorkspaceRevision, type WorkspaceLeaseV1 } from '../lib/workspace-lease.js'
 import { isIsoUtc as journalIsoOk, nowIso as journalNowIso } from '../node-journal/serialization.js'
 import type { NodeJournal } from '../node-journal/store.js'
 
@@ -117,6 +118,26 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     return
   }
   const workspacePath = wsResolved.path
+
+  // ── Workspace lease enforcement (workspace_lease_v1) ─────────────────────────
+  // AFTER containment resolves the (untrusted) key, and BEFORE creating any
+  // directory, writing the run record, writing a prompt file, or starting a
+  // backend: if the workspace is leased, the run must present the exact matching
+  // active lease; a lease-bound request on a node without lease storage is
+  // unsupported. Sanitized codes — the message never echoes the key or a path.
+  const presentedLeaseId = msg.workspace_lease_id ?? null
+  if (presentedLeaseId && !nodeJournal) {
+    sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_start_ack', req_id: msg.req_id, ok: false, error: 'this node cannot enforce workspace leases', code: 'workspace_lease_unsupported' })
+    return
+  }
+  if (nodeJournal) {
+    try { nodeJournal.validateWorkspaceLeaseForRun(nodeId, workspaceKey, presentedLeaseId) }
+    catch (err) {
+      if (err instanceof WorkspaceLeaseError) { sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_start_ack', req_id: msg.req_id, ok: false, error: 'workspace lease check failed', code: err.code }); return }
+      throw err
+    }
+  }
+
   fs.mkdirSync(workspacePath, { recursive: true })
 
   // Write prompt content to a node-local temp file. The controller sends the
@@ -143,10 +164,14 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     ...(msg.metadata && { metadata: msg.metadata }),
     ...(stopAesKey && { stop_aes_key: stopAesKey }),        // MVP 4D: stored for handleRunStop
     ...(approvalAesKey && { approval_aes_key: approvalAesKey }), // MVP 4F: stored for handleEncryptedApprovalResponse
+    ...(presentedLeaseId && { workspace_lease_id: presentedLeaseId }), // Node-local; never forwarded to the provider
     created_at: now,
     updated_at: now,
   }
   writeRun(record)
+  // Bind the run to its lease so the Node can refuse a lease release while this run
+  // is still non-terminal (release protection). Immutable once set.
+  if (nodeJournal && presentedLeaseId) { try { nodeJournal.bindRunToLease(runId, presentedLeaseId) } catch { /* validated above; best effort */ } }
 
   const backendMap: Record<string, import('../backends/types.js').Backend> = {
     'claude-code': claudeCodeBackend,
@@ -228,6 +253,7 @@ async function handleEncryptedRunStart(
     ...(payload.prompt_content !== undefined && { prompt_content: payload.prompt_content }),
     ...(payload.permission_mode && { permission_mode: payload.permission_mode }),
     ...(payload.metadata && { metadata: payload.metadata }),
+    ...(payload.workspace_lease_id && { workspace_lease_id: payload.workspace_lease_id }), // from the ENCRYPTED payload (relay never saw it)
   }
 
   return handleRunStart(ws, nodeId, config, synthetic, eventAesKey, stopAesKey, approvalAesKey)
@@ -432,7 +458,7 @@ export async function relayNodeDaemon(
     transport: 'relay',
     // Advertise journaled replay only when the journal actually opened, so a
     // client can detect replay support (absence ⇒ live-only, older behavior).
-    capabilities: nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY] : ['run', 'stream', 'stop', 'workspace'],
+    capabilities: nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY] : ['run', 'stream', 'stop', 'workspace'],
     agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
@@ -614,6 +640,32 @@ export async function relayNodeDaemon(
             else sendMsg(ws, base) // missing/invalid → status only, no content
           } catch (err) {
             sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_result_ack', req_id: reqId, run_id: runId, ok: false, error: (err as Error).message, code: 'internal_error' })
+          }
+        } else if (msg.type === 'workspace_lease_acquire' || msg.type === 'workspace_lease_get' || msg.type === 'workspace_lease_release') {
+          // workspace_lease_v1: the Node is the authority. Physical paths + revision
+          // observation stay Node-local; only bounded opaque lease data is returned.
+          const reqId = (msg as { req_id: string }).req_id
+          const leaseAck = (fields: Record<string, unknown>): void => sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'workspace_lease_ack', req_id: reqId, ...fields } as never)
+          if (!nodeJournal) { leaseAck({ ok: false, error: 'node cannot enforce workspace leases', code: 'workspace_lease_unavailable' }); }
+          else {
+            try {
+              if (msg.type === 'workspace_lease_acquire') {
+                const m = msg as import('./types.js').WorkspaceLeaseAcquireRequestMsg
+                // Contain the (untrusted) key + observe the base revision LOCALLY.
+                const wsr = resolveContainedWorkspace(m.workspace_key, config.workspace_root)
+                if (!wsr.ok) { leaseAck({ ok: false, error: 'invalid workspace key', code: 'workspace_lease_invalid' }) }
+                else { const base = observeWorkspaceRevision(wsr.path); const r = nodeJournal.acquireWorkspaceLease(m.workflow_id, nodeId, m.workspace_key, base); leaseAck({ ok: true, created: r.created, lease: r.lease }) }
+              } else if (msg.type === 'workspace_lease_get') {
+                const lease = nodeJournal.getWorkspaceLease((msg as { workspace_lease_id: string }).workspace_lease_id)
+                if (!lease) leaseAck({ ok: false, error: 'no such lease', code: 'workspace_lease_invalid' }); else leaseAck({ ok: true, lease })
+              } else {
+                const r = nodeJournal.releaseWorkspaceLease((msg as { workspace_lease_id: string }).workspace_lease_id)
+                leaseAck({ ok: true, lease: r.lease })
+              }
+            } catch (err) {
+              if (err instanceof WorkspaceLeaseError) leaseAck({ ok: false, error: 'workspace lease operation failed', code: err.code })
+              else leaseAck({ ok: false, error: 'internal error', code: 'internal_error' })
+            }
           }
         } else if (msg.type === 'run_replay_open') {
           // Journaled replay (run_event_replay_v1): serve THIS subscriber replay+live
@@ -1016,6 +1068,9 @@ export interface RemoteRunStartOpts {
   promptFile?: string     // controller-local path; content is read here and sent as prompt_content
   permissionMode?: PermissionMode
   metadata?: Record<string, unknown>
+  /** workspace_lease_v1: authorize the run against the node's active workspace lease.
+   *  Carried INSIDE the encrypted payload; never forwarded to the provider/prompt. */
+  workspaceLeaseId?: string
   /** When set, encrypt the run_start payload for the target node. */
   encryptionPublicKey?: string  // target node's X25519 encryption_public_key (base64)
 }
@@ -1065,6 +1120,7 @@ export async function remoteRunStart(
           ...(promptContent !== undefined && { prompt_content: promptContent }),
           ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
           ...(opts.metadata && { metadata: opts.metadata }),
+          ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
         }
         const enc = encryptPayload(opts.encryptionPublicKey, payload)
         capturedEphemeralPrivKey = enc.ephemeralPrivateKey
@@ -1095,6 +1151,7 @@ export async function remoteRunStart(
           ...(promptContent !== undefined && { prompt_content: promptContent }),
           ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
           ...(opts.metadata && { metadata: opts.metadata }),
+          ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
         })
       }
     })
@@ -1724,6 +1781,44 @@ export async function remoteRunResult(relay: string, token: string, runId: strin
     ws.on('close', () => done(undefined, new Error('Relay connection closed before run_result_ack')))
     ws.on('error', (err) => done(undefined, err))
   })
+}
+
+/** workspace_lease_v1: one-shot lease op against a specific node. Resolves with the
+ *  ack; a structured `workspace_lease_*` failure rejects with an Error whose `.code`
+ *  is the sanitized lease code. Only bounded opaque data crosses the relay. */
+export class RemoteLeaseError extends Error { constructor(message: string, public readonly code: string) { super(message); this.name = 'RemoteLeaseError' } }
+function oneShotLease(relay: string, token: string, request: (reqId: string) => Record<string, unknown>): Promise<import('./types.js').WorkspaceLeaseAckMsg> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+    let settled = false
+    const done = (ack?: import('./types.js').WorkspaceLeaseAckMsg, err?: Error): void => { if (settled) return; settled = true; clearTimeout(timeout); ack ? resolve(ack) : reject(err!) }
+    const timeout = setTimeout(() => { ws.terminate(); done(undefined, new RemoteLeaseError('timeout waiting for workspace_lease_ack', 'workspace_lease_unavailable')) }, 10_000)
+    ws.on('open', () => sendMsg(ws, { version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(), req_id: reqId, ...request(reqId) } as never))
+    ws.on('message', (raw) => {
+      try {
+        const m = JSON.parse(raw.toString()) as RelayMessage
+        if ((m as { type?: string }).type === 'workspace_lease_ack' && (m as { req_id?: string }).req_id === reqId) { ws.close(); done(m as import('./types.js').WorkspaceLeaseAckMsg) }
+        else if ((m as { type?: string }).type === 'relay_error') { const e = m as import('./types.js').RelayErrorMsg; ws.terminate(); reject(new RemoteLeaseError(e.message, e.code)) }
+      } catch { /* ignore */ }
+    })
+    ws.on('close', () => done(undefined, new RemoteLeaseError('relay closed before workspace_lease_ack', 'workspace_lease_unavailable')))
+    ws.on('error', (err) => done(undefined, new RemoteLeaseError(err.message, 'workspace_lease_unavailable')))
+  })
+}
+function unwrapLease(ack: import('./types.js').WorkspaceLeaseAckMsg): WorkspaceLeaseV1 {
+  if (!ack.ok || !ack.lease) throw new RemoteLeaseError(ack.error ?? 'workspace lease operation failed', ack.code ?? 'workspace_lease_invalid')
+  return ack.lease
+}
+export async function remoteWorkspaceLeaseAcquire(relay: string, token: string, nodeId: string, workflowId: string, workspaceKey: string): Promise<{ lease: WorkspaceLeaseV1; created: boolean }> {
+  const ack = await oneShotLease(relay, token, () => ({ type: 'workspace_lease_acquire', node_id: nodeId, workflow_id: workflowId, workspace_key: workspaceKey, mode: 'exclusive' }))
+  return { lease: unwrapLease(ack), created: ack.created === true }
+}
+export async function remoteWorkspaceLeaseGet(relay: string, token: string, nodeId: string, leaseId: string): Promise<WorkspaceLeaseV1> {
+  return unwrapLease(await oneShotLease(relay, token, () => ({ type: 'workspace_lease_get', node_id: nodeId, workspace_lease_id: leaseId })))
+}
+export async function remoteWorkspaceLeaseRelease(relay: string, token: string, nodeId: string, leaseId: string): Promise<WorkspaceLeaseV1> {
+  return unwrapLease(await oneShotLease(relay, token, () => ({ type: 'workspace_lease_release', node_id: nodeId, workspace_lease_id: leaseId })))
 }
 
 /**
