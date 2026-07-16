@@ -120,14 +120,22 @@ export class WorkflowRuntime {
     if (wf.status === 'blocked') return wf                             // do not silently resume
     if (wf.status === 'running') { this.ensurePump(workflowId); return wf } // coalesce
     if (wf.status !== 'ready') throw new WorkflowRuntimeError('invalid_transition', `cannot start from status ${wf.status}`)
+    const spec = this.loadSpec(wf)
+    if (!spec) throw new WorkflowRuntimeError('runtime_internal', 'invalid persisted spec')
+    const inputs = (wf.input_values ?? {}) as Record<string, unknown>
+    // A workspace-bound workflow REQUIRES a lease client so its Node workspaces are
+    // exclusively leased + Node-enforced. Without one, FAIL CLOSED: stay `ready`,
+    // start no task, never run unprotected. (A resolution failure — e.g. an
+    // unroutable bound step — still means the workflow IS workspace-bound.)
+    const resolved = resolveWorkspaceTargets(workflowId, spec, inputs)
+    const workspaceBound = !resolved.ok || resolved.targets.length > 0
+    if (workspaceBound && !this.leaseClient) {
+      throw new WorkflowRuntimeError('workspace_lease_unsupported', 'workspace-bound workflow requires a workspace lease client (Node-enforced leases); refusing to run unleased')
+    }
     // Acquire ALL required workspace leases BEFORE the durable ready→running
     // transition. On conflict the workflow stays `ready`, any partially-acquired
     // leases are released, and no task starts — an explicit later start retries.
-    if (this.leaseClient) {
-      const spec = this.loadSpec(wf)
-      if (!spec) throw new WorkflowRuntimeError('runtime_internal', 'invalid persisted spec')
-      await this.acquireWorkflowLeases(workflowId, spec, (wf.input_values ?? {}) as Record<string, unknown>)
-    }
+    if (this.leaseClient) await this.acquireWorkflowLeases(workflowId, spec, inputs)
     const r = await this.store.startWorkflowDurably(workflowId, { event_type: 'workflow.started', ts: new Date().toISOString(), payload: {}, contract_version: CV } as WorkflowEventDraft)
     this.ensurePump(workflowId)
     return r.workflow

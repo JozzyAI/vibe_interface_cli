@@ -23,6 +23,7 @@ export type WorkflowErrorCode =
   | 'workspace_lease_conflict' // a required workspace is already leased by another workflow
   | 'workspace_node_ambiguous' // a workspace-bound step's node routing is not explicit
   | 'workspace_lease_unavailable' // the workspace-lease service was unreachable at start
+  | 'workspace_lease_unsupported' // a workspace-bound workflow has no lease client (fail closed)
   | 'runtime_internal'         // an unexpected runtime error (sanitized)
 
 /** Stable reasons for a non-terminal `blocked` workflow. */

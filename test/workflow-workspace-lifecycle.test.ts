@@ -256,12 +256,32 @@ test('recovery completes a pending release left by a crash after terminalization
   } finally { store.closeSync() }
 })
 
-test('a runtime WITHOUT a lease client ignores workspace leases entirely (backward compatible)', async () => {
+test('a workflow with NO workspace-bound steps runs unchanged without a lease client (backward compatible)', async () => {
   await withStore(async (store) => {
     const rt = new WorkflowRuntime({ store, taskClient: new ScriptedFake(store, acceptanceScript), waitWindowMs: 20 })
-    const { workflow_id } = await rt.createWorkflow(plannerExecutorLoopExample(), { objective: 'x', workspace_key: WS })
+    // No `workspace_key` input → the implement step's optional workspace key is absent →
+    // the workflow is NOT workspace-bound, so no lease client is required.
+    const { workflow_id } = await rt.createWorkflow(plannerExecutorLoopExample(), { objective: 'x' })
     await rt.startWorkflow(workflow_id); await rt.awaitWorkflow(workflow_id)
     assert.equal((await store.getWorkflow(workflow_id))!.status, 'completed')
     assert.equal((await store.listWorkspaceLeaseProjections(workflow_id)).length, 0, 'no lease projection without a lease client')
+  })
+})
+
+test('a workspace-bound workflow FAILS CLOSED without a lease client: workspace_lease_unsupported, stays ready, no task', async () => {
+  await withStore(async (store) => {
+    const fake = new ScriptedFake(store, acceptanceScript)
+    // A workspace_key input makes the implement step workspace-bound; NO lease client.
+    const rt = new WorkflowRuntime({ store, taskClient: fake, waitWindowMs: 20 })
+    const { workflow_id } = await rt.createWorkflow(plannerExecutorLoopExample(), { objective: 'x', workspace_key: WS })
+    await assert.rejects(() => rt.startWorkflow(workflow_id), (e: any) => e.code === 'workspace_lease_unsupported', 'refused to start unleased')
+    const wf = (await store.getWorkflow(workflow_id))!
+    assert.equal(wf.status, 'ready', 'workflow stays ready (no ready→running transition)')
+    assert.equal(wf.total_tasks, 0)
+    assert.equal(fake.creates.length, 0, 'no Agent Task was created')
+    assert.equal((await store.listStepExecutions(workflow_id)).length, 0, 'no step execution started')
+    // No terminal/started event was emitted.
+    const evs = (await store.listWorkflowEvents(workflow_id)).map((e) => e.event_type)
+    assert.ok(!evs.includes('workflow.started'), 'no workflow.started event')
   })
 })
