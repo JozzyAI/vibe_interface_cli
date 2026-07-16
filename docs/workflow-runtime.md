@@ -179,12 +179,14 @@ ControlStore schema v5) so they survive restart. They are validated against
 `WorkflowSpec.inputs` before creation (required/defaults/types/unknown-name checks)
 and must not contain credential/token/key field names.
 
-## Current absence of REST / MCP / UI / compiler
+## REST / MCP exposure
 
-There is no workflow REST endpoint, MCP tool, UI/map, or natural-language compiler
-in this version. The runtime is an internal service consumed in-process. Workflow
-events are persisted (and sequenced contiguously) for a future API/UI, but no
-external workflow event streaming is provided here.
+The runtime is exposed through the existing `vibe api serve` REST server
+(`/v1/workflows`) and the `vibe mcp serve` adapter (seven workflow tools) —
+lifecycle entry points only (list/create/start/get/events/cancel), with runtime
+semantics unchanged. See [`docs/workflow-api.md`](./workflow-api.md) and
+[`docs/mcp-server.md`](./mcp-server.md). There is still **no** natural-language
+compiler, **no** Workflow Map UI, **no** blocked-workflow resume, and **no** A2A.
 
 ## Example lifecycle
 

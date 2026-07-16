@@ -147,15 +147,43 @@ export function registerApiCommand(program: Command): void {
         fail(code, `could not open the durable control store at ${dbPath}: ${(err as Error).message}`)
       }
 
+      // The WorkflowRuntime's task client targets THIS gateway over loopback, so it
+      // is built AFTER listen and injected via a lazy accessor (undefined until then).
+      let workflowRuntime: import('../workflow/runtime.js').WorkflowRuntime | undefined
       let server
       try {
-        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store })
+        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store, controlStore: store, getWorkflowRuntime: () => workflowRuntime })
       } catch (err) {
         try { store.closeSync() } catch { /* ignore */ }
         fail('serve_failed', `could not start the gateway: ${(err as Error).message}`)
       }
 
       const base = `http://${host}:${server.port}`
+
+      // Wire the durable Workflow Runtime to the SAME control store, driving Agent
+      // Tasks through the colocated Gateway task API over loopback with the existing
+      // API bearer token (never printed; no second listener; no relay token). Recover
+      // running workflows in the background — recovery schedules bounded pumps and
+      // returns immediately (it never blocks startup on an unavailable node).
+      try {
+        const { GatewayClient } = await import('../mcp/gateway-client.js')
+        const { GatewayAgentTaskClient } = await import('../workflow/task-client.js')
+        const { WorkflowRuntime } = await import('../workflow/runtime.js')
+        const taskClient = new GatewayAgentTaskClient(new GatewayClient(base, tf.token))
+        // A workspace-bound workflow needs the Node workspace-lease authority, reached
+        // over the relay. Only construct the lease client when a relay + token are
+        // configured; without it, a workspace-bound workflow FAILS CLOSED at start
+        // (workspace_lease_unsupported) rather than running unleased.
+        let leaseClient: import('../workflow/workspace-lease-client.js').WorkspaceLeaseClient | undefined
+        if (relayUrl && relayToken) {
+          const { RelayWorkspaceLeaseClient } = await import('../workflow/workspace-lease-client.js')
+          leaseClient = new RelayWorkspaceLeaseClient(relayUrl, relayToken)
+        }
+        workflowRuntime = new WorkflowRuntime({ store, taskClient, leaseClient })
+        await workflowRuntime.recoverWorkflows()
+      } catch (err) {
+        if (!opts.quiet) process.stderr.write(`warning: workflow runtime init/recovery hit an error (workflow routes remain available): ${(err as Error).message}\n`)
+      }
       if (!opts.quiet) {
         if (!isLoopbackHost(host)) {
           process.stderr.write(`warning: the Agent Task API is WRITE-CAPABLE and now bound to ${host} (LAN/VPN). The bearer token is the only gate — keep it secret; do NOT expose this port to the public internet.\n`)
@@ -164,6 +192,7 @@ export function registerApiCommand(program: Command): void {
         process.stdout.write(`  auth: send  Authorization: Bearer <token>  on every request\n`)
         process.stdout.write(`  API token file: ${tf.path} (mode 0600, ${tf.created ? 'created' : 'reused'}) — keep it secret; the token itself is never printed\n`)
         process.stdout.write(`  durable store: ${dbPath} (tasks + event history persisted; non-terminal tasks recovered on restart)\n`)
+        process.stdout.write(`  workflows: durable Workflow Runtime enabled — POST /v1/workflows to create, /start to run (running workflows recovered on restart)\n`)
         if (relayUrl) {
           process.stdout.write(`  remote execution: ENABLED via relay ${relayUrl} — target a node with node_id (agents: GET /v1/agents)\n`)
         } else {
@@ -172,7 +201,18 @@ export function registerApiCommand(program: Command): void {
         process.stdout.write(`  Ctrl-C to stop.\n`)
       }
 
-      const shutdown = (): void => { void server.close().then(() => { try { store.closeSync() } catch { /* ignore */ } process.exit(0) }) }
+      // Ordered shutdown: (1)+(2)+(3) abort workflow waits/pumps/backoff and shut
+      // down the runtime FIRST (its task client calls the gateway over loopback, so
+      // the gateway must still be up); then (4) close the Gateway (task pumps + SSE);
+      // then (5) close the ControlStore cleanly.
+      const shutdown = (): void => {
+        void (async () => {
+          try { await workflowRuntime?.shutdown() } catch { /* ignore */ }
+          try { await server.close() } catch { /* ignore */ }
+          try { store.closeSync() } catch { /* ignore */ }
+          process.exit(0)
+        })()
+      }
       process.on('SIGINT', shutdown)
       process.on('SIGTERM', shutdown)
     })

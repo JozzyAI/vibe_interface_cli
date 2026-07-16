@@ -13,6 +13,7 @@
  * diagnostics go to stderr and never contain the token.
  */
 import { GatewayApiError, type GatewayClient } from './gateway-client.js'
+import { createWorkflowTools } from './workflow-tools.js'
 
 /** Overall wait budget bounds for the higher-level workflow tools (in seconds).
  *  Wider than a single SSE poll (still capped at 30s inside gateway-client): the
@@ -247,7 +248,8 @@ export interface McpServer {
 }
 
 export function createMcpServer(client: GatewayClient, serverVersion: string): McpServer {
-  const tools = createGatewayTools(client)
+  // Seven task tools + seven workflow tools. Existing task tools are unchanged.
+  const tools = [...createGatewayTools(client), ...createWorkflowTools(client)]
   const byName = new Map(tools.map((t) => [t.name, t]))
   const rpcError = (id: JsonRpcMessage['id'], code: number, message: string) => ({ jsonrpc: '2.0', id: id ?? null, error: { code, message } })
   const rpcResult = (id: JsonRpcMessage['id'], result: unknown) => ({ jsonrpc: '2.0', id: id ?? null, result })

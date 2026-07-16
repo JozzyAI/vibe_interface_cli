@@ -69,6 +69,31 @@ real spawned server end-to-end).
 | `vibe_get_task` | `GET /v1/tasks/:id` | authoritative canonical Task |
 | `vibe_get_task_events` | `GET /v1/tasks/:id/events` (SSE) | **bounded** single request/response — see below |
 | `vibe_cancel_task` | `POST /v1/tasks/:id/cancel` | **destructive** (annotated); idempotent (the gateway owns idempotency) |
+| `vibe_list_workflows` | `GET /v1/workflows` | durable workflow summaries; optional `status`, bounded `limit`/`offset` |
+| `vibe_create_workflow` | `POST /v1/workflows` | validate + create a **`ready`** workflow; **does NOT start it** (inputs `spec`, `input_values`) |
+| `vibe_start_workflow` | `POST /v1/workflows/:id/start` | explicit start (idempotent); returns the snapshot without waiting |
+| `vibe_get_workflow` | `GET /v1/workflows/:id` | durable WorkflowSnapshot |
+| `vibe_get_workflow_events` | `GET /v1/workflows/:id/events` (SSE) | **bounded** poll; workflow event cursor (distinct from task ids) |
+| `vibe_wait_workflow` | `GET /v1/workflows/:id/events` resume loop | **resumable bounded wait**: return on terminal, blocked, or timeout (`terminal`/`blocked`/`ended_by`) |
+| `vibe_cancel_workflow` | `POST /v1/workflows/:id/cancel` | **destructive** (annotated); idempotent + durable |
+
+### Workflow tools (durable Workflow Runtime)
+
+Seven workflow tools sit alongside the seven task tools (fourteen total). They are
+pure HTTP clients of the `/v1/workflows` routes — see
+[`docs/workflow-api.md`](workflow-api.md) for full semantics. Key points:
+
+- **create ≠ start**: `vibe_create_workflow` only validates + persists a `ready`
+  workflow (no Agent Task runs); you must call `vibe_start_workflow` explicitly.
+- **`vibe_wait_workflow`** returns when the workflow is terminal
+  (`completed`/`failed`/`cancelled`), **blocked** (non-terminal, `terminal:false
+  blocked:true`), or the wait budget expires (`ended_by:"timeout"`, still running —
+  resume with `next_event_id`). A timeout or MCP disconnect **never** cancels.
+- **`blocked` is non-terminal** and not auto-resumed; cancellation is explicit
+  (`vibe_cancel_workflow` only).
+- Recommended flow: `vibe_create_workflow` → inspect → `vibe_start_workflow` →
+  `vibe_wait_workflow` → `vibe_get_workflow`/`vibe_get_workflow_events` →
+  `vibe_cancel_workflow` (only explicitly).
 
 ### Bounded event polling (`vibe_get_task_events`)
 
