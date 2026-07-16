@@ -36,6 +36,7 @@ export type TemplateRef =
   | { kind: 'step_output'; step: string; field: string; raw: string }
   | { kind: 'workflow'; key: 'round'; raw: string }
   | { kind: 'context'; group: ContextGroup; field: string; raw: string }
+  | { kind: 'pause'; raw: string }   // pause.response — THIS step's answered input pause
 
 export interface TemplateParse {
   refs: TemplateRef[]
@@ -47,7 +48,8 @@ const TPL_INPUT_RE = /^inputs\.([A-Za-z_][A-Za-z0-9_]*)$/
 const TPL_STEP_RE = /^steps\.([a-z0-9][a-z0-9_-]*)\.output\.([A-Za-z_][A-Za-z0-9_]*)$/
 const TPL_WORKFLOW_RE = /^workflow\.round$/
 const TPL_CONTEXT_RE = /^context\.(latest_planner_decision|latest_executor_handoff)\.([A-Za-z_][A-Za-z0-9_]*)$/
-const KNOWN_TEMPLATE_NAMESPACES = ['inputs', 'steps', 'workflow', 'context']
+const TPL_PAUSE_RE = /^pause\.response$/
+const KNOWN_TEMPLATE_NAMESPACES = ['inputs', 'steps', 'workflow', 'context', 'pause']
 
 /**
  * Parse `{{ … }}` references from text. Recognizes ONLY `inputs.<name>`,
@@ -74,6 +76,7 @@ export function parseTemplateReferences(text: string): TemplateParse {
     if ((mm = TPL_STEP_RE.exec(inner))) { refs.push({ kind: 'step_output', step: mm[1], field: mm[2], raw }); continue }
     if (TPL_WORKFLOW_RE.test(inner)) { refs.push({ kind: 'workflow', key: 'round', raw }); continue }
     if ((mm = TPL_CONTEXT_RE.exec(inner))) { refs.push({ kind: 'context', group: mm[1] as ContextGroup, field: mm[2], raw }); continue }
+    if (TPL_PAUSE_RE.test(inner)) { refs.push({ kind: 'pause', raw }); continue }
     const ns = inner.split('.')[0]
     errors.push(KNOWN_TEMPLATE_NAMESPACES.includes(ns) ? 'template_bad_reference' : 'template_unsupported_namespace')
   }
@@ -244,6 +247,23 @@ function checkContextBindingCompat(group: ContextGroup, schemaName: string | und
   }
 }
 
+const MAX_PAUSE_PROMPT = 2000
+const MAX_PAUSE_CHOICES = 50
+const MAX_PAUSE_CHOICE_LEN = 200
+
+/** Validate a step's optional `pause_before` human-pause gate (bounded). */
+function validatePauseGate(gate: unknown, p: string, err: Err): void {
+  if (!isObj(gate)) { err('bad_pause_before', 'pause_before must be an object', p); return }
+  if (gate.kind !== 'input' && gate.kind !== 'approval') err('bad_pause_kind', 'pause_before.kind must be "input" or "approval"', `${p}/kind`)
+  if (!isStr(gate.prompt) || gate.prompt.length === 0 || gate.prompt.length > MAX_PAUSE_PROMPT) err('bad_pause_prompt', `pause_before.prompt must be a non-empty string ≤ ${MAX_PAUSE_PROMPT} chars`, `${p}/prompt`)
+  if (gate.choices !== undefined) {
+    if (!Array.isArray(gate.choices) || gate.choices.length > MAX_PAUSE_CHOICES || !gate.choices.every((c) => isStr(c) && (c as string).length > 0 && (c as string).length <= MAX_PAUSE_CHOICE_LEN)) {
+      err('bad_pause_choices', `pause_before.choices must be an array of ≤ ${MAX_PAUSE_CHOICES} non-empty strings (≤ ${MAX_PAUSE_CHOICE_LEN} chars each)`, `${p}/choices`)
+    }
+  }
+  for (const k of Object.keys(gate)) if (!['kind', 'prompt', 'choices'].includes(k)) err('pause_unknown_field', `unknown pause_before field: ${k}`, `${p}/${k}`)
+}
+
 function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set<string>, schemaFieldDefs: Map<string, Map<string, FieldDef>>, err: Err): { stepIds: Set<string>; stepOutputSchema: Map<string, string> } {
   const stepIds = new Set<string>()
   const stepOutputSchema = new Map<string, string>()
@@ -267,7 +287,8 @@ function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set
     }
     if (step.label !== undefined && !isStr(step.label)) err('bad_field_type', 'step.label must be a string', `${p}/label`)
     if (step.description !== undefined && !isStr(step.description)) err('bad_field_type', 'step.description must be a string', `${p}/description`)
-    for (const k of Object.keys(step)) if (!['id', 'type', 'agent_role', 'prompt_template', 'output_schema', 'permission_mode', 'workspace_key_template', 'context_binding', 'label', 'description'].includes(k)) err('step_unknown_field', `unknown step field: ${k}`, `${p}/${k}`)
+    if (step.pause_before !== undefined) validatePauseGate(step.pause_before, `${p}/pause_before`, err)
+    for (const k of Object.keys(step)) if (!['id', 'type', 'agent_role', 'prompt_template', 'output_schema', 'permission_mode', 'workspace_key_template', 'context_binding', 'pause_before', 'label', 'description'].includes(k)) err('step_unknown_field', `unknown step field: ${k}`, `${p}/${k}`)
   })
   return { stepIds, stepOutputSchema }
 }
@@ -427,21 +448,25 @@ function validateTemplates(
     if (!isObj(step)) return
     const p = `/steps/${i}`
     const stepId = isStr(step.id) ? step.id : undefined
+    const hasInputPause = isObj(step.pause_before) && (step.pause_before as Record<string, unknown>).kind === 'input'
     if (isStr(step.prompt_template)) {
       const parsed = parseTemplateReferences(step.prompt_template)
       for (const code of parsed.errors) err(code, `invalid template reference (${code})`, `${p}/prompt_template`)
-      for (const ref of parsed.refs) checkPromptRef(ref, `${p}/prompt_template`, stepId, inputTypes, stepIds, stepOutputSchema, schemaFields, reachable, doms, err)
+      for (const ref of parsed.refs) checkPromptRef(ref, `${p}/prompt_template`, stepId, hasInputPause, inputTypes, stepIds, stepOutputSchema, schemaFields, reachable, doms, err)
     }
     if (isStr(step.workspace_key_template)) validateWorkspaceKey(step.workspace_key_template, `${p}/workspace_key_template`, inputTypes, err)
   })
 }
 
 function checkPromptRef(
-  ref: TemplateRef, path: string, currentStep: string | undefined, inputTypes: Map<string, WorkflowInputType>,
+  ref: TemplateRef, path: string, currentStep: string | undefined, hasInputPause: boolean, inputTypes: Map<string, WorkflowInputType>,
   stepIds: Set<string>, stepOutputSchema: Map<string, string>, schemaFields: Map<string, Set<string>>,
   reachable: Set<string>, doms: Map<string, Set<string>>, err: Err,
 ): void {
-  if (ref.kind === 'input') {
+  if (ref.kind === 'pause') {
+    // pause.response is valid ONLY on a step whose pause_before is an input gate.
+    if (!hasInputPause) err('template_pause_without_input_gate', 'pause.response requires this step to declare pause_before.kind = "input"', path)
+  } else if (ref.kind === 'input') {
     if (!inputTypes.has(ref.name)) err('template_unknown_input', `template references unknown input: ${ref.name}`, path)
   } else if (ref.kind === 'context') {
     const fields = CONTEXT_FIELDS[ref.group]

@@ -10,7 +10,7 @@ import type {
   TaskRecord, CreateTaskInput, TaskPatch, TaskEventInput, TaskEventRecord,
   WorkflowRecord, CreateWorkflowInput, WorkflowPatch, StepExecutionRecord,
   CreateStepExecutionInput, StepExecutionPatch, WorkflowEventInput, WorkflowEventRecord,
-  WorkflowSnapshot, WorkflowWorkspaceLeaseRecord,
+  WorkflowSnapshot, WorkflowWorkspaceLeaseRecord, WorkflowHumanRequestRecord, CreateHumanRequestInput,
 } from './records.js'
 
 /** A workflow event without a `sequence` — the store assigns the next contiguous
@@ -188,6 +188,29 @@ export interface ControlStore {
   /** Persist the revision observed BEFORE / AFTER a step's task. Idempotent. */
   setStepRevisionBefore(stepExecutionId: string, revision: unknown): Promise<void>
   setStepRevisionAfter(stepExecutionId: string, revision: unknown): Promise<void>
+
+  // ── human pause / approval gates (workflow_human_requests) ───────────────────
+  // Durable input/approval pauses. No Agent Task runs while a workflow waits; the
+  // request survives restart; a response is idempotent and a conflicting second
+  // response fails closed. Transitions are atomic with the workflow status change.
+  /** Atomically create the pause request (idempotent on request_id) AND transition
+   *  the workflow running → `waiting_input`/`waiting_approval` with a pause event. */
+  createHumanRequestAndPause(input: CreateHumanRequestInput, waitingStatus: string, pausedEvent: WorkflowEventDraft): Promise<WorkflowHumanRequestRecord>
+  getHumanRequest(requestId: string): Promise<WorkflowHumanRequestRecord | null>
+  /** The request currently AWAITING a human (status `pending`) for this workflow. */
+  getPendingHumanRequest(workflowId: string): Promise<WorkflowHumanRequestRecord | null>
+  /** The active request for this workflow (pending/answered/approved) — for resume. */
+  getActiveHumanRequest(workflowId: string): Promise<WorkflowHumanRequestRecord | null>
+  /** Record an input answer. Idempotent (same value); a DIFFERENT value fails closed. */
+  answerHumanRequestInput(requestId: string, value: string): Promise<WorkflowHumanRequestRecord>
+  /** Record an approval. Idempotent; a conflicting later decision fails closed. */
+  approveHumanRequest(requestId: string): Promise<WorkflowHumanRequestRecord>
+  /** Atomically record a rejection AND terminalize the workflow `failed`. Idempotent;
+   *  a prior approval fails closed. Documents the approval-rejection → failed policy. */
+  rejectHumanRequestAndFailWorkflow(requestId: string, workflowFailedEvent: WorkflowEventDraft): Promise<{ request: WorkflowHumanRequestRecord; workflow: WorkflowRecord }>
+  /** Transition `waiting_input`/`waiting_approval` → running with a resume event.
+   *  Idempotent (already running → no-op). */
+  resumeWorkflowRunning(workflowId: string, resumedEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; resumed: boolean }>
 
   // retention primitives (bounded; never touch active records; no scheduler)
   pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult>

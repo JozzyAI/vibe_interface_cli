@@ -15,11 +15,11 @@
  */
 import crypto from 'crypto'
 import type { ControlStore, WorkflowEventDraft } from '../control/store.js'
-import type { WorkflowRecord, StepExecutionRecord, CreateStepExecutionInput } from '../control/records.js'
+import type { WorkflowRecord, StepExecutionRecord, CreateStepExecutionInput, WorkflowHumanRequestRecord } from '../control/records.js'
 import {
   isTerminalWorkflowStatus as isWfTerminalEnum, isTerminalStepStatus as isStepTerminalEnum, canTakeLoopEdge, terminalTargetToStatus,
   WORKFLOW_EVENT_CONTRACT_VERSION,
-  type WorkflowSpec, type ContextGroup, type WorkflowContextBundle, type OutputSchema,
+  type WorkflowSpec, type ContextGroup, type WorkflowContextBundle, type OutputSchema, type StepPauseGate,
   type WorkflowStatus, type StepStatus,
 } from './contract.js'
 
@@ -31,7 +31,7 @@ import { renderPrompt, renderWorkspaceKey, type RenderScope } from './prompt-ren
 import { extractAgentOutputText, parseSingleJsonObject } from './output-parser.js'
 import { validateAgainstSchema } from './output-validator.js'
 import { selectEdge } from './routing.js'
-import { stepExecutionId } from './recovery.js'
+import { stepExecutionId, humanRequestId } from './recovery.js'
 import { WorkflowRuntimeError, type LimitKind } from './errors.js'
 import { TransientAgentTaskError, type AgentTaskClient, type AgentTaskTerminalRead } from './task-client.js'
 import { resolveWorkspaceTargets, TransientWorkspaceLeaseError, type WorkspaceLeaseClient, type WorkspaceTarget } from './workspace-lease-client.js'
@@ -256,6 +256,13 @@ export class WorkflowRuntime {
     const role = specStep ? spec.agents[specStep.agent_role] : undefined
     if (!specStep || !role) { await this.failWorkflow(workflowId, 'runtime_internal', { reason: 'unknown_step_or_role', step_id: step.step_id }); return 'stop' }
 
+    // Human PAUSE gate (evaluated BEFORE any Agent Task is created). A `pause_before`
+    // step waits for an explicit durable response; no backend runs while waiting.
+    if (specStep.pause_before) {
+      const gate = await this.evaluatePauseGate(workflowId, step, specStep.pause_before)
+      if (gate !== 'proceed') return 'stop' // waiting (pump stopped) or rejected→failed
+    }
+
     const scope = await this.buildRenderScope(workflowId, wf, step)
     const rendered = renderPrompt(specStep.prompt_template, scope)
     if (!rendered.ok) { await this.failWorkflow(workflowId, 'render_error', { code: rendered.code, step_id: step.step_id }); return 'stop' }
@@ -446,6 +453,71 @@ export class WorkflowRuntime {
     await this.store.cancelStepAndWorkflow(stepExecId, workflowId, { event_type: 'workflow.cancelled', ts: new Date().toISOString(), payload: {}, contract_version: CV } as WorkflowEventDraft)
   }
 
+  // ── human pause / approval gates ─────────────────────────────────────────────────
+
+  /** Evaluate a step's `pause_before` gate. `proceed` → the response is in and the
+   *  task may run; `wait` → a durable pending request was (idempotently) created and
+   *  the workflow is now `waiting_*` (pump stops); `stop` → an approval was rejected
+   *  and the workflow failed. Idempotent + crash-safe (deterministic request id). */
+  private async evaluatePauseGate(workflowId: string, step: StepExecutionRecord, gate: StepPauseGate): Promise<'proceed' | 'stop'> {
+    const requestId = humanRequestId(step.step_execution_id)
+    const existing = await this.store.getHumanRequest(requestId)
+    if (existing) {
+      if (existing.status === 'answered' || existing.status === 'approved') return 'proceed'
+      if (existing.status === 'rejected') { await this.failWorkflow(workflowId, 'runtime_internal', { reason: 'approval_rejected', step_id: step.step_id }); return 'stop' }
+      // pending → (re)assert the waiting state and stop the pump.
+    }
+    const waitingStatus = gate.kind === 'input' ? 'waiting_input' : 'waiting_approval'
+    await this.store.createHumanRequestAndPause(
+      { request_id: requestId, workflow_id: workflowId, step_execution_id: step.step_execution_id, kind: gate.kind, prompt: gate.prompt, choices: gate.choices ?? null },
+      waitingStatus,
+      { event_type: 'workflow.paused', ts: new Date().toISOString(), payload: { reason: waitingStatus, kind: gate.kind, step_id: step.step_id, step_execution_id: step.step_execution_id }, contract_version: CV } as WorkflowEventDraft,
+    )
+    return 'stop'
+  }
+
+  /** The request currently AWAITING a human response (null if none pending). */
+  async getPendingRequest(workflowId: string): Promise<WorkflowHumanRequestRecord | null> {
+    return this.store.getPendingHumanRequest(workflowId)
+  }
+
+  /** Record a durable input answer (idempotent; a conflicting value fails closed).
+   *  Does NOT itself resume — call resumeWorkflow to continue from the checkpoint. */
+  async answerInput(requestId: string, value: string): Promise<WorkflowHumanRequestRecord> {
+    return this.store.answerHumanRequestInput(requestId, value)
+  }
+
+  /** Record a durable approval decision (idempotent; a conflicting decision fails
+   *  closed). A REJECTION is definitive: it fails the workflow (documented policy)
+   *  and releases its leases. An approval requires an explicit resumeWorkflow. */
+  async decideApproval(requestId: string, approved: boolean): Promise<WorkflowHumanRequestRecord> {
+    if (approved) return this.store.approveHumanRequest(requestId)
+    const r = await this.store.rejectHumanRequestAndFailWorkflow(requestId, { event_type: 'workflow.failed', ts: new Date().toISOString(), payload: { reason: 'approval_rejected' }, contract_version: CV } as WorkflowEventDraft)
+    this.aborts.get(r.request.workflow_id)?.abort()
+    if (this.leaseClient) await this.settleLeaseReleases(r.request.workflow_id)
+    return r.request
+  }
+
+  /** Continue a paused workflow from its durable checkpoint once its request has been
+   *  answered/approved: transition `waiting_*` → running and re-drive the pump (no new
+   *  step or Agent Task — the SAME step resumes). Idempotent; a still-pending request
+   *  (no response yet) or a terminal workflow is a safe no-op. */
+  async resumeWorkflow(workflowId: string): Promise<WorkflowRecord> {
+    const wf = await this.store.getWorkflow(workflowId)
+    if (!wf) throw new WorkflowRuntimeError('invalid_transition', `workflow not found: ${workflowId}`)
+    if (wf.status === 'waiting_input' || wf.status === 'waiting_approval') {
+      const req = await this.store.getActiveHumanRequest(workflowId)
+      const ready = req && (req.status === 'answered' || req.status === 'approved')
+      if (ready) {
+        await this.store.resumeWorkflowRunning(workflowId, { event_type: 'workflow.resumed', ts: new Date().toISOString(), payload: { request_id: req!.request_id }, contract_version: CV } as WorkflowEventDraft)
+        this.ensurePump(workflowId)
+      }
+    } else if (wf.status === 'running') {
+      this.ensurePump(workflowId) // coalesce (e.g. resume after a restart)
+    }
+    return (await this.store.getWorkflow(workflowId))!
+  }
+
   // ── workspace-lease lifecycle (workspace_lease_v1) ───────────────────────────────
 
   /** The lease target for a workspace-bound step (null if not lease-managed or no
@@ -586,7 +658,12 @@ export class WorkflowRuntime {
     const context: Partial<Record<ContextGroup, Record<string, unknown>>> = {}
     if (ctx.latest_planner_decision) context.latest_planner_decision = ctx.latest_planner_decision as unknown as Record<string, unknown>
     if (ctx.latest_executor_handoff) context.latest_executor_handoff = ctx.latest_executor_handoff as unknown as Record<string, unknown>
-    return { inputs: (wf.input_values ?? {}) as Record<string, unknown>, stepOutputs, round: step.round, context }
+    // `pause.response`: THIS step's answered input pause. Present only once answered —
+    // the pause gate guarantees the task is not rendered/created until then, so a
+    // prompt referencing pause.response never starts before a response exists.
+    const req = await this.store.getHumanRequest(humanRequestId(step.step_execution_id))
+    const pauseResponse = req && req.kind === 'input' && req.status === 'answered' && req.response_value !== null ? req.response_value : undefined
+    return { inputs: (wf.input_values ?? {}) as Record<string, unknown>, stepOutputs, round: step.round, context, ...(pauseResponse !== undefined ? { pauseResponse } : {}) }
   }
 
   private async buildUpdatedContext(workflowId: string, binding: ContextGroup | undefined, output: Record<string, unknown>, taskId: string, historyComplete: boolean): Promise<{ context: WorkflowContextBundle; revision: number }> {

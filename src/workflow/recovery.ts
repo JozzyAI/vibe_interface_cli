@@ -6,6 +6,7 @@
  * mint the stable `step_execution_id` (reused verbatim on recovery — it is NOT a
  * retry) and classify the durable phase a recovered workflow is in.
  */
+import { createHash } from 'crypto'
 import type { WorkflowRecord, StepExecutionRecord } from '../control/records.js'
 
 /**
@@ -16,6 +17,12 @@ import type { WorkflowRecord, StepExecutionRecord } from '../control/records.js'
  */
 export function stepExecutionId(workflowId: string, stepId: string, round: number, attempt: number): string {
   return `${workflowId}.${stepId}.r${round}.a${attempt}`
+}
+
+/** Deterministic, stable human-pause request id for a step execution — reused
+ *  verbatim on recovery so the pause request is idempotent (never a duplicate). */
+export function humanRequestId(stepExecutionId: string): string {
+  return `hr_${createHash('sha256').update(stepExecutionId).digest('hex').slice(0, 32)}`
 }
 
 export type RecoveryPhase =

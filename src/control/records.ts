@@ -45,6 +45,7 @@ const WF_EVENT_NAMES = new Set<string>([
   'workflow.created', 'workflow.validated', 'workflow.started', 'step.started', 'step.task_created',
   'step.completed', 'step.failed', 'edge.selected', 'workflow.round_advanced',
   'workflow.blocked', 'workflow.completed', 'workflow.failed', 'workflow.cancelled',
+  'workflow.paused', 'workflow.resumed',
 ])
 function isWfEventName(s: string): boolean { return WF_EVENT_NAMES.has(s) }
 export { isStepScopedEvent, WORKFLOW_EVENT_CONTRACT_VERSION }
@@ -240,6 +241,32 @@ export interface WorkflowEventInput {
   ts: string
   step_execution_id?: string | null
   payload: unknown
+}
+
+/** A durable HUMAN PAUSE request (input / approval) gating a workflow step. At most
+ *  one active request per step execution. Bounded; carries no secrets. */
+export interface WorkflowHumanRequestRecord {
+  request_id: string
+  workflow_id: string
+  step_execution_id: string
+  kind: string          // 'input' | 'approval'
+  prompt: string
+  choices: string[] | null
+  status: string        // 'pending' | 'answered' | 'approved' | 'rejected'
+  response_value: string | null   // the answered input value (bounded); null for approval
+  created_at: string
+  responded_at: string | null
+  updated_at: string
+  revision: number
+}
+
+export interface CreateHumanRequestInput {
+  request_id: string
+  workflow_id: string
+  step_execution_id: string
+  kind: string
+  prompt: string
+  choices: string[] | null
 }
 
 /** Durable ControlStore PROJECTION of a Node workspace lease held by a workflow.
