@@ -74,12 +74,14 @@ test('node lease: run-start gate rejects unleased/wrong runs, allows the matchin
   const j = openNodeJournal({ path: tmpDb() }); const rev = observeWorkspaceRevision(gitWs())
   const a = j.acquireWorkspaceLease('wf_A', 'node1', 'ws', rev)
   // a run on a leased workspace WITHOUT the lease is rejected — backend must not start
-  assert.throws(() => j.validateWorkspaceLeaseForRun('node1', 'ws', null), (e: unknown) => e instanceof WorkspaceLeaseError && e.code === 'workspace_lease_conflict')
+  assert.throws(() => j.validateWorkspaceLeaseForRun('node1', 'ws', null), (e: unknown) => e instanceof WorkspaceLeaseError && e.code === 'workspace_lease_required')
   // a wrong/other lease id is rejected
   assert.throws(() => j.validateWorkspaceLeaseForRun('node1', 'ws', 'wl_deadbeef'), (e: unknown) => e instanceof WorkspaceLeaseError && e.code === 'workspace_lease_invalid')
   // the matching lease is allowed; an unleased workspace is always allowed
   assert.doesNotThrow(() => j.validateWorkspaceLeaseForRun('node1', 'ws', a.lease.workspace_lease_id))
   assert.doesNotThrow(() => j.validateWorkspaceLeaseForRun('node1', 'other-ws', null))
+  // an unknown/stale lease presented on an UNLEASED workspace fails closed (not allowed)
+  assert.throws(() => j.validateWorkspaceLeaseForRun('node1', 'other-ws', 'wl_unknown'), (e: unknown) => e instanceof WorkspaceLeaseError && e.code === 'workspace_lease_invalid')
   j.close()
 })
 

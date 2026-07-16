@@ -205,6 +205,12 @@ export interface CreateTaskRequest {
    *  bounded safe identifier — NOT a task id, NOT a credential, NEVER forwarded to
    *  the relay/node/backend. */
   idempotency_key?: string
+  /** OPTIONAL workspace lease id (workspace_lease_v1) authorizing this run against
+   *  a Node's active workspace lease. Bounded safe identifier, DISTINCT from
+   *  task_id / remote_run_id / idempotency_key / workflow_id. Participates in the
+   *  request fingerprint. Reaches the Node ONLY for authorization — NEVER forwarded
+   *  to the provider (prompt/metadata/env) and never logged. */
+  workspace_lease_id?: string
 }
 
 /**
@@ -295,12 +301,23 @@ export function validateCreateTaskRequest(
     }
   }
 
+  // Optional workspace lease id — a bounded safe opaque identifier, DISTINCT from
+  // task_id/remote_run_id/idempotency_key/workflow_id. Same shape rule as the
+  // idempotency key; the submitted value is never echoed. It reaches the Node for
+  // authorization only and is NEVER forwarded to the provider.
+  if (b.workspace_lease_id !== undefined) {
+    if (typeof b.workspace_lease_id !== 'string' || !IDEMPOTENCY_KEY_RE.test(b.workspace_lease_id)) {
+      return fail('`workspace_lease_id` must be a bounded safe identifier matching ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ (no whitespace, control characters, path separators, or arbitrary Unicode)')
+    }
+  }
+
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }
   if (typeof b.node_id === 'string') value.node_id = b.node_id
   if (workspace && typeof workspace.workspace_key === 'string') value.workspace = { workspace_key: workspace.workspace_key }
   if (exec && exec.permission_mode) value.execution = { permission_mode: exec.permission_mode as PermissionMode }
   if (isPlainObject(b.metadata)) value.metadata = b.metadata
   if (typeof b.idempotency_key === 'string') value.idempotency_key = b.idempotency_key
+  if (typeof b.workspace_lease_id === 'string') value.workspace_lease_id = b.workspace_lease_id
   return { ok: true, value }
 }
 
@@ -400,6 +417,7 @@ export type ApiErrorCode =
   | 'invalid_state_transition'
   | 'cancellation_conflict'
   | 'idempotency_conflict'
+  | 'workspace_lease_unsupported'
   | 'internal_error'
 
 // Only the opaque `task_id` is exposed on the wire — the internal `run_id` is
@@ -426,6 +444,7 @@ const RETRYABLE: Record<ApiErrorCode, boolean> = {
   invalid_state_transition: false,
   cancellation_conflict: false,
   idempotency_conflict: false,
+  workspace_lease_unsupported: false,
   internal_error: true,
 }
 
@@ -459,6 +478,7 @@ export function apiErrorHttpStatus(code: ApiErrorCode): number {
     case 'invalid_state_transition': return 409
     case 'idempotency_conflict': return 409
     case 'agent_unavailable': return 422
+    case 'workspace_lease_unsupported': return 422
     case 'node_offline': return 503
     case 'service_unavailable': return 503
     case 'internal_error': return 500

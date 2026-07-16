@@ -90,6 +90,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const pendingStops = new Map<string, WebSocket>()
     // req_id → requester ws, for routing run_result_ack back to the gateway
     const pendingResults = new Map<string, import('ws').WebSocket>()
+    // req_id → requester ws, for routing workspace_lease_ack back to the gateway
+    const pendingLeases = new Map<string, import('ws').WebSocket>()
     // req_id → requester ws, for routing run_status_ack back to CLI
     const pendingStatuses = new Map<string, WebSocket>()
     // req_id → requester ws, for routing approval_response_ack back to CLI
@@ -578,6 +580,26 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             if (requester) { sendMsg(requester, msg); pendingResults.delete(msg.req_id) }
             break
           }
+
+          case 'workspace_lease_acquire':
+          case 'workspace_lease_get':
+          case 'workspace_lease_release': {
+            // workspace_lease_v1: route to the exact target node; only bounded opaque
+            // lease data crosses. The Node is the authority — the relay never decides.
+            pendingLeases.set(msg.req_id, ws)
+            const target = registry.get(msg.node_id)
+            if (!target) {
+              sendMsg(ws, { version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(), type: 'workspace_lease_ack', req_id: msg.req_id, ok: false, error: `node offline or unknown: ${msg.node_id}`, code: 'workspace_lease_unavailable' })
+              pendingLeases.delete(msg.req_id); break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+          case 'workspace_lease_ack': {
+            const requester = pendingLeases.get(msg.req_id)
+            if (requester) { sendMsg(requester, msg); pendingLeases.delete(msg.req_id) }
+            break
+          }
         }
       })
 
@@ -600,6 +622,9 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         }
         for (const [reqId, reqWs] of pendingResults) {
           if (reqWs === ws) pendingResults.delete(reqId)
+        }
+        for (const [reqId, reqWs] of pendingLeases) {
+          if (reqWs === ws) pendingLeases.delete(reqId)
         }
         for (const [reqId, reqWs] of pendingApprovals) {
           if (reqWs === ws) pendingApprovals.delete(reqId)

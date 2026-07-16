@@ -41,7 +41,8 @@ or any `*_aes_key`.
   "workspace": { "path": "…", "repo_url": "…", "branch": "…", "workspace_key": "…" },
   "execution": { "permission_mode": "default", "timeout_seconds": 1800 },
   "metadata": { "source": "symphony", "issue_id": "JOZ-21" },
-  "idempotency_key": "step:wf_1.plan.r1.a1"   // optional; create-or-return
+  "idempotency_key": "step:wf_1.plan.r1.a1",  // optional; create-or-return
+  "workspace_lease_id": "wl_…"                 // optional; authorize a leased workspace
 }
 ```
 
@@ -56,6 +57,14 @@ or any `*_aes_key`.
 - `execution.permission_mode` (`default` | `unsafe-skip`)
 - `metadata`
 - `idempotency_key` (optional; see **Idempotent creation** below)
+- `workspace_lease_id` (optional; a bounded safe id matching
+  `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` authorizing a run against a Node's active
+  `workspace_lease_v1` lease — see [workspace leases](workflow-workspace-leases.md)). It
+  joins the request fingerprint (a changed lease under the same `idempotency_key` →
+  `idempotency_conflict`), requires an explicit **lease-capable remote `node_id`** (local
+  execution rejects it with `workspace_lease_unsupported`/422), and is **never** forwarded
+  to the provider (prompt/metadata/env/logs) — it reaches the Node only to authorize the
+  run. Distinct from `task_id` / `remote_run_id` / `idempotency_key` / `workflow_id`.
 
 **Reserved / deferred fields (rejected with `invalid_request` / 400):**
 `workspace.path`, `workspace.repo_url`, `workspace.branch`,

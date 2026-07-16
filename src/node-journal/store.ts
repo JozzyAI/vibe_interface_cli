@@ -54,6 +54,10 @@ export interface NodeJournal {
    *  matching active lease id (same workflow). Throws WorkspaceLeaseError otherwise. */
   validateWorkspaceLeaseForRun(nodeId: string, workspaceKey: string, presentedLeaseId: string | null): void
   recordWorkspaceRevision(leaseId: string, stepExecutionId: string | null, phase: string, revision: import('../lib/workspace-lease.js').WorkspaceRevision): { observation_id: string }
+  /** Bind a run to a lease at run start (immutable); enables release protection. */
+  bindRunToLease(remoteRunId: string, leaseId: string): void
+  /** True iff any run bound to the lease is still non-terminal. */
+  isLeaseInUse(leaseId: string): boolean
 
   // durable AgentTaskResult (immutable; never derived from run events)
   /** Persist the authoritative result idempotently. Exact duplicate → applied:false;

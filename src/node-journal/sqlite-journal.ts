@@ -129,7 +129,11 @@ CREATE TABLE workspace_revisions (
   FOREIGN KEY (workspace_lease_id) REFERENCES workspace_leases(workspace_lease_id) ON DELETE CASCADE
 );
 `
-const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }]
+/** Journal v4 — run-to-lease binding. A run started under a workspace lease records
+ *  the lease id so the Node can refuse a lease release while any bound run is still
+ *  non-terminal (a provider may still be writing). Additive; legacy rows NULL. */
+const V4 = `ALTER TABLE runs ADD COLUMN workspace_lease_id TEXT;`
+const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }]
 export const LATEST_JOURNAL_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 const LATEST = LATEST_JOURNAL_SCHEMA_VERSION
 
@@ -169,7 +173,7 @@ interface Sub {
   closed: boolean
 }
 
-interface RunRow { remote_run_id: string; created_at: string; updated_at: string; status: string; terminal_at: string | null; last_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number }
+interface RunRow { remote_run_id: string; created_at: string; updated_at: string; status: string; terminal_at: string | null; last_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; workspace_lease_id: string | null }
 interface ResultRow { remote_run_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
 interface LeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; base_revision_json: string | null; current_revision_json: string | null; created_at: string; updated_at: string }
 function isUniqueError(e: unknown): boolean { if (!(e instanceof Error)) return false; const c = (e as unknown as { code?: unknown }).code; return typeof c === 'string' && c.startsWith('SQLITE_CONSTRAINT') }
@@ -308,17 +312,46 @@ export class SqliteNodeJournal implements NodeJournal {
     return this.db.transaction(() => {
       const r = this.leaseRow(leaseId); if (!r) throw new WorkspaceLeaseError('workspace_lease_invalid', 'no such lease')
       if (r.status === 'released') return { lease: this.toLease(r) } // idempotent
+      // Refuse release while any non-terminal run is still bound to the lease — a
+      // provider backend may still be writing. Never rely solely on the caller.
+      if (this.isLeaseInUse(leaseId)) throw new WorkspaceLeaseError('workspace_lease_in_use', 'a non-terminal run is still bound to this lease')
       const now = nowIso()
       this.db.prepare(`UPDATE workspace_leases SET status='released', released_at=?, updated_at=? WHERE workspace_lease_id=?`).run(now, now, leaseId)
       return { lease: this.toLease(this.leaseRow(leaseId)!) }
     })()
   }
+  /** Bind a run to a lease at run start (immutable once set). A different existing
+   *  binding is a conflict; the same binding is a no-op. */
+  bindRunToLease(remoteRunId: string, leaseId: string): void {
+    this.open(); this.assertId(remoteRunId)
+    this.db.transaction(() => {
+      this.ensureRun(remoteRunId)
+      const r = this.runRow(remoteRunId)!
+      if (r.workspace_lease_id && r.workspace_lease_id !== leaseId) throw new WorkspaceLeaseError('workspace_lease_conflict', 'run is already bound to a different lease')
+      if (!r.workspace_lease_id) this.db.prepare('UPDATE runs SET workspace_lease_id = ?, updated_at = ? WHERE remote_run_id = ?').run(leaseId, nowIso(), remoteRunId)
+    })()
+  }
+  /** True iff any run bound to the lease is still non-terminal (a provider may be writing). */
+  isLeaseInUse(leaseId: string): boolean {
+    this.open()
+    return (this.db.prepare('SELECT 1 FROM runs WHERE workspace_lease_id = ? AND terminal_event_recorded = 0 LIMIT 1').get(leaseId)) !== undefined
+  }
   validateWorkspaceLeaseForRun(nodeId: string, workspaceKey: string, presentedLeaseId: string | null): void {
     this.open()
     const active = this.activeLeaseRow(nodeId, workspaceKey)
-    if (!active) return // unleased workspace → any run may proceed
-    if (!presentedLeaseId) throw new WorkspaceLeaseError('workspace_lease_conflict', 'workspace is leased; a run must present the matching lease')
-    if (presentedLeaseId !== active.workspace_lease_id) throw new WorkspaceLeaseError('workspace_lease_invalid', 'presented lease does not match the workspace lease')
+    if (presentedLeaseId) {
+      // A lease was presented: it MUST be the active lease for THIS workspace. A
+      // stale/released/unknown presented lease fails closed even on an unleased ws.
+      if (!active) {
+        const row = this.leaseRow(presentedLeaseId)
+        if (row && row.status === 'released') throw new WorkspaceLeaseError('workspace_lease_released', 'presented lease is released')
+        throw new WorkspaceLeaseError('workspace_lease_invalid', 'presented lease is not active for this workspace')
+      }
+      if (presentedLeaseId !== active.workspace_lease_id) throw new WorkspaceLeaseError('workspace_lease_invalid', 'presented lease does not match the workspace lease')
+      return // matches the active lease
+    }
+    // No lease presented: a leased workspace requires one; an unleased workspace is fine.
+    if (active) throw new WorkspaceLeaseError('workspace_lease_required', 'workspace is leased; a run must present the matching lease')
   }
   recordWorkspaceRevision(leaseId: string, stepExecutionId: string | null, phase: string, revision: WorkspaceRevision): { observation_id: string } {
     this.open()

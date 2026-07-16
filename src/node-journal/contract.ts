@@ -31,10 +31,9 @@ export const RUN_EVENT_REPLAY_CAPABILITY = 'run_event_replay_v1'
 /** Advertised when durable run-result storage is available: the node can serve the
  *  authoritative AgentTaskResult by exact remote_run_id (encrypted end-to-end). */
 export const RUN_RESULT_CAPABILITY = 'run_result_v1'
-// NOTE: the `workspace_lease_v1` relay CAPABILITY is intentionally NOT defined or
-// advertised here — this PR is the durable lease STORAGE + CONTRACT foundation only.
-// The capability is introduced in PR #70 together with the relay acquire/get/release
-// operations, Agent-Task workspace_lease_id binding, and Node run-start enforcement.
+/** Advertised ONLY when the Node lease store is open, acquire/get/release ops are
+ *  registered, AND run-start enforcement is active — never partial support. */
+export const WORKSPACE_LEASE_CAPABILITY = 'workspace_lease_v1'
 
 /** Journal DB schema version (bumped for incompatible schema changes). */
 export const JOURNAL_SCHEMA_VERSION = 1
