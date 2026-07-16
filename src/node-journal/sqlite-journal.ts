@@ -23,7 +23,8 @@ import {
 } from './contract.js'
 import { nowIso, isIsoUtc, encodeJson, decodeJson } from './serialization.js'
 import { pruneTerminalRuns, pruneRunEvents } from './retention.js'
-import type { NodeJournal, JournalHealth, JournalSubscription, SubscribeOptions } from './store.js'
+import type { NodeJournal, JournalHealth, JournalSubscription, SubscribeOptions, NodeRunResult } from './store.js'
+import { validateTaskResult, MAX_FINAL_OUTPUT_BYTES, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'stopped', 'cancelled'])
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
@@ -77,7 +78,25 @@ CREATE TABLE run_events (
 );
 CREATE INDEX idx_runs_terminal_at ON runs(terminal_at);
 `
-const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }]
+/** Journal v2 — durable first-class AgentTaskResult, keyed by remote_run_id
+ *  (immutable content). Additive; the result is NEVER derived from run events.
+ *  No token/key/credential/PID/prompt-path ever enters this table. */
+const V2 = `
+CREATE TABLE run_results (
+  remote_run_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  result_status TEXT NOT NULL,
+  final_output_text TEXT,
+  process_exit_code INTEGER,
+  finalized_at TEXT,
+  content_hash TEXT,
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (remote_run_id) REFERENCES runs(remote_run_id) ON DELETE CASCADE
+);
+`
+const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }]
 export const LATEST_JOURNAL_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 const LATEST = LATEST_JOURNAL_SCHEMA_VERSION
 
@@ -118,6 +137,8 @@ interface Sub {
 }
 
 interface RunRow { remote_run_id: string; created_at: string; updated_at: string; status: string; terminal_at: string | null; last_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number }
+interface ResultRow { remote_run_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
+function boundFinal(text: string): string { if (Buffer.byteLength(text, 'utf8') > MAX_FINAL_OUTPUT_BYTES) throw new JournalError('too_large', 'run_result.final_output exceeds the size limit'); return text }
 interface EventRow { remote_run_id: string; sequence: number; type: string; ts: string; payload_json: string; created_at: string }
 
 export class SqliteNodeJournal implements NodeJournal {
@@ -205,6 +226,48 @@ export class SqliteNodeJournal implements NodeJournal {
     if (run.terminal_event_recorded && !TERMINAL_STATUSES.has(status)) throw new JournalError('invalid_transition', 'terminal run cannot regress to non-terminal')
     this.db.prepare('UPDATE runs SET status = ?, updated_at = ?, terminal_at = COALESCE(?, terminal_at) WHERE remote_run_id = ?').run(status, nowIso(), terminalAt ?? null, remoteRunId)
     return this.toMeta(this.runRow(remoteRunId)!)
+  }
+
+  // ── durable AgentTaskResult (immutable; never derived from run events) ───────
+  private resultRow(remoteRunId: string): ResultRow | undefined { return this.db.prepare('SELECT * FROM run_results WHERE remote_run_id = ?').get(remoteRunId) as ResultRow | undefined }
+  /** Idempotent-duplicate check over the COMPLETE normalized immutable envelope
+   *  (schema_version, final_output, process_exit_code, content_hash, evidence_refs,
+   *  artifact_refs) — NOT merely content_hash. finalized_at is excluded (the first
+   *  finalization's timestamp is preserved). */
+  private resultMatches(row: ResultRow, resultStatus: string, result: AgentTaskResultV1 | null): boolean {
+    if (row.result_status !== resultStatus) return false
+    if (result === null) return row.content_hash === null
+    return row.schema_version === result.schema_version
+      && row.content_hash === result.content_hash
+      && (row.final_output_text ?? '') === result.final_output.text
+      && (row.process_exit_code ?? null) === (result.process_exit_code ?? null)
+      && row.evidence_refs_json === encodeJson(result.evidence_refs ?? [], 256 * 1024, 'run_result.evidence_refs')
+      && row.artifact_refs_json === encodeJson(result.artifact_refs ?? [], 256 * 1024, 'run_result.artifact_refs')
+  }
+  persistRunResult(remoteRunId: string, resultStatus: string, result: AgentTaskResultV1 | null): { applied: boolean } {
+    this.open(); this.assertId(remoteRunId)
+    return this.db.transaction(() => {
+      this.ensureRun(remoteRunId)
+      const existing = this.resultRow(remoteRunId)
+      if (existing) { if (this.resultMatches(existing, resultStatus, result)) return { applied: false }; throw new JournalError('result_conflict', 'a different run result already exists (content mismatch)') }
+      const now = nowIso()
+      this.db.prepare(`INSERT INTO run_results (remote_run_id,schema_version,result_status,final_output_text,process_exit_code,finalized_at,content_hash,evidence_refs_json,artifact_refs_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
+        remoteRunId, result?.schema_version ?? '1', resultStatus,
+        result ? boundFinal(result.final_output.text) : null,
+        result?.process_exit_code ?? null, result?.finalized_at ?? null, result?.content_hash ?? null,
+        encodeJson(result?.evidence_refs ?? [], 256 * 1024, 'run_result.evidence_refs'),
+        encodeJson(result?.artifact_refs ?? [], 256 * 1024, 'run_result.artifact_refs'), now,
+      )
+      return { applied: true }
+    })()
+  }
+  getRunResult(remoteRunId: string): NodeRunResult | null {
+    this.open()
+    const row = this.resultRow(remoteRunId); if (!row) return null
+    if (row.result_status !== 'available') return { remote_run_id: remoteRunId, result_status: row.result_status, result: null }
+    const v = validateTaskResult({ schema_version: row.schema_version, final_output: { kind: 'text', text: row.final_output_text ?? '' }, process_exit_code: row.process_exit_code, finalized_at: row.finalized_at ?? '', content_hash: row.content_hash ?? '', evidence_refs: decodeJson(row.evidence_refs_json, 256 * 1024, 'run_result.evidence_refs'), artifact_refs: decodeJson(row.artifact_refs_json, 256 * 1024, 'run_result.artifact_refs') })
+    if (!v.ok) throw new JournalError('corruption', `persisted run result is invalid (${v.code})`)
+    return { remote_run_id: remoteRunId, result_status: 'available', result: v.value }
   }
 
   // ── reads ──────────────────────────────────────────────────────────────────

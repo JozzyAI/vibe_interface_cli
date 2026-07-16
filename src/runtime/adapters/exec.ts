@@ -10,6 +10,9 @@
  */
 import { spawn } from 'child_process'
 import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import crypto from 'crypto'
 import { appendEvent } from '../../events.js'
 import { readRun, updateRun } from '../../store.js'
 import { redact } from '../../redact.js'
@@ -34,15 +37,37 @@ export interface EmitHelpers {
   toolCall(tool: string, input: unknown): void
   /** Emit a pr_created event once per unique URL. */
   pr(url: string): void
+  /** Provider AUTHORITATIVE final-output text (last call wins) — the adapter's own
+   *  completion path, NOT event-history scanning. Used only when the strategy is
+   *  `explicit` (e.g. Claude's stream-json `result` message). */
+  setFinal(text: string): void
 }
+
+/** Build-args context: the adapter may wire the provider's dedicated final-message
+ *  output file into its CLI args (e.g. codex `--output-last-message <file>`). */
+export interface BuildArgsContext { finalOutputFile?: string }
 
 export interface ExecAgentOptions {
   binary: string
-  /** Build CLI args given the resolved record (prompt is always piped via stdin). */
-  buildArgs(record: RunRecord): string[]
+  /** Build CLI args given the resolved record (prompt is always piped via stdin).
+   *  `ctx.finalOutputFile` is set when `finalOutputStrategy === 'last-message-file'`. */
+  buildArgs(record: RunRecord, ctx: BuildArgsContext): string[]
   onStdoutLine: StdoutLineHandler
   /** Friendly binary label for error messages (defaults to `binary`). */
   label?: string
+  /**
+   * How to select the AUTHORITATIVE final output on a clean exit — always the
+   * provider's OWN completion path, never the event history:
+   *   - `explicit`          : only what the handler passed to `emit.setFinal` (a
+   *                           dedicated final-result message, e.g. Claude stream-json).
+   *   - `last-message-file` : the provider's dedicated final-message FILE (e.g. codex
+   *                           `--output-last-message`), isolated from mixed stdout
+   *                           progress/reasoning. Empty/absent → no result (`missing`).
+   * Absent → no authoritative final output (→ result_status `missing`). NOTE: raw
+   * full-stdout is deliberately NOT a strategy — mixed progress/reasoning must never
+   * be shipped as an authoritative result, nor heuristically scraped.
+   */
+  finalOutputStrategy?: 'explicit' | 'last-message-file'
 }
 
 export async function execAgent(record: RunRecord, ctx: AgentAdapterContext, options: ExecAgentOptions): Promise<AgentOutcome> {
@@ -91,18 +116,36 @@ export async function execAgent(record: RunRecord, ctx: AgentAdapterContext, opt
     }
   }
 
+  // Authoritative final-output capture (the adapter's own path, never the event log).
+  const FINAL_LIMIT = 256 * 1024
+  let explicitFinal: string | undefined
+  // Dedicated final-message file for a provider that writes its final result there.
+  const finalOutputFile = options.finalOutputStrategy === 'last-message-file'
+    ? path.join(os.tmpdir(), `vibe-final-${run_id}-${crypto.randomBytes(6).toString('hex')}.txt`)
+    : undefined
+
   const emit: EmitHelpers = {
     run_id,
     setSession: (id) => { session_id = id },
     log: (stream, message) => appendEvent({ type: 'log', run_id, session_id, stream, message: redact(message), ts: ts() }),
     toolCall: (tool, input) => appendEvent({ type: 'tool_call', run_id, session_id, tool, input, ts: ts() }),
     pr: (url) => { if (isNewPrUrl(url)) appendEvent({ type: 'pr_created', run_id, session_id, url, ts: ts() }) },
+    setFinal: (text) => { explicitFinal = text },
+  }
+  const selectFinal = (): string | undefined => {
+    if (options.finalOutputStrategy === 'explicit') return explicitFinal
+    if (options.finalOutputStrategy === 'last-message-file' && finalOutputFile) {
+      // Read the provider's dedicated final-message file (never mixed stdout).
+      try { const t = fs.readFileSync(finalOutputFile, 'utf8').trim(); return t === '' ? undefined : t } catch { return undefined }
+      finally { try { fs.unlinkSync(finalOutputFile) } catch { /* best effort */ } }
+    }
+    return undefined
   }
 
   // Hardened env so the agent's git uses WSL git + the controlled gh credential
   // helper (JozzyAI) and can never fall through to the Windows GCM / personal
   // account path (the JOZ-32 root cause the real-agent canary reproduced).
-  const child = spawn(options.binary, options.buildArgs(record), {
+  const child = spawn(options.binary, options.buildArgs(record, { finalOutputFile }), {
     cwd: record.workspace_path,
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: true,
@@ -170,7 +213,7 @@ export async function execAgent(record: RunRecord, ctx: AgentAdapterContext, opt
         return resolve(diagnosticError(`run timed out after ${timeoutMs}ms`))
       }
       if (code === 0) {
-        return resolve({ result: 'completed', tailOutput: tail })
+        return resolve({ result: 'completed', tailOutput: tail, finalOutput: selectFinal() })
       }
       return resolve(diagnosticError(signal ? `${label} exited with signal ${signal}` : `${label} exited with code ${code}`))
     })

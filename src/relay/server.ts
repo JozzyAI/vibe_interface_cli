@@ -88,6 +88,8 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
     const pendingReqs = new Map<string, WebSocket>()
     // req_id → requester ws, for routing run_stop_ack back to CLI
     const pendingStops = new Map<string, WebSocket>()
+    // req_id → requester ws, for routing run_result_ack back to the gateway
+    const pendingResults = new Map<string, import('ws').WebSocket>()
     // req_id → requester ws, for routing run_status_ack back to CLI
     const pendingStatuses = new Map<string, WebSocket>()
     // req_id → requester ws, for routing approval_response_ack back to CLI
@@ -552,6 +554,30 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             }
             break
           }
+
+          case 'run_result_request': {
+            // run_result_v1: route to the owning node; the ack (encrypted for an
+            // encrypted run) routes back to the requester. Relay never sees plaintext.
+            pendingResults.set(msg.req_id, ws)
+            const ownerId = runOwnership.get(msg.run_id)
+            if (!ownerId) {
+              sendMsg(ws, { version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(), type: 'run_result_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false, error: `Run not found in relay: ${msg.run_id}`, code: 'run_not_found' })
+              pendingResults.delete(msg.req_id); break
+            }
+            const target = registry.get(ownerId)
+            if (!target) {
+              sendMsg(ws, { version: 1, kind: 'plaintext', from: 'relay', to: msg.from, ts: now(), type: 'run_result_ack', req_id: msg.req_id, run_id: msg.run_id, ok: false, error: `Owning node is offline: ${ownerId}`, code: 'node_offline' })
+              pendingResults.delete(msg.req_id); break
+            }
+            sendMsg(target.ws, msg)
+            break
+          }
+
+          case 'run_result_ack': {
+            const requester = pendingResults.get(msg.req_id)
+            if (requester) { sendMsg(requester, msg); pendingResults.delete(msg.req_id) }
+            break
+          }
         }
       })
 
@@ -571,6 +597,9 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
         }
         for (const [reqId, reqWs] of pendingStatuses) {
           if (reqWs === ws) pendingStatuses.delete(reqId)
+        }
+        for (const [reqId, reqWs] of pendingResults) {
+          if (reqWs === ws) pendingResults.delete(reqId)
         }
         for (const [reqId, reqWs] of pendingApprovals) {
           if (reqWs === ws) pendingApprovals.delete(reqId)

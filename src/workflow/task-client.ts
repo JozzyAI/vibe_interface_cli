@@ -27,8 +27,16 @@ export interface AgentTaskState {
   task_id: string
   status: string
   terminal: boolean
-  /** Canonical event history is complete (`history.complete === true`). */
+  /** Canonical event history is complete (`history.complete === true`). Retained as
+   *  DIAGNOSTIC evidence only — the runtime routes on the AgentTaskResult, not on
+   *  event history. */
   history_complete: boolean
+  /** First-class AgentTaskResult status: 'available' | 'missing' | 'invalid' (or
+   *  undefined for a legacy task without a result). The authoritative control result. */
+  result_status?: string
+  /** The authoritative final output text (present iff result_status === 'available').
+   *  The runtime parses THIS into the step schema — never the event history. */
+  result_text?: string
 }
 
 export interface AgentTaskTerminalRead extends AgentTaskState {
@@ -63,6 +71,15 @@ function isTerminalStatus(s: unknown): boolean { return typeof s === 'string' &&
 function historyComplete(task: unknown): boolean {
   const h = (task && typeof task === 'object') ? (task as { history?: { complete?: unknown } }).history : undefined
   return h?.complete === true
+}
+function resultStatusOf(task: unknown): string | undefined {
+  const v = (task && typeof task === 'object') ? (task as { result_status?: unknown }).result_status : undefined
+  return typeof v === 'string' ? v : undefined
+}
+function resultTextOf(task: unknown): string | undefined {
+  const r = (task && typeof task === 'object') ? (task as { result?: { final_output?: { text?: unknown } } }).result : undefined
+  const t = r?.final_output?.text
+  return typeof t === 'string' ? t : undefined
 }
 function statusOf(task: unknown): string {
   return (task && typeof task === 'object' && typeof (task as { status?: unknown }).status === 'string') ? (task as { status: string }).status : 'unknown'
@@ -108,7 +125,7 @@ export class GatewayAgentTaskClient implements AgentTaskClient {
     let task: unknown
     try { task = await this.client.getTask(taskId) } catch (err) { classify(err) }
     const status = statusOf(task)
-    return { task_id: taskIdOf(task, taskId), status, terminal: isTerminalStatus(status), history_complete: historyComplete(task) }
+    return { task_id: taskIdOf(task, taskId), status, terminal: isTerminalStatus(status), history_complete: historyComplete(task), result_status: resultStatusOf(task), result_text: resultTextOf(task) }
   }
 
   async waitForTerminal(taskId: string, opts: { afterId?: number; budgetMs: number; signal?: AbortSignal }): Promise<AgentTaskTerminalRead> {
@@ -118,7 +135,8 @@ export class GatewayAgentTaskClient implements AgentTaskClient {
     const status = statusOf(r.task)
     return {
       task_id: taskIdOf(r.task, taskId), status, terminal: r.terminal || isTerminalStatus(status),
-      history_complete: historyComplete(r.task), events: r.events as RuntimeTaskEvent[], next_event_id: r.next_event_id,
+      history_complete: historyComplete(r.task), result_status: resultStatusOf(r.task), result_text: resultTextOf(r.task),
+      events: r.events as RuntimeTaskEvent[], next_event_id: r.next_event_id,
     }
   }
 

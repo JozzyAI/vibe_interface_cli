@@ -7,6 +7,9 @@ import type { NodeRunEvent, NodeRunEventInput, NodeRunMeta, ReplayMetadata } fro
 
 export interface JournalHealth { ok: boolean; schema_version: number; foreign_keys: boolean; journal_mode: string; busy_timeout: number }
 
+/** A durable Node run result (authoritative control result, keyed by remote_run_id). */
+export interface NodeRunResult { remote_run_id: string; result_status: string; result: import('../lib/agent-task-result.js').AgentTaskResultV1 | null }
+
 /** A race-free replay→live subscription. Replay events are delivered first (in
  *  order), then live appends; a slow subscriber's queue is bounded. */
 export interface JournalSubscription {
@@ -41,6 +44,13 @@ export interface NodeJournal {
   /** Explicit-sequence append (idempotent duplicate / gap-checked) for resilience. */
   appendAt(remoteRunId: string, sequence: number, event: NodeRunEventInput): { event: NodeRunEvent; duplicate: boolean }
   markStatus(remoteRunId: string, status: string, terminalAt?: string | null): NodeRunMeta
+
+  // durable AgentTaskResult (immutable; never derived from run events)
+  /** Persist the authoritative result idempotently. Exact duplicate → applied:false;
+   *  conflicting content → result_conflict. `result` is null for missing/invalid. */
+  persistRunResult(remoteRunId: string, resultStatus: string, result: import('../lib/agent-task-result.js').AgentTaskResultV1 | null): { applied: boolean }
+  /** Read the durable result (revalidated on read; malformed → corruption). */
+  getRunResult(remoteRunId: string): NodeRunResult | null
 
   // reads
   getRun(remoteRunId: string): NodeRunMeta | null

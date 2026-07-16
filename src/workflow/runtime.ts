@@ -278,11 +278,16 @@ export class WorkflowRuntime {
     if (read.status === 'cancelled') {
       await this.failStep(workflowId, step, { reason: 'task_cancelled_external', task_id: read.task_id }); return true
     }
-    // completed — require COMPLETE canonical history before trusting the output.
-    if (!read.history_complete) {
-      await this.blockWorkflow(workflowId, 'task_history_incomplete', { task_id: read.task_id, step_id: step.step_id, round: step.round }); return true
+    // completed — route on the FIRST-CLASS AgentTaskResult, never on event history.
+    //   available → parse final_output into the step schema and route
+    //   missing   → block (task_result_missing); never guess from events
+    //   invalid   → fail (task_result_invalid); the result envelope was corrupt
+    const rs = read.result_status
+    if (rs === 'invalid') { await this.failStep(workflowId, step, { reason: 'task_result_invalid', task_id: read.task_id }); return true }
+    if (rs !== 'available' || read.result_text === undefined) {
+      await this.blockWorkflow(workflowId, 'task_result_missing', { task_id: read.task_id, step_id: step.step_id, round: step.round }); return true
     }
-    const parsed = await this.parseValidatedOutput(read.task_id, spec, step)
+    const parsed = this.parseResultOutput(read.result_text, spec, step)
     if (!parsed.ok) { await this.failStep(workflowId, step, { reason: 'invalid_output', code: parsed.code, ...(parsed.field ? { field: parsed.field } : {}) }); return true }
 
     // Persist the validated output + update the bound context slot atomically.
@@ -292,15 +297,12 @@ export class WorkflowRuntime {
     return false // loop re-reads and routes from the now-completed step
   }
 
-  private async parseValidatedOutput(taskId: string, spec: WorkflowSpec, step: StepExecutionRecord): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; code: string; field?: string }> {
+  /** Parse the AgentTaskResult's authoritative final output into the step's output
+   *  schema. PURE over the result text — NO event-history scanning/aggregation. */
+  private parseResultOutput(resultText: string, spec: WorkflowSpec, step: StepExecutionRecord): { ok: true; value: Record<string, unknown> } | { ok: false; code: string; field?: string } {
     const specStep = spec.steps.find((s) => s.id === step.step_id)!
     const schema: OutputSchema = spec.output_schemas[specStep.output_schema]
-    // Re-read the full retained canonical history (afterId -1) so output extraction
-    // is complete; a terminal task returns it promptly.
-    let read: AgentTaskTerminalRead
-    try { read = await this.taskClient.waitForTerminal(taskId, { afterId: -1, budgetMs: 500 }) } catch { return { ok: false, code: 'output_unreadable' } }
-    const agg = extractAgentOutputText(read.events)
-    const parsed = parseSingleJsonObject(agg.text)
+    const parsed = parseSingleJsonObject(resultText)
     if (!parsed.ok) return { ok: false, code: parsed.code }
     const validated = validateAgainstSchema(parsed.value, schema)
     if (!validated.ok) return { ok: false, code: validated.code, field: validated.field }

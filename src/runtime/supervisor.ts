@@ -35,6 +35,7 @@ import {
   RepoNotAllowedError,
 } from '../repo-policy.js'
 import type { AgentAdapter, AgentAdapterContext, AgentOutcome, FailureReason } from './types.js'
+import { buildTaskResult, MAX_FINAL_OUTPUT_BYTES, type AgentTaskResultV1, type TaskResultStatus } from '../lib/agent-task-result.js'
 import { mockAdapter } from './adapters/mock.js'
 import { claudeAdapter } from './adapters/claude.js'
 import { codexAdapter } from './adapters/codex.js'
@@ -119,6 +120,16 @@ function buildFallbackPrompt(record: RunRecord, handoffFile: string): string {
   const out = path.join(vibeDir(), 'handoff', `${record.run_id}.fallback.prompt.md`)
   fs.writeFileSync(out, composed)
   return out
+}
+
+/** Build the durable AgentTaskResult from an adapter's authoritative final output.
+ *  Absent or oversized final output → `missing` (never a guess from event history). */
+function finalizeResult(outcome: AgentOutcome): { result_status: TaskResultStatus; task_result?: AgentTaskResultV1 } {
+  const fo = outcome.finalOutput
+  if (typeof fo === 'string' && Buffer.byteLength(fo, 'utf8') <= MAX_FINAL_OUTPUT_BYTES) {
+    return { result_status: 'available', task_result: buildTaskResult({ text: fo, processExitCode: outcome.exitCode }) }
+  }
+  return { result_status: 'missing' }
 }
 
 export async function runSupervisor(run_id: string): Promise<void> {
@@ -214,11 +225,16 @@ export async function runSupervisor(run_id: string): Promise<void> {
     if (readRun(run_id).status === 'stopped') return
 
     if (outcome.result === 'completed') {
+      // Finalize the authoritative AgentTaskResult from the adapter's OWN completion
+      // path (never by scanning the event log). No authoritative/bounded final
+      // output → result_status = 'missing' (we never guess from events).
+      const { result_status, task_result } = finalizeResult(outcome)
       updateRun(run_id, {
         status: 'completed', final_agent: agent, switched,
         ...(switchReason && { switch_reason: switchReason }),
         ...(handoffStr && { handoff_path: handoffStr }),
         ...(outcome.exitCode !== undefined && { exit_code: outcome.exitCode }),
+        result_status, ...(task_result && { task_result }),
         child_pid: undefined,
       })
       appendEvent({ type: 'status', run_id, session_id, status: 'completed', ts: ts() })

@@ -37,6 +37,9 @@ export interface RunRecord {
   recoverable?: boolean          // whether the terminal failure was classified recoverable
   exit_code?: number             // process/adapter exit status on a terminal outcome (0 = completed; absent when the agent never produced one, e.g. a pre-spawn gate failure)
   error?: string                 // human-readable terminal failure message (mirrors the adapter's diagnostic `error` event); absent on success
+  // ── First-class AgentTaskResult (authoritative control result; NOT event-history inference) ──
+  result_status?: import('./lib/agent-task-result.js').TaskResultStatus // 'available' when task_result is set; 'missing' when the backend produced no authoritative final result
+  task_result?: import('./lib/agent-task-result.js').AgentTaskResultV1   // the durable final result envelope (present iff result_status === 'available')
   event_aes_key?: string   // base64 AES-256 key for run_event decryption (HKDF 'vibe-run-event-v1'); stored locally
   stop_aes_key?: string     // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally
   approval_aes_key?: string // base64 AES-256 key for approval_response encryption (HKDF 'vibe-approval-response-v1')

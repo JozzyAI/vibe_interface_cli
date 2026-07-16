@@ -71,7 +71,9 @@ export const mockAdapter: AgentAdapter = {
     if (mockOutput) {
       await sleep(50)
       appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: mockOutput, ts: ts() })
-      return { result: 'completed', exitCode: 0 }
+      // The mock's AUTHORITATIVE final output is exactly VIBE_MOCK_OUTPUT (its own
+      // completion path — not the event log). Unset → no authoritative result.
+      return { result: 'completed', exitCode: 0, finalOutput: mockOutput }
     }
 
     // VIBE_MOCK_RUN_MS unset: byte-identical to the original fixed timings.

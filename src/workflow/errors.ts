@@ -19,11 +19,13 @@ export type WorkflowErrorCode =
   | 'workflow_limit_exceeded'  // a durable limit (rounds/tasks/runtime/failures) was hit
   | 'task_failed'              // the Agent Task reported a terminal failure
   | 'task_cancelled_external'  // the Agent Task was cancelled without our intent
+  | 'task_result_invalid'      // the AgentTaskResult envelope itself was malformed/corrupted
   | 'runtime_internal'         // an unexpected runtime error (sanitized)
 
 /** Stable reasons for a non-terminal `blocked` workflow. */
 export type WorkflowBlockReason =
-  | 'task_history_incomplete'  // task terminal but canonical history is not complete
+  | 'task_result_missing'      // task terminal but no authoritative AgentTaskResult was available
+  | 'task_history_incomplete'  // (legacy diagnostic) canonical history not complete
   | 'agent_blocked'            // an agent output declared status blocked
   | 'routed_blocked'           // routing selected the reserved $blocked target
 

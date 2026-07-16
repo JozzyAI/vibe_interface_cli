@@ -121,15 +121,16 @@ Recovery never resets `current_round`, counters, or `started_at`, and never crea
 another attempt merely because the process restarted (recovery reuses the same
 `attempt`/`step_execution_id`; it is **not** a retry).
 
-## `history.complete` requirement
+## First-class result consumption
 
-Before an Agent Task result routes the workflow, the task must be **authoritatively
-terminal `completed`** with **`history.complete === true`**. If canonical history is
-incomplete, the runtime does **not** guess the missing output or forward partial
-evidence — it transitions the workflow to **`blocked`** with reason
-`task_history_incomplete`, preserving the workflow/step/task identifiers. It does
-**not** mark the workflow failed merely because a legacy Node lacks event replay.
-(This is why the Node event journal and Gateway replay landed before this runtime.)
+The runtime routes on the durable [AgentTaskResult](./agent-task-result.md), NOT on
+event history. For a completed Agent Task: `result_status=available` → parse
+`final_output.text` with the strict JSON parser → validate against the step schema
+→ route; `result_status=missing` → transition to **blocked** with reason
+`task_result_missing` (never guess from events); `result_status=invalid` → fail with
+`task_result_invalid`. Event history remains available for UI/replay/audit/evidence,
+and history completeness is recorded as diagnostic evidence — never used as a hidden
+fallback for control output.
 
 ## Loop & limit enforcement
 

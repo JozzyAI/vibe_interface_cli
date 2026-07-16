@@ -148,7 +148,30 @@ ALTER TABLE workflows ADD COLUMN input_values_json TEXT;
 ALTER TABLE workflows ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }]
+/** Schema v6 — first-class durable AgentTaskResult. `task_results` is the
+ *  authoritative control result of a task (keyed by the PUBLIC task_id, immutable
+ *  content). `tasks.result_status` is a bounded projection for the task API. The
+ *  result is NEVER derived from Gateway event history. Additive only — v1–v5 are
+ *  never rewritten; legacy tasks keep NULL. No token/key/credential/PID/prompt-path
+ *  ever enters these rows. */
+const V6 = `
+CREATE TABLE task_results (
+  task_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  result_status TEXT NOT NULL,
+  final_output_text TEXT,
+  process_exit_code INTEGER,
+  finalized_at TEXT,
+  content_hash TEXT,
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+);
+ALTER TABLE tasks ADD COLUMN result_status TEXT;
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
