@@ -45,6 +45,16 @@ export interface NodeJournal {
   appendAt(remoteRunId: string, sequence: number, event: NodeRunEventInput): { event: NodeRunEvent; duplicate: boolean }
   markStatus(remoteRunId: string, status: string, terminalAt?: string | null): NodeRunMeta
 
+  // durable Node-authoritative workspace leases (exclusive per node_id+workspace_key)
+  acquireWorkspaceLease(workflowId: string, nodeId: string, workspaceKey: string, baseRevision: import('../lib/workspace-lease.js').WorkspaceRevision): { lease: import('../lib/workspace-lease.js').WorkspaceLeaseV1; created: boolean }
+  getWorkspaceLease(leaseId: string): import('../lib/workspace-lease.js').WorkspaceLeaseV1 | null
+  getActiveWorkspaceLease(nodeId: string, workspaceKey: string): import('../lib/workspace-lease.js').WorkspaceLeaseV1 | null
+  releaseWorkspaceLease(leaseId: string): { lease: import('../lib/workspace-lease.js').WorkspaceLeaseV1 }
+  /** Authoritative run-start gate: if the workspace is leased, a run MUST present the
+   *  matching active lease id (same workflow). Throws WorkspaceLeaseError otherwise. */
+  validateWorkspaceLeaseForRun(nodeId: string, workspaceKey: string, presentedLeaseId: string | null): void
+  recordWorkspaceRevision(leaseId: string, stepExecutionId: string | null, phase: string, revision: import('../lib/workspace-lease.js').WorkspaceRevision): { observation_id: string }
+
   // durable AgentTaskResult (immutable; never derived from run events)
   /** Persist the authoritative result idempotently. Exact duplicate → applied:false;
    *  conflicting content → result_conflict. `result` is null for missing/invalid. */

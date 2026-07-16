@@ -25,6 +25,8 @@ import { nowIso, isIsoUtc, encodeJson, decodeJson } from './serialization.js'
 import { pruneTerminalRuns, pruneRunEvents } from './retention.js'
 import type { NodeJournal, JournalHealth, JournalSubscription, SubscribeOptions, NodeRunResult } from './store.js'
 import { validateTaskResult, MAX_FINAL_OUTPUT_BYTES, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
+import { WorkspaceLeaseError, isValidLease, isValidRevision, workspaceLeaseId, type WorkspaceLeaseV1, type WorkspaceRevision } from '../lib/workspace-lease.js'
+import crypto from 'crypto'
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'stopped', 'cancelled'])
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
@@ -96,7 +98,38 @@ CREATE TABLE run_results (
   FOREIGN KEY (remote_run_id) REFERENCES runs(remote_run_id) ON DELETE CASCADE
 );
 `
-const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }]
+/** Journal v3 — durable Node-authoritative workspace leases + revision observations.
+ *  At most one ACTIVE/acquiring/release_requested lease per (node_id, workspace_key)
+ *  is enforced by a partial unique index. Additive; no secrets ever stored. */
+const V3 = `
+CREATE TABLE workspace_leases (
+  workspace_lease_id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  workspace_key TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'exclusive',
+  status TEXT NOT NULL,
+  acquired_at TEXT,
+  release_requested_at TEXT,
+  released_at TEXT,
+  base_revision_json TEXT,
+  current_revision_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_ws_lease_active ON workspace_leases(node_id, workspace_key)
+  WHERE status IN ('acquiring','active','release_requested');
+CREATE TABLE workspace_revisions (
+  observation_id TEXT PRIMARY KEY,
+  workspace_lease_id TEXT NOT NULL,
+  step_execution_id TEXT,
+  phase TEXT NOT NULL,
+  revision_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (workspace_lease_id) REFERENCES workspace_leases(workspace_lease_id) ON DELETE CASCADE
+);
+`
+const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }]
 export const LATEST_JOURNAL_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 const LATEST = LATEST_JOURNAL_SCHEMA_VERSION
 
@@ -138,6 +171,8 @@ interface Sub {
 
 interface RunRow { remote_run_id: string; created_at: string; updated_at: string; status: string; terminal_at: string | null; last_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number }
 interface ResultRow { remote_run_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
+interface LeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; base_revision_json: string | null; current_revision_json: string | null; created_at: string; updated_at: string }
+function isUniqueError(e: unknown): boolean { if (!(e instanceof Error)) return false; const c = (e as unknown as { code?: unknown }).code; return typeof c === 'string' && c.startsWith('SQLITE_CONSTRAINT') }
 function boundFinal(text: string): string { if (Buffer.byteLength(text, 'utf8') > MAX_FINAL_OUTPUT_BYTES) throw new JournalError('too_large', 'run_result.final_output exceeds the size limit'); return text }
 interface EventRow { remote_run_id: string; sequence: number; type: string; ts: string; payload_json: string; created_at: string }
 
@@ -226,6 +261,75 @@ export class SqliteNodeJournal implements NodeJournal {
     if (run.terminal_event_recorded && !TERMINAL_STATUSES.has(status)) throw new JournalError('invalid_transition', 'terminal run cannot regress to non-terminal')
     this.db.prepare('UPDATE runs SET status = ?, updated_at = ?, terminal_at = COALESCE(?, terminal_at) WHERE remote_run_id = ?').run(status, nowIso(), terminalAt ?? null, remoteRunId)
     return this.toMeta(this.runRow(remoteRunId)!)
+  }
+
+  // ── durable Node-authoritative workspace leases ─────────────────────────────
+  private ACTIVE_LEASE = ['acquiring', 'active', 'release_requested']
+  private leaseRow(id: string): LeaseRow | undefined { return this.db.prepare('SELECT * FROM workspace_leases WHERE workspace_lease_id = ?').get(id) as LeaseRow | undefined }
+  private activeLeaseRow(nodeId: string, workspaceKey: string): LeaseRow | undefined {
+    return this.db.prepare(`SELECT * FROM workspace_leases WHERE node_id = ? AND workspace_key = ? AND status IN ('acquiring','active','release_requested')`).get(nodeId, workspaceKey) as LeaseRow | undefined
+  }
+  private toLease(r: LeaseRow): WorkspaceLeaseV1 {
+    const l: WorkspaceLeaseV1 = { workspace_lease_id: r.workspace_lease_id, workflow_id: r.workflow_id, node_id: r.node_id, workspace_key: r.workspace_key, mode: 'exclusive', status: r.status as WorkspaceLeaseV1['status'], ...(r.acquired_at ? { acquired_at: r.acquired_at } : {}), ...(r.release_requested_at ? { release_requested_at: r.release_requested_at } : {}), ...(r.released_at ? { released_at: r.released_at } : {}) }
+    if (r.base_revision_json) { const v = decodeJson(r.base_revision_json, 256 * 1024, 'lease.base_revision'); if (!isValidRevision(v)) throw new JournalError('corruption', 'persisted base_revision is invalid'); l.base_revision = v }
+    if (r.current_revision_json) { const v = decodeJson(r.current_revision_json, 256 * 1024, 'lease.current_revision'); if (!isValidRevision(v)) throw new JournalError('corruption', 'persisted current_revision is invalid'); l.current_revision = v }
+    if (!isValidLease(l)) throw new JournalError('corruption', 'persisted workspace lease is invalid')
+    return l
+  }
+  acquireWorkspaceLease(workflowId: string, nodeId: string, workspaceKey: string, baseRevision: WorkspaceRevision): { lease: WorkspaceLeaseV1; created: boolean } {
+    this.open()
+    const leaseId = workspaceLeaseId(workflowId, nodeId, workspaceKey)
+    const revJson = encodeJson(baseRevision, 256 * 1024, 'lease.base_revision')
+    const attempt = (): { lease: WorkspaceLeaseV1; created: boolean } => this.db.transaction(() => {
+      const own = this.leaseRow(leaseId)
+      if (own && this.ACTIVE_LEASE.includes(own.status)) return { lease: this.toLease(own), created: false } // idempotent same-workflow retry
+      const other = this.activeLeaseRow(nodeId, workspaceKey)
+      if (other && other.workspace_lease_id !== leaseId) throw new WorkspaceLeaseError('workspace_lease_conflict', 'workspace is exclusively leased by another workflow')
+      const now = nowIso()
+      if (own) { // a released lease for THIS workflow → reactivate
+        this.db.prepare(`UPDATE workspace_leases SET status='active', acquired_at=?, release_requested_at=NULL, released_at=NULL, base_revision_json=?, current_revision_json=?, updated_at=? WHERE workspace_lease_id=?`).run(now, revJson, revJson, now, leaseId)
+      } else {
+        this.db.prepare(`INSERT INTO workspace_leases (workspace_lease_id,workflow_id,node_id,workspace_key,mode,status,acquired_at,base_revision_json,current_revision_json,created_at,updated_at) VALUES (?,?,?,?,'exclusive','active',?,?,?,?,?)`).run(leaseId, workflowId, nodeId, workspaceKey, now, revJson, revJson, now, now)
+      }
+      return { lease: this.toLease(this.leaseRow(leaseId)!), created: true }
+    })()
+    try { return attempt() }
+    catch (e) {
+      if (e instanceof WorkspaceLeaseError) throw e
+      // A concurrent cross-connection acquire won the partial-unique index → re-check.
+      if (isUniqueError(e)) { const other = this.activeLeaseRow(nodeId, workspaceKey); if (other && other.workspace_lease_id !== leaseId) throw new WorkspaceLeaseError('workspace_lease_conflict', 'workspace is exclusively leased by another workflow'); return attempt() }
+      throw e
+    }
+  }
+  getWorkspaceLease(leaseId: string): WorkspaceLeaseV1 | null { this.open(); const r = this.leaseRow(leaseId); return r ? this.toLease(r) : null }
+  getActiveWorkspaceLease(nodeId: string, workspaceKey: string): WorkspaceLeaseV1 | null { this.open(); const r = this.activeLeaseRow(nodeId, workspaceKey); return r ? this.toLease(r) : null }
+  releaseWorkspaceLease(leaseId: string): { lease: WorkspaceLeaseV1 } {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new WorkspaceLeaseError('workspace_lease_invalid', 'no such lease')
+      if (r.status === 'released') return { lease: this.toLease(r) } // idempotent
+      const now = nowIso()
+      this.db.prepare(`UPDATE workspace_leases SET status='released', released_at=?, updated_at=? WHERE workspace_lease_id=?`).run(now, now, leaseId)
+      return { lease: this.toLease(this.leaseRow(leaseId)!) }
+    })()
+  }
+  validateWorkspaceLeaseForRun(nodeId: string, workspaceKey: string, presentedLeaseId: string | null): void {
+    this.open()
+    const active = this.activeLeaseRow(nodeId, workspaceKey)
+    if (!active) return // unleased workspace → any run may proceed
+    if (!presentedLeaseId) throw new WorkspaceLeaseError('workspace_lease_conflict', 'workspace is leased; a run must present the matching lease')
+    if (presentedLeaseId !== active.workspace_lease_id) throw new WorkspaceLeaseError('workspace_lease_invalid', 'presented lease does not match the workspace lease')
+  }
+  recordWorkspaceRevision(leaseId: string, stepExecutionId: string | null, phase: string, revision: WorkspaceRevision): { observation_id: string } {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new WorkspaceLeaseError('workspace_lease_invalid', 'no such lease')
+      const revJson = encodeJson(revision, 256 * 1024, 'workspace_revision')
+      const observation_id = `wro_${crypto.randomBytes(9).toString('hex')}`
+      this.db.prepare(`INSERT INTO workspace_revisions (observation_id,workspace_lease_id,step_execution_id,phase,revision_json,created_at) VALUES (?,?,?,?,?,?)`).run(observation_id, leaseId, stepExecutionId, phase, revJson, nowIso())
+      this.db.prepare(`UPDATE workspace_leases SET current_revision_json=?, updated_at=? WHERE workspace_lease_id=?`).run(revJson, nowIso(), leaseId)
+      return { observation_id }
+    })()
   }
 
   // ── durable AgentTaskResult (immutable; never derived from run events) ───────
