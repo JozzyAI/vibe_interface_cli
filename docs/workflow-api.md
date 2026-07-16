@@ -2,8 +2,9 @@
 
 The durable [Workflow Runtime](./workflow-runtime.md) is exposed through the
 existing `vibe api serve` process as versioned REST routes under `/v1/workflows`,
-and through the existing `vibe mcp serve` adapter as seven MCP tools. This layer
-adds **lifecycle entry points only** (list, create, start, get, events, cancel) —
+and through the existing `vibe mcp serve` adapter as eleven MCP tools. This layer
+adds **lifecycle entry points only** (list, create, start, get, events, cancel,
+and the human-pause operations pending-request / answer / decision / resume) —
 it does **not** change Workflow Runtime semantics.
 
 Not in this layer: natural-language workflow generation, automatic start after
@@ -53,6 +54,10 @@ All routes require `Authorization: Bearer <token>`.
 | `POST /v1/workflows/:id/start` | `ready`→`running`; running coalesces; terminal returns unchanged; blocked → **409** conflict. A **workspace-bound** workflow with no lease authority is refused (**422** `workspace_lease_unsupported`); a workspace already held by another workflow → **409** `workspace_lease_conflict`. Returns the snapshot (does not wait) |
 | `GET /v1/workflows/:id/events` | SSE workflow events (see cursor semantics) |
 | `POST /v1/workflows/:id/cancel` | Idempotent durable cancellation → current snapshot |
+| `GET /v1/workflows/:id/pending-request` | The human pause request awaiting a response (`{ workflow_id, status, request }`; `request` is null when none) |
+| `POST /v1/workflows/:id/answer` | Answer an **input** pause `{ request_id, value }` — idempotent; a different value → **409**; unknown request → **404** |
+| `POST /v1/workflows/:id/decision` | Approve/reject an **approval** pause `{ request_id, approved }` — idempotent; a conflicting decision → **409**; reject → workflow `failed` |
+| `POST /v1/workflows/:id/resume` | Continue a paused workflow once answered/approved → current snapshot (idempotent) |
 
 **Summaries** and **snapshots** never include Gateway/relay tokens, encryption
 keys, native-agent credentials, backend PIDs, native-agent histories, raw logs, DB
@@ -140,7 +145,7 @@ Completed workflows remain queryable.
 
 ## MCP tools
 
-Seven workflow tools are added alongside the seven task tools (fourteen total; the
+Eleven workflow tools are added alongside the seven task tools (eighteen total; the
 task tools are unchanged): `vibe_list_workflows`, `vibe_create_workflow`,
 `vibe_start_workflow`, `vibe_get_workflow`, `vibe_get_workflow_events`,
 `vibe_wait_workflow`, `vibe_cancel_workflow`. See [`docs/mcp-server.md`](./mcp-server.md).

@@ -88,10 +88,11 @@ test('official MCP SDK client drives the real stdio server end to end', { timeou
   await client.ping() // must succeed
 
   const list = await client.listTools()
-  // Seven task tools + seven workflow tools (existing task tools unchanged).
+  // Seven task tools + eleven workflow tools (existing task tools unchanged).
   assert.deepEqual(list.tools.map((t) => t.name).sort(), [
-    'vibe_cancel_task', 'vibe_cancel_workflow', 'vibe_create_workflow', 'vibe_get_task', 'vibe_get_task_events',
-    'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_list_agents', 'vibe_list_workflows', 'vibe_run_task',
+    'vibe_answer_workflow_input', 'vibe_cancel_task', 'vibe_cancel_workflow', 'vibe_create_workflow', 'vibe_decide_workflow_approval',
+    'vibe_get_pending_request', 'vibe_get_task', 'vibe_get_task_events',
+    'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_list_agents', 'vibe_list_workflows', 'vibe_resume_workflow', 'vibe_run_task',
     'vibe_start_task', 'vibe_start_workflow', 'vibe_wait_task', 'vibe_wait_workflow',
   ])
   const cancel = list.tools.find((t) => t.name === 'vibe_cancel_task')!

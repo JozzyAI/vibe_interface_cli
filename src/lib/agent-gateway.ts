@@ -43,7 +43,7 @@ import { computeRequestFingerprint } from './request-fingerprint.js'
 import type { GatewayTaskStore, ControlStore } from '../control/store.js'
 import { ControlStoreError, type CreateTaskInput, type TaskEventInput, type TaskRecord } from '../control/records.js'
 import { validateTaskResult, type AgentTaskResultV1, type TaskResultStatus } from './agent-task-result.js'
-import { listWorkflowsController, createWorkflowController, startWorkflowController, getWorkflowController, cancelWorkflowController } from '../workflow/api.js'
+import { listWorkflowsController, createWorkflowController, startWorkflowController, getWorkflowController, cancelWorkflowController, getPendingRequestController, answerInputController, decideApprovalController, resumeWorkflowController } from '../workflow/api.js'
 import { streamWorkflowEvents } from '../workflow/event-stream.js'
 import { workflowApiError } from '../workflow/api-contract.js'
 
@@ -1165,6 +1165,27 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
       if (method !== 'POST') return methodNotAllowed(res, ['POST'])
       if (!runtime) return wfUnavailable(res)
       const r = await cancelWorkflowController(runtime, controlStore, id); return sendJson(res, r.status, r.body)
+    }
+    // ── human pause / approval sub-resources ──
+    if (parts.length === 4 && parts[3] === 'pending-request') {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+      if (!runtime) return wfUnavailable(res)
+      const r = await getPendingRequestController(runtime, controlStore, id); return sendJson(res, r.status, r.body)
+    }
+    if (parts.length === 4 && (parts[3] === 'answer' || parts[3] === 'decision')) {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (!runtime) return wfUnavailable(res)
+      const body = await readBody(req, MAX_BODY_BYTES)
+      if (!body.ok) return sendError(res, apiError('invalid_request', `request body exceeds ${MAX_BODY_BYTES} bytes`), 413)
+      let parsed: unknown
+      try { parsed = JSON.parse(body.text) } catch { return sendJson(res, 400, workflowApiError('invalid_request', 'malformed JSON body')) }
+      const r = parts[3] === 'answer' ? await answerInputController(runtime, controlStore, id, parsed) : await decideApprovalController(runtime, controlStore, id, parsed)
+      return sendJson(res, r.status, r.body)
+    }
+    if (parts.length === 4 && parts[3] === 'resume') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (!runtime) return wfUnavailable(res)
+      const r = await resumeWorkflowController(runtime, controlStore, id); return sendJson(res, r.status, r.body)
     }
     return sendError(res, apiError('task_not_found', 'not found'), 404)
   }

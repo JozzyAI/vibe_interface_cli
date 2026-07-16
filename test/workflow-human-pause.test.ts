@@ -304,6 +304,44 @@ test('binding 5: approval pauses inject nothing (execution gate only) and a reje
   })
 })
 
+test('transition: a PENDING request cannot resume (resume before answer is a no-op; stays waiting, no task)', async () => {
+  await withStore(async (store) => {
+    const fake = new ScriptedFake(store, doneScript)
+    const rt = mkRt(store, fake)
+    const workflowId = (await rt.createWorkflow(pausedSpec('input'), { objective: 'x' })).workflow_id
+    await rt.startWorkflow(workflowId)
+    for (let i = 0; i < 20 && (await store.getWorkflow(workflowId))!.status !== 'waiting_input'; i++) await sleep(20)
+    // resume WITHOUT answering → no-op; the workflow stays waiting and starts no task
+    await rt.resumeWorkflow(workflowId)
+    await rt.resumeWorkflow(workflowId)
+    await sleep(60)
+    assert.equal((await store.getWorkflow(workflowId))!.status, 'waiting_input', 'still waiting (pending cannot resume)')
+    assert.equal(fake.creates.length, 0, 'no Agent Task created')
+    assert.equal((await rt.getPendingRequest(workflowId))!.status, 'pending')
+  })
+})
+
+test('transition: a REJECTED approval cannot resume (terminal wins; no task)', async () => {
+  await withStore(async (store) => {
+    const fake = new ScriptedFake(store, doneScript)
+    const rt = mkRt(store, fake)
+    const workflowId = (await rt.createWorkflow(pausedSpec('approval'), { objective: 'x' })).workflow_id
+    await rt.startWorkflow(workflowId)
+    for (let i = 0; i < 20 && (await store.getWorkflow(workflowId))!.status !== 'waiting_approval'; i++) await sleep(20)
+    await rt.decideApproval(humanRequestId(gateExecId(workflowId)), false)
+    assert.equal((await store.getWorkflow(workflowId))!.status, 'failed')
+    // resume on a rejected (failed) workflow is a no-op — it stays failed, no task
+    await rt.resumeWorkflow(workflowId)
+    await rt.resumeWorkflow(workflowId)
+    await sleep(40)
+    assert.equal((await store.getWorkflow(workflowId))!.status, 'failed', 'rejection is terminal; resume cannot revive it')
+    assert.equal(fake.creates.length, 0)
+    // completion/terminal event exactly once
+    const evs = (await store.listWorkflowEvents(workflowId)).map((e) => e.event_type)
+    assert.equal(evs.filter((e) => e === 'workflow.failed').length, 1)
+  })
+})
+
 test('resume after restart re-drives without duplicating the Agent Task; started_at is preserved', async () => {
   const db = tmpDb()
   let workflowId = ''; let startedAt = ''

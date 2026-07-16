@@ -10,11 +10,12 @@
 import { ControlStoreError } from '../control/records.js'
 import { WorkflowRuntimeError } from './errors.js'
 import { validateWorkflowSpec, type ValidationIssue } from './validator.js'
-import type { WorkflowRecord, StepExecutionRecord, WorkflowEventRecord, WorkflowWorkspaceLeaseRecord } from '../control/records.js'
+import type { WorkflowRecord, StepExecutionRecord, WorkflowEventRecord, WorkflowWorkspaceLeaseRecord, WorkflowHumanRequestRecord } from '../control/records.js'
 
 export type WorkflowApiErrorCode =
   | 'invalid_request'
   | 'workflow_not_found'
+  | 'human_request_not_found'
   | 'invalid_workflow_spec'
   | 'invalid_workflow_inputs'
   | 'workflow_state_conflict'
@@ -37,6 +38,7 @@ export interface WorkflowApiError {
 const RETRYABLE: Record<WorkflowApiErrorCode, boolean> = {
   invalid_request: false,
   workflow_not_found: false,
+  human_request_not_found: false,
   invalid_workflow_spec: false,
   invalid_workflow_inputs: false,
   workflow_state_conflict: false,
@@ -58,6 +60,7 @@ export function workflowErrorHttpStatus(code: WorkflowApiErrorCode): number {
     case 'invalid_workflow_spec': return 400
     case 'invalid_workflow_inputs': return 400
     case 'workflow_not_found': return 404
+    case 'human_request_not_found': return 404
     case 'workflow_state_conflict': return 409
     case 'workspace_lease_conflict': return 409
     case 'workspace_lease_unsupported': return 422
@@ -120,6 +123,42 @@ export function parseCreateWorkflowBody(body: unknown): { ok: true; value: Creat
   if (b.input_values !== undefined && (typeof b.input_values !== 'object' || b.input_values === null || Array.isArray(b.input_values))) return { ok: false, error: workflowApiError('invalid_request', '`input_values` must be an object') }
   for (const k of Object.keys(b)) if (k !== 'spec' && k !== 'input_values') return { ok: false, error: workflowApiError('invalid_request', `unknown field: ${k}`) }
   return { ok: true, value: { spec: b.spec, input_values: b.input_values as Record<string, unknown> | undefined } }
+}
+
+// ── human pause request projection + response bodies ─────────────────────────────
+
+/** Bounded, safe projection of a durable human pause request. `response_value` is the
+ *  human's own submitted input — never a token/credential. */
+export interface HumanRequestView {
+  request_id: string; workflow_id: string; step_execution_id: string
+  kind: string; prompt: string; choices: string[] | null; status: string
+  response_value: string | null; created_at: string; responded_at: string | null
+}
+export function toHumanRequestView(r: WorkflowHumanRequestRecord): HumanRequestView {
+  return { request_id: r.request_id, workflow_id: r.workflow_id, step_execution_id: r.step_execution_id, kind: r.kind, prompt: r.prompt, choices: r.choices, status: r.status, response_value: r.response_value, created_at: r.created_at, responded_at: r.responded_at }
+}
+
+const SAFE_REQUEST_ID_RE = /^hr_[0-9a-f]{32}$/
+const MAX_ANSWER_BYTES = 8192
+
+/** Validate an answer-input body `{ request_id, value }`. */
+export function parseAnswerBody(body: unknown): { ok: true; value: { request_id: string; value: string } } | { ok: false; error: WorkflowApiError } {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { ok: false, error: workflowApiError('invalid_request', 'request body must be a JSON object') }
+  const b = body as Record<string, unknown>
+  if (typeof b.request_id !== 'string' || !SAFE_REQUEST_ID_RE.test(b.request_id)) return { ok: false, error: workflowApiError('invalid_request', '`request_id` must be a valid human-request id') }
+  if (typeof b.value !== 'string' || b.value.length === 0 || Buffer.byteLength(b.value, 'utf8') > MAX_ANSWER_BYTES) return { ok: false, error: workflowApiError('invalid_request', `\`value\` must be a non-empty string ≤ ${MAX_ANSWER_BYTES} bytes`) }
+  for (const k of Object.keys(b)) if (k !== 'request_id' && k !== 'value') return { ok: false, error: workflowApiError('invalid_request', `unknown field: ${k}`) }
+  return { ok: true, value: { request_id: b.request_id, value: b.value } }
+}
+
+/** Validate an approval-decision body `{ request_id, approved }`. */
+export function parseDecisionBody(body: unknown): { ok: true; value: { request_id: string; approved: boolean } } | { ok: false; error: WorkflowApiError } {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { ok: false, error: workflowApiError('invalid_request', 'request body must be a JSON object') }
+  const b = body as Record<string, unknown>
+  if (typeof b.request_id !== 'string' || !SAFE_REQUEST_ID_RE.test(b.request_id)) return { ok: false, error: workflowApiError('invalid_request', '`request_id` must be a valid human-request id') }
+  if (typeof b.approved !== 'boolean') return { ok: false, error: workflowApiError('invalid_request', '`approved` must be a boolean') }
+  for (const k of Object.keys(b)) if (k !== 'request_id' && k !== 'approved') return { ok: false, error: workflowApiError('invalid_request', `unknown field: ${k}`) }
+  return { ok: true, value: { request_id: b.request_id, approved: b.approved } }
 }
 
 /** Rich, sanitized 400 for a spec that fails validation (issue code/severity/

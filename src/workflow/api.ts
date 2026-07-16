@@ -14,6 +14,7 @@ import type { WorkflowRuntime } from './runtime.js'
 import {
   workflowApiError, mapThrownError, parseCreateWorkflowBody, preflightSpec, parseListQuery,
   toWorkflowSummary, toWorkflowSnapshotView, reasonFromEvents,
+  toHumanRequestView, parseAnswerBody, parseDecisionBody,
 } from './api-contract.js'
 
 export interface ControllerResult { status: number; body: unknown }
@@ -82,6 +83,49 @@ export async function cancelWorkflowController(runtime: WorkflowRuntime, store: 
     const view = await buildSnapshotView(store, workflowId)
     return { status: 200, body: view }
   } catch (err) { const m = mapThrownError(err); return { status: m.status, body: m.error } }
+}
+
+// ── human pause / approval operations ────────────────────────────────────────────
+
+/** GET the request currently AWAITING a human (or `{ request: null }` when none). */
+export async function getPendingRequestController(runtime: WorkflowRuntime, store: ControlStore, workflowId: string): Promise<ControllerResult> {
+  const rec = await store.getWorkflow(workflowId)
+  if (!rec) return { status: 404, body: workflowApiError('workflow_not_found', `no such workflow: ${workflowId}`) }
+  try { const req = await runtime.getPendingRequest(workflowId); return { status: 200, body: { workflow_id: workflowId, status: rec.status, request: req ? toHumanRequestView(req) : null } } }
+  catch (err) { const m = mapThrownError(err); return { status: m.status, body: m.error } }
+}
+
+/** Fetch a request and confirm it belongs to this workflow (else a sanitized 404). */
+async function requireRequest(store: ControlStore, workflowId: string, requestId: string): Promise<{ ok: true } | { ok: false; result: ControllerResult }> {
+  const rec = await store.getWorkflow(workflowId)
+  if (!rec) return { ok: false, result: { status: 404, body: workflowApiError('workflow_not_found', `no such workflow: ${workflowId}`) } }
+  const existing = await store.getHumanRequest(requestId)
+  if (!existing || existing.workflow_id !== workflowId) return { ok: false, result: { status: 404, body: workflowApiError('human_request_not_found', 'no such pending request for this workflow') } }
+  return { ok: true }
+}
+
+/** POST an input answer `{ request_id, value }` (idempotent; conflict → 409). */
+export async function answerInputController(runtime: WorkflowRuntime, store: ControlStore, workflowId: string, body: unknown): Promise<ControllerResult> {
+  const p = parseAnswerBody(body); if (!p.ok) return { status: 400, body: p.error }
+  const guard = await requireRequest(store, workflowId, p.value.request_id); if (!guard.ok) return guard.result
+  try { const r = await runtime.answerInput(p.value.request_id, p.value.value); return { status: 200, body: toHumanRequestView(r) } }
+  catch (err) { const m = mapThrownError(err); return { status: m.status, body: m.error } }
+}
+
+/** POST an approval decision `{ request_id, approved }` (idempotent; conflict → 409). */
+export async function decideApprovalController(runtime: WorkflowRuntime, store: ControlStore, workflowId: string, body: unknown): Promise<ControllerResult> {
+  const p = parseDecisionBody(body); if (!p.ok) return { status: 400, body: p.error }
+  const guard = await requireRequest(store, workflowId, p.value.request_id); if (!guard.ok) return guard.result
+  try { const r = await runtime.decideApproval(p.value.request_id, p.value.approved); return { status: 200, body: toHumanRequestView(r) } }
+  catch (err) { const m = mapThrownError(err); return { status: m.status, body: m.error } }
+}
+
+/** POST resume: continue a paused workflow from its checkpoint (idempotent). */
+export async function resumeWorkflowController(runtime: WorkflowRuntime, store: ControlStore, workflowId: string): Promise<ControllerResult> {
+  const rec = await store.getWorkflow(workflowId)
+  if (!rec) return { status: 404, body: workflowApiError('workflow_not_found', `no such workflow: ${workflowId}`) }
+  try { await runtime.resumeWorkflow(workflowId); return { status: 200, body: await buildSnapshotView(store, workflowId) } }
+  catch (err) { const m = mapThrownError(err); return { status: m.status, body: m.error } }
 }
 
 /** The runtime exposes its snapshot via getWorkflowSnapshot; project it fully. */

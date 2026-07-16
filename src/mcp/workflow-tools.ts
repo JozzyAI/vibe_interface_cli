@@ -162,5 +162,46 @@ export function createWorkflowTools(client: GatewayClient): ToolDef[] {
         try { return ok(await client.cancelWorkflow(id.value)) } catch (e) { return fromGatewayError(e) }
       },
     },
+    {
+      name: 'vibe_get_pending_request',
+      description: 'Get the human pause request (input/approval) currently AWAITING a response for a workflow, or null when none is pending. A waiting_input/waiting_approval workflow runs no Agent Task until answered/approved. Returns { workflow_id, status, request }.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['workflow_id'], properties: { workflow_id: { type: 'string' } } },
+      annotations: { readOnlyHint: true },
+      handler: async (args) => {
+        const id = reqString(args, 'workflow_id'); if (!id.ok) return id.err
+        try { return ok(await client.getPendingRequest(id.value)) } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_answer_workflow_input',
+      description: 'Submit a durable answer to a workflow\'s pending INPUT pause. Idempotent (the same value is a no-op); a DIFFERENT value for the same request fails closed with a conflict. This records the response only — call vibe_resume_workflow to continue. The value is captured for the paused step (available to its prompt via {{ pause.response }}).',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['workflow_id', 'request_id', 'value'], properties: { workflow_id: { type: 'string' }, request_id: { type: 'string' }, value: { type: 'string', description: 'the human-entered value (bounded)' } } },
+      handler: async (args) => {
+        const id = reqString(args, 'workflow_id'); if (!id.ok) return id.err
+        const rid = reqString(args, 'request_id'); if (!rid.ok) return rid.err
+        const val = reqString(args, 'value'); if (!val.ok) return val.err
+        try { return ok({ request: await client.answerWorkflowInput(id.value, { request_id: rid.value, value: val.value }), next: { tool: 'vibe_resume_workflow', arguments: { workflow_id: id.value } } }) } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_decide_workflow_approval',
+      description: 'Approve or reject a workflow\'s pending APPROVAL pause. Idempotent (repeating the same decision is a no-op); a conflicting later decision fails closed. Approve records the decision (call vibe_resume_workflow to continue); REJECT is definitive — it fails the workflow (documented policy) and releases its workspace leases.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['workflow_id', 'request_id', 'approved'], properties: { workflow_id: { type: 'string' }, request_id: { type: 'string' }, approved: { type: 'boolean', description: 'true to approve (continue), false to reject (fail the workflow)' } } },
+      handler: async (args) => {
+        const id = reqString(args, 'workflow_id'); if (!id.ok) return id.err
+        const rid = reqString(args, 'request_id'); if (!rid.ok) return rid.err
+        if (typeof args.approved !== 'boolean') return toolError('invalid_request', '`approved` is required (boolean)')
+        try { const request = await client.decideWorkflowApproval(id.value, { request_id: rid.value, approved: args.approved }); return ok({ request, ...(args.approved ? { next: { tool: 'vibe_resume_workflow', arguments: { workflow_id: id.value } } } : {}) }) } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_resume_workflow',
+      description: 'Continue a paused workflow from its durable checkpoint once its pending request has been answered/approved: transitions waiting_input/waiting_approval → running and re-drives the SAME step (no duplicate step or Agent Task). Idempotent; a still-pending request or a terminal workflow is a safe no-op. Returns the durable snapshot.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['workflow_id'], properties: { workflow_id: { type: 'string' } } },
+      handler: async (args) => {
+        const id = reqString(args, 'workflow_id'); if (!id.ok) return id.err
+        try { return ok({ workflow: await client.resumeWorkflow(id.value), next: { tool: 'vibe_wait_workflow', arguments: { workflow_id: id.value } } }) } catch (e) { return fromGatewayError(e) }
+      },
+    },
   ]
 }

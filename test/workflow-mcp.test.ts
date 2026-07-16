@@ -68,13 +68,72 @@ let rpcId = 1
 const call = (mcp: McpServer, name: string, args: Record<string, unknown> = {}) => mcp.handle({ jsonrpc: '2.0', id: rpcId++, method: 'tools/call', params: { name, arguments: args } })
 const sc = (r: any) => r.result.structuredContent
 
-test('MCP: tools/list exposes the seven task tools plus the seven workflow tools', async () => {
+test('MCP: tools/list exposes the seven task tools plus the eleven workflow tools', async () => {
   await withMcp((s) => new Fake(s, acceptanceScript), async ({ mcp }) => {
     const list = await mcp.handle({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
     const names = ((list as any).result.tools as Array<{ name: string }>).map((t) => t.name).sort()
-    assert.equal(names.length, 14)
-    for (const n of ['vibe_list_workflows', 'vibe_create_workflow', 'vibe_start_workflow', 'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_wait_workflow', 'vibe_cancel_workflow']) assert.ok(names.includes(n), `has ${n}`)
+    assert.equal(names.length, 18)
+    for (const n of ['vibe_list_workflows', 'vibe_create_workflow', 'vibe_start_workflow', 'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_wait_workflow', 'vibe_cancel_workflow', 'vibe_get_pending_request', 'vibe_answer_workflow_input', 'vibe_decide_workflow_approval', 'vibe_resume_workflow']) assert.ok(names.includes(n), `has ${n}`)
     for (const n of ['vibe_start_task', 'vibe_run_task', 'vibe_get_task', 'vibe_get_task_events', 'vibe_wait_task', 'vibe_cancel_task', 'vibe_list_agents']) assert.ok(names.includes(n), `retains ${n}`)
+  })
+})
+
+/** A spec with an input/approval pause gate on its first step, then finish. */
+const pauseSpec = (kind: 'input' | 'approval') => ({
+  version: '1', name: `pause-${kind}`, entry_step: 'gate', inputs: { objective: { type: 'string', required: true } },
+  agents: { solo: { agent: 'mock' } }, output_schemas: { o: { fields: { status: { type: 'enum', required: true, enum: ['done'] }, summary: { type: 'string', required: true } } } },
+  limits: { max_tasks: 5, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 2 },
+  steps: [
+    { id: 'gate', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do {{ inputs.objective }}', output_schema: 'o', pause_before: { kind, prompt: kind === 'input' ? 'Enter' : 'Approve?' } },
+    { id: 'finish', type: 'agent_task', agent_role: 'solo', prompt_template: 'Finish', output_schema: 'o' },
+  ],
+  edges: [
+    { from: 'gate', to: 'finish', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
+    { from: 'finish', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
+  ],
+})
+const waitWfStatus = async (mcp: any, id: string, want: string[], ms = 8000) => {
+  const end = Date.now() + ms
+  while (Date.now() < end) { const s = sc(await call(mcp, 'vibe_get_workflow', { workflow_id: id })).status; if (want.includes(s)) return s; await sleep(40) }
+  throw new Error(`workflow ${id} did not reach ${want}`)
+}
+
+test('MCP input pause: get_pending_request → answer → resume → completes', async () => {
+  await withMcp((s) => new Fake(s, () => ({ output: { status: 'done', summary: 'ok' } })), async ({ mcp }) => {
+    const id = sc(await call(mcp, 'vibe_create_workflow', { spec: pauseSpec('input'), input_values: { objective: 'x' } })).workflow.workflow_id
+    await call(mcp, 'vibe_start_workflow', { workflow_id: id })
+    await waitWfStatus(mcp, id, ['waiting_input'])
+    const pending = sc(await call(mcp, 'vibe_get_pending_request', { workflow_id: id }))
+    assert.equal(pending.request.kind, 'input'); assert.equal(pending.request.status, 'pending')
+    const requestId = pending.request.request_id
+    const answered = sc(await call(mcp, 'vibe_answer_workflow_input', { workflow_id: id, request_id: requestId, value: 'v' }))
+    assert.equal(answered.request.status, 'answered')
+    await call(mcp, 'vibe_resume_workflow', { workflow_id: id })
+    assert.equal(await waitWfStatus(mcp, id, ['completed']), 'completed')
+    // a conflicting answer fails closed (structured error)
+    const bad = await call(mcp, 'vibe_answer_workflow_input', { workflow_id: id, request_id: requestId, value: 'other' })
+    assert.equal((bad as any).result.isError, true)
+  })
+})
+
+test('MCP approval pause: reject fails the workflow (structured), approve+resume completes', async () => {
+  await withMcp((s) => new Fake(s, () => ({ output: { status: 'done', summary: 'ok' } })), async ({ mcp }) => {
+    // reject
+    const idR = sc(await call(mcp, 'vibe_create_workflow', { spec: pauseSpec('approval'), input_values: { objective: 'x' } })).workflow.workflow_id
+    await call(mcp, 'vibe_start_workflow', { workflow_id: idR })
+    await waitWfStatus(mcp, idR, ['waiting_approval'])
+    const reqR = sc(await call(mcp, 'vibe_get_pending_request', { workflow_id: idR })).request.request_id
+    const rej = sc(await call(mcp, 'vibe_decide_workflow_approval', { workflow_id: idR, request_id: reqR, approved: false }))
+    assert.equal(rej.request.status, 'rejected')
+    assert.equal(sc(await call(mcp, 'vibe_get_workflow', { workflow_id: idR })).status, 'failed')
+    // approve
+    const idA = sc(await call(mcp, 'vibe_create_workflow', { spec: pauseSpec('approval'), input_values: { objective: 'x' } })).workflow.workflow_id
+    await call(mcp, 'vibe_start_workflow', { workflow_id: idA })
+    await waitWfStatus(mcp, idA, ['waiting_approval'])
+    const reqA = sc(await call(mcp, 'vibe_get_pending_request', { workflow_id: idA })).request.request_id
+    await call(mcp, 'vibe_decide_workflow_approval', { workflow_id: idA, request_id: reqA, approved: true })
+    await call(mcp, 'vibe_resume_workflow', { workflow_id: idA })
+    assert.equal(await waitWfStatus(mcp, idA, ['completed']), 'completed')
   })
 })
 
