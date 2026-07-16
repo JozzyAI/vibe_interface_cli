@@ -9,7 +9,11 @@ import type { AgentAdapter, AgentAdapterContext, AgentOutcome } from '../types.j
 
 interface ClaudeStreamEvent {
   type: string
+  subtype?: string
   session_id?: string
+  /** Claude Code stream-json emits a terminal `type:"result"` message whose
+   *  `result` field is the AUTHORITATIVE final assistant answer. */
+  result?: string
   message?: {
     content?: Array<{ type: string; text?: string; name?: string; input?: unknown }>
   }
@@ -19,6 +23,9 @@ function handleLine(line: string, emit: EmitHelpers): void {
   try {
     const msg = JSON.parse(line) as ClaudeStreamEvent
     if (msg.type === 'system' && msg.session_id) emit.setSession(msg.session_id)
+    // Authoritative final output: the dedicated terminal `result` message (not the
+    // concatenation of intermediate assistant text, and never the event log).
+    if (msg.type === 'result' && typeof msg.result === 'string') emit.setFinal(msg.result)
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.type === 'text' && block.text) {
@@ -48,6 +55,8 @@ export const claudeAdapter: AgentAdapter = {
         return args
       },
       onStdoutLine: handleLine,
+      // Claude Code has a dedicated final-result message → explicit capture.
+      finalOutputStrategy: 'explicit',
     })
   },
 }

@@ -199,6 +199,9 @@ class ThrowingStore implements GatewayTaskStore {
   appendTaskEventDurable(id: string, e: TaskEventInput) { if (e.event_type === this.throwOn) throw new Error('injected persistence failure'); return this.inner.appendTaskEventDurable(id, e) }
   updateTaskDurable(id: string, r: number, p: TaskPatch) { return this.inner.updateTaskDurable(id, r, p) }
   terminalizeTaskDurable(id: string, r: number, p: TaskPatch, e: TaskEventInput) { return this.inner.terminalizeTaskDurable(id, r, p, e) }
+  terminalizeTaskWithResultDurable(id: string, r: number, p: TaskPatch, e: TaskEventInput, rs: string, res: Parameters<GatewayTaskStore['terminalizeTaskWithResultDurable']>[5]) { return this.inner.terminalizeTaskWithResultDurable(id, r, p, e, rs, res) }
+  persistTaskResultDurable(id: string, rs: string, res: Parameters<GatewayTaskStore['persistTaskResultDurable']>[2]) { return this.inner.persistTaskResultDurable(id, rs, res) }
+  getTaskResultDurable(id: string) { return this.inner.getTaskResultDurable(id) }
   getTaskRecord(id: string) { return this.inner.getTaskRecord(id) }
   listNonTerminalTasks() { return this.inner.listNonTerminalTasks() }
   loadTaskEvents(id: string) { return this.inner.loadTaskEvents(id) }

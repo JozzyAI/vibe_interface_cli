@@ -48,6 +48,20 @@ export interface GatewayTaskStore {
   updateTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch): TaskRecord
   /** Atomically persist terminal status + exactly one terminal event. */
   terminalizeTaskDurable(taskId: string, expectedRevision: number, patch: TaskPatch, terminalEvent: TaskEventInput): TaskRecord
+  /**
+   * Atomically persist the durable AgentTaskResult, the terminal task status, and
+   * exactly one terminal event — the ordering guarantee that a terminal task never
+   * loses its final output. Idempotent: a re-run with the same result is a no-op;
+   * a CONFLICTING result content is `result_conflict`. The result is NEVER derived
+   * from event history. `result` is null when `resultStatus` is 'missing'/'invalid'.
+   */
+  terminalizeTaskWithResultDurable(taskId: string, expectedRevision: number, patch: TaskPatch, terminalEvent: TaskEventInput, resultStatus: string, result: import('../lib/agent-task-result.js').AgentTaskResultV1 | null): TaskRecord
+  /** Persist/overwrite the durable task result idempotently (create-or-return by
+   *  content). Exact duplicate → applied:false; conflicting content → result_conflict.
+   *  Also updates the `tasks.result_status` projection. */
+  persistTaskResultDurable(taskId: string, resultStatus: string, result: import('../lib/agent-task-result.js').AgentTaskResultV1 | null): { applied: boolean }
+  /** Read the durable task result (revalidated on read; malformed → corruption). */
+  getTaskResultDurable(taskId: string): import('./records.js').TaskResultRecord | null
   getTaskRecord(taskId: string): TaskRecord | null
   /** Non-terminal persisted tasks (for restart recovery). */
   listNonTerminalTasks(): TaskRecord[]

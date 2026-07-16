@@ -21,6 +21,7 @@ export type ControlStoreErrorCode =
   | 'forbidden_field'
   | 'unsupported_schema_version'
   | 'idempotency_conflict'
+  | 'result_conflict'
   | 'closed'
 
 /** Structured store error. `code` is stable; `message` never echoes payloads. */
@@ -87,6 +88,17 @@ export interface TaskRecord {
    *  itself; never the raw prompt). Detects a same-key request whose meaning
    *  changed. */
   request_fingerprint: string | null
+  /** Bounded projection of the durable AgentTaskResult status (NULL until the
+   *  backend terminalizes; then 'available' | 'missing' | 'invalid'). */
+  result_status: string | null
+}
+
+/** A durable task result row (the authoritative control result, keyed by the
+ *  PUBLIC task_id). `result` is the validated envelope when status is 'available'. */
+export interface TaskResultRecord {
+  task_id: string
+  result_status: string
+  result: import('../lib/agent-task-result.js').AgentTaskResultV1 | null
 }
 
 /** Stable reason codes for an incomplete persisted event history. */

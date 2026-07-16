@@ -324,6 +324,26 @@ export interface RunStatusAckMsg extends RelayMsgBase {
   code?: string
 }
 
+/** run_result_v1: fetch the authoritative AgentTaskResult by exact remote_run_id. */
+export interface RunResultRequestMsg extends RelayMsgBase {
+  type: 'run_result_request'
+  req_id: string
+  run_id: string
+}
+export interface RunResultAckMsg extends RelayMsgBase {
+  type: 'run_result_ack'
+  req_id: string
+  run_id: string
+  ok: boolean
+  result_status?: string
+  /** ENCRYPTED result envelope for an encrypted run (relay never sees plaintext). */
+  encrypted?: { nonce: string; ciphertext: string }
+  /** Plaintext result envelope — ONLY for an unencrypted run. */
+  result?: import('../lib/agent-task-result.js').AgentTaskResultV1
+  error?: string
+  code?: string
+}
+
 // ── relay → client ─────────────────────────────────────────────────────────
 
 export interface NodeRegisterAckMsg extends RelayMsgBase {
@@ -455,6 +475,7 @@ export type RelayMessage =
   | RunStartMsg
   | RunStopRequestMsg
   | RunStatusRequestMsg
+  | RunResultRequestMsg
   | RunEventMsg
   | RunReplayOpenMsg
   | RunReplayCloseMsg
@@ -467,6 +488,7 @@ export type RelayMessage =
   | RunStreamSubscribeAckMsg
   | RunStopAckMsg
   | RunStatusAckMsg
+  | RunResultAckMsg
   | TerminalOpenMsg
   | TerminalOpenAckMsg
   | TerminalInputMsg

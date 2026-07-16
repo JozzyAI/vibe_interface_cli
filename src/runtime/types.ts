@@ -91,6 +91,15 @@ export interface AgentOutcome {
   tailOutput?: string
   /** Process/adapter exit status, when the adapter has one (e.g. a spawned CLI's real exit code, or a mock's simulated one). Projected onto the run record's `exit_code` on the terminal outcome. */
   exitCode?: number
+  /**
+   * The provider's AUTHORITATIVE final output text, captured through the adapter's
+   * OWN completion path (e.g. Claude's stream-json `result` message) — NOT by
+   * scanning the persisted event history. `undefined` means the backend produced
+   * no authoritative final result (→ result_status = `missing`). The provider layer
+   * never parses workflow schemas (planner_decision/executor_handoff); it supplies
+   * only generic final text. Bounded by the supervisor before persistence.
+   */
+  finalOutput?: string
 }
 
 export interface AgentAdapterContext {

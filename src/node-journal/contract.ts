@@ -28,6 +28,9 @@
 /** Advertised Node capability: a client that sees this may send `after_sequence`
  *  and expect journaled replay. Absence ⇒ replay unavailable (live stream only). */
 export const RUN_EVENT_REPLAY_CAPABILITY = 'run_event_replay_v1'
+/** Advertised when durable run-result storage is available: the node can serve the
+ *  authoritative AgentTaskResult by exact remote_run_id (encrypted end-to-end). */
+export const RUN_RESULT_CAPABILITY = 'run_result_v1'
 
 /** Journal DB schema version (bumped for incompatible schema changes). */
 export const JOURNAL_SCHEMA_VERSION = 1
@@ -59,6 +62,7 @@ export type JournalErrorCode =
   | 'too_large'
   | 'events_per_run_exceeded'
   | 'unsupported_schema_version'
+  | 'result_conflict'
   | 'closed'
   | 'subscriber_overflow'
 

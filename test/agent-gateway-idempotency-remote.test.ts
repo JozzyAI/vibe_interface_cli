@@ -109,9 +109,12 @@ test('remote idempotent create: lost-response retry + restart retry return the s
     assert.equal(conflict.status, 409); assert.equal(conflict.body.code, 'idempotency_conflict')
     assert.ok(!JSON.stringify(conflict.body).includes('different prompt'))
 
-    // 12) terminal history remains exactly once
+    // 12) terminal history remains exactly once. The Gateway now resolves the
+    // authoritative AgentTaskResult (run_result_v1) BEFORE publishing the terminal,
+    // so the durable terminal lags the authoritative status slightly — wait for it.
     const done = await waitStatus(gw.port, id, 'completed')
     assert.equal(done.status, 'completed')
+    for (let i = 0; i < 40 && store.getTaskRecord(id)?.terminal_event_recorded !== true; i++) await delay(150)
     const terminals = store.loadTaskEvents(id).filter((e) => ['task.completed', 'task.failed', 'task.cancelled'].includes(e.event_type))
     assert.equal(terminals.length, 1, 'exactly one terminal event')
     // a post-terminal retry still returns the same task, no new run

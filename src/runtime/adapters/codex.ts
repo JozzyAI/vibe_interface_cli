@@ -19,15 +19,23 @@ export const codexAdapter: AgentAdapter = {
     return execAgent(record, ctx, {
       binary: 'codex',
       label: 'codex',
-      buildArgs: (rec) => {
+      buildArgs: (rec, ctx) => {
         // --skip-git-repo-check: workspace may not be a git repo (no repo_url).
         const args = ['exec', '--skip-git-repo-check']
         if (rec.permission_mode === 'unsafe-skip') args.push('--dangerously-bypass-approvals-and-sandbox')
+        // Codex `exec` stdout MIXES reasoning/progress with the final answer, so it
+        // is NOT an authoritative result channel. `--output-last-message` writes ONLY
+        // the agent's final message to a dedicated file — the authoritative final
+        // output, isolated from mixed stdout. (Verified against codex-cli 0.139.0.)
+        if (ctx.finalOutputFile) args.push('--output-last-message', ctx.finalOutputFile)
         args.push('--cd', rec.workspace_path)
         args.push('-') // read prompt from stdin
         return args
       },
       onStdoutLine: handleLine,
+      // Authoritative final output = codex's dedicated final-message file (never the
+      // mixed stdout stream, never a heuristic scrape). Empty → result_status missing.
+      finalOutputStrategy: 'last-message-file',
     })
   },
 }

@@ -20,11 +20,12 @@ import {
   type TaskRecord, type CreateTaskInput, type TaskPatch, type TaskEventInput, type TaskEventRecord,
   type WorkflowRecord, type CreateWorkflowInput, type WorkflowPatch, type StepExecutionRecord,
   type CreateStepExecutionInput, type StepExecutionPatch, type WorkflowEventInput, type WorkflowEventRecord,
-  type WorkflowSnapshot,
+  type WorkflowSnapshot, type TaskResultRecord,
 } from './records.js'
 import {
   SIZE_LIMITS, nowIso, isIsoUtc, encodeJson, boundString, decodeJson, assertValidContext, assertNoForbiddenFields,
 } from './serialization.js'
+import { validateTaskResult, MAX_FINAL_OUTPUT_BYTES, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
 import type { ControlStore, GatewayTaskStore, IngestSourceEvent, WorkflowEventDraft, Pagination, TaskFilters, WorkflowFilters, HealthCheck, CleanupResult } from './store.js'
 
 export interface OpenControlStoreOptions {
@@ -118,6 +119,73 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
       return this.toTask(this.taskRow(taskId)!)
     })()
   }
+  // ── durable AgentTaskResult (authoritative control result; never event-derived) ──
+  private taskResultRow(taskId: string): TaskResultRow | undefined { return this.db.prepare('SELECT * FROM task_results WHERE task_id = ?').get(taskId) as TaskResultRow | undefined }
+  /** Idempotent-duplicate check over the COMPLETE normalized immutable envelope
+   *  (schema_version, final_output, process_exit_code, content_hash, evidence_refs,
+   *  artifact_refs) — NOT merely content_hash. finalized_at is excluded from equality
+   *  (the first durable finalization's timestamp is preserved), so a re-finalization
+   *  of identical content never conflicts on the timestamp alone. */
+  private resultRowMatches(row: TaskResultRow, resultStatus: string, result: AgentTaskResultV1 | null): boolean {
+    if (row.result_status !== resultStatus) return false
+    if (result === null) return row.content_hash === null
+    return row.schema_version === result.schema_version
+      && row.content_hash === result.content_hash
+      && (row.final_output_text ?? '') === result.final_output.text
+      && (row.process_exit_code ?? null) === (result.process_exit_code ?? null)
+      && row.evidence_refs_json === encodeJson(result.evidence_refs ?? [], 256 * 1024, 'task_result.evidence_refs')
+      && row.artifact_refs_json === encodeJson(result.artifact_refs ?? [], 256 * 1024, 'task_result.artifact_refs')
+  }
+  private writeResultRow(taskId: string, resultStatus: string, result: AgentTaskResultV1 | null): void {
+    const now = nowIso()
+    this.db.prepare(`INSERT INTO task_results (task_id,schema_version,result_status,final_output_text,process_exit_code,finalized_at,content_hash,evidence_refs_json,artifact_refs_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
+      taskId, result?.schema_version ?? '1', resultStatus,
+      result ? boundString(result.final_output.text, MAX_FINAL_OUTPUT_BYTES, 'task_result.final_output') : null,
+      result?.process_exit_code ?? null, result?.finalized_at ?? null, result?.content_hash ?? null,
+      encodeJson(result?.evidence_refs ?? [], 256 * 1024, 'task_result.evidence_refs'),
+      encodeJson(result?.artifact_refs ?? [], 256 * 1024, 'task_result.artifact_refs'), now,
+    )
+    this.db.prepare('UPDATE tasks SET result_status = ? WHERE task_id = ?').run(resultStatus, taskId)
+  }
+  persistTaskResultDurable(taskId: string, resultStatus: string, result: AgentTaskResultV1 | null): { applied: boolean } {
+    this.open()
+    return this.db.transaction(() => {
+      if (!this.taskRow(taskId)) throw new ControlStoreError('not_found', `task not found: ${taskId}`)
+      const existing = this.taskResultRow(taskId)
+      if (existing) { if (this.resultRowMatches(existing, resultStatus, result)) return { applied: false }; throw new ControlStoreError('result_conflict', 'a different task result already exists (content mismatch)') }
+      this.writeResultRow(taskId, resultStatus, result)
+      return { applied: true }
+    })()
+  }
+  getTaskResultDurable(taskId: string): TaskResultRecord | null {
+    this.open()
+    const row = this.taskResultRow(taskId); if (!row) return null
+    if (row.result_status !== 'available') return { task_id: taskId, result_status: row.result_status, result: null }
+    // Revalidate the persisted envelope on read (untrusted JSON; corruption fails closed).
+    const v = validateTaskResult({ schema_version: row.schema_version, final_output: { kind: 'text', text: row.final_output_text ?? '' }, process_exit_code: row.process_exit_code, finalized_at: row.finalized_at ?? '', content_hash: row.content_hash ?? '', evidence_refs: decodeJson(row.evidence_refs_json, 256 * 1024, 'task_result.evidence_refs') ?? [], artifact_refs: decodeJson(row.artifact_refs_json, 256 * 1024, 'task_result.artifact_refs') ?? [] })
+    if (!v.ok) throw new ControlStoreError('corruption', `persisted task result is invalid (${v.code})`)
+    return { task_id: taskId, result_status: 'available', result: v.value }
+  }
+  terminalizeTaskWithResultDurable(taskId: string, expectedRevision: number, patch: TaskPatch, terminalEvent: TaskEventInput, resultStatus: string, result: AgentTaskResultV1 | null): TaskRecord {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.taskRow(taskId); if (!cur) throw new ControlStoreError('not_found', `task not found: ${taskId}`)
+      // Persist the result FIRST (idempotent; conflict fails closed), so a terminal
+      // task can never lose its final output.
+      const existing = this.taskResultRow(taskId)
+      if (existing) { if (!this.resultRowMatches(existing, resultStatus, result)) throw new ControlStoreError('result_conflict', 'conflicting task result on terminalization') }
+      else this.writeResultRow(taskId, resultStatus, result)
+      // Then terminalize + append the terminal event exactly once (idempotent).
+      if (!cur.terminal_event_recorded) {
+        if (!patch.status || !TASK_TERMINAL_STATUSES.has(patch.status)) throw new ControlStoreError('invalid_transition', 'terminalize requires a terminal status')
+        this.updateTaskSync(taskId, expectedRevision, { ...patch, terminal_at: patch.terminal_at ?? nowIso() })
+        this.appendTaskEventSync(taskId, terminalEvent)
+        this.db.prepare('UPDATE tasks SET terminal_event_recorded = 1 WHERE task_id = ?').run(taskId)
+      }
+      return this.toTask(this.taskRow(taskId)!)
+    })()
+  }
+
   getTaskRecord(taskId: string): TaskRecord | null { this.open(); const r = this.taskRow(taskId); return r ? this.toTask(r) : null }
   listNonTerminalTasks(): TaskRecord[] {
     this.open()
@@ -671,7 +739,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 
   // ── row → record mappers (untrusted JSON decoded defensively) ────────────────
   private toTask(r: TaskRow): TaskRecord {
-    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence, last_remote_event_sequence: r.last_remote_event_sequence, idempotency_key: r.idempotency_key, request_fingerprint: r.request_fingerprint }
+    return { task_id: r.task_id, revision: r.revision, node_id: r.node_id, agent: r.agent, workspace_key: r.workspace_key, permission_mode: r.permission_mode, status: r.status, remote_run_id: r.remote_run_id, input_text: r.input_text, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'task.metadata', true) as Record<string, unknown> | null, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, earliest_retained_sequence: r.earliest_retained_sequence, terminal_event_recorded: r.terminal_event_recorded === 1, error_code: r.error_code, error_message: r.error_message, history_incomplete: r.history_incomplete === 1, history_reason: r.history_reason, history_boundary_sequence: r.history_boundary_sequence, last_remote_event_sequence: r.last_remote_event_sequence, idempotency_key: r.idempotency_key, request_fingerprint: r.request_fingerprint, result_status: r.result_status }
   }
   private toWorkflow(r: WorkflowRow): WorkflowRecord {
     return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence, input_values: decodeJson(r.input_values_json, SIZE_LIMITS.metadata_json, 'workflow.input_values', true) as Record<string, unknown> | null, cancel_requested: r.cancel_requested === 1 }
@@ -682,7 +750,8 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 }
 
 // ── row shapes ─────────────────────────────────────────────────────────────────
-interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null; idempotency_key: string | null; request_fingerprint: string | null }
+interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null; idempotency_key: string | null; request_fingerprint: string | null; result_status: string | null }
+interface TaskResultRow { task_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null }

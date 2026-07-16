@@ -18,7 +18,8 @@ import { resolveAgents, resolveAdvertisedAgents } from '../agent-registry.js'
 import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import { openNodeJournal } from '../node-journal/sqlite-journal.js'
-import { RUN_EVENT_REPLAY_CAPABILITY } from '../node-journal/contract.js'
+import { RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY } from '../node-journal/contract.js'
+import { validateTaskResult, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
 import { isIsoUtc as journalIsoOk, nowIso as journalNowIso } from '../node-journal/serialization.js'
 import type { NodeJournal } from '../node-journal/store.js'
 
@@ -238,6 +239,30 @@ async function handleEncryptedRunStart(
  * as encrypted_run_event. Otherwise sends plaintext run_event (backward-compatible).
  * Resolves after a terminal event or after IDLE_TIMEOUT_MS with no new events.
  */
+/** Persist the authoritative AgentTaskResult for a terminal run into the node
+ *  journal from the run record (written by the supervisor BEFORE the terminal
+ *  event). Idempotent; never derived from event history. */
+function persistTerminalResult(runId: string): void {
+  if (!nodeJournal) return
+  const rec = tryReadRun(runId) as (RunRecord & { result_status?: string; task_result?: unknown }) | undefined
+  let rs = (rec?.result_status as string) ?? 'missing'
+  let result: AgentTaskResultV1 | null = null
+  if (rs === 'available' && rec?.task_result) { const v = validateTaskResult(rec.task_result); if (v.ok) result = v.value; else rs = 'invalid' }
+  else if (rs === 'available') rs = 'missing'
+  nodeJournal.persistRunResult(runId, rs, result)
+}
+
+/** Resolve a run's durable result on the node (journal first, then a best-effort
+ *  terminal persist from the run record). */
+function resolveNodeRunResult(runId: string): { result_status: string; result: AgentTaskResultV1 | null } {
+  if (nodeJournal) {
+    let nr = nodeJournal.getRunResult(runId)
+    if (!nr) { try { persistTerminalResult(runId); nr = nodeJournal.getRunResult(runId) } catch { /* */ } }
+    if (nr) return { result_status: nr.result_status, result: nr.result }
+  }
+  return { result_status: 'missing', result: null }
+}
+
 function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey?: string): Promise<void> {
   const eventsFile = path.join(vibeDir(), 'events', `${runId}.jsonl`)
   let offset = 0
@@ -289,6 +314,10 @@ function tailRunEvents(ws: WebSocket, nodeId: string, runId: string, eventAesKey
             if (nodeJournal) {
               try { sourceSeq = nodeJournal.append(runId, { type: event.type, timestamp: journalIsoOk(event.ts) ? event.ts : journalNowIso(), payload: event, terminal: isTerminal(event), status: journalStatusOf(event) }).sequence }
               catch { continue }
+              // On the terminal event, durably persist the authoritative
+              // AgentTaskResult from the run record (the supervisor wrote it BEFORE
+              // this terminal event). Idempotent; never derived from event history.
+              if (isTerminal(event)) { try { persistTerminalResult(runId) } catch { /* best effort; RunRecord retains it too */ } }
             }
             if (eventAesKey) {
               // MVP 4C: encrypt event payload — relay sees only routing metadata.
@@ -403,7 +432,7 @@ export async function relayNodeDaemon(
     transport: 'relay',
     // Advertise journaled replay only when the journal actually opened, so a
     // client can detect replay support (absence ⇒ live-only, older behavior).
-    capabilities: nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY] : ['run', 'stream', 'stop', 'workspace'],
+    capabilities: nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY] : ['run', 'stream', 'stop', 'workspace'],
     agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
@@ -570,6 +599,22 @@ export async function relayNodeDaemon(
               error: err.message, code: 'internal_error',
             })
           })
+        } else if (msg.type === 'run_result_request') {
+          // run_result_v1: serve the authoritative AgentTaskResult by exact run id.
+          // For an ENCRYPTED run the result content is encrypted with the run event
+          // key (relay never sees plaintext); an unencrypted run returns it plainly.
+          const reqId = (msg as { req_id: string }).req_id
+          const runId = (msg as { run_id: string }).run_id
+          try {
+            const { result_status, result } = resolveNodeRunResult(runId)
+            const key = runEventKeys.get(runId)
+            const base = { version: 1 as const, kind: 'plaintext' as const, from: nodeId, to: 'relay', ts: t(), type: 'run_result_ack' as const, req_id: reqId, run_id: runId, ok: true as const, result_status }
+            if (result && key) { const enc = encryptEvent(key, result); sendMsg(ws, { ...base, encrypted: { nonce: enc.nonce, ciphertext: enc.ciphertext } }) }
+            else if (result && !key) sendMsg(ws, { ...base, result }) // unencrypted run → plaintext ok
+            else sendMsg(ws, base) // missing/invalid → status only, no content
+          } catch (err) {
+            sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_result_ack', req_id: reqId, run_id: runId, ok: false, error: (err as Error).message, code: 'internal_error' })
+          }
         } else if (msg.type === 'run_replay_open') {
           // Journaled replay (run_event_replay_v1): serve THIS subscriber replay+live
           // race-free from the node journal. Events for an ENCRYPTED run are
@@ -1633,6 +1678,50 @@ export async function remoteRunStatus(relay: string, token: string, runId: strin
     })
 
     ws.on('close', () => done(undefined, new Error('Relay connection closed before run_status_ack')))
+    ws.on('error', (err) => done(undefined, err))
+  })
+}
+
+/** The authoritative AgentTaskResult of a remote run (run_result_v1). */
+export interface RemoteRunResult { result_status: string; result: AgentTaskResultV1 | null }
+
+/**
+ * One-shot, read-only: fetch the durable AgentTaskResult for a remote run by exact
+ * run id. For an ENCRYPTED run the node returns the result CIPHERTEXT (relay never
+ * sees plaintext); this decrypts it with the run event key from the local run
+ * record and revalidates it. A node without run_result_v1 (or no result) yields
+ * result_status 'missing'. No side effects on the run.
+ */
+export async function remoteRunResult(relay: string, token: string, runId: string): Promise<RemoteRunResult> {
+  const localRecord = tryReadRun(runId)
+  const eventAesKey = localRecord?.event_aes_key
+  return new Promise<RemoteRunResult>((resolve, reject) => {
+    const ws = new WebSocket(relayUrl(relay, token))
+    const reqId = `req_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`
+    let settled = false
+    const done = (v?: RemoteRunResult, err?: Error): void => { if (settled) return; settled = true; clearTimeout(timeout); v ? resolve(v) : reject(err!) }
+    const timeout = setTimeout(() => { ws.terminate(); done(undefined, new Error('Timeout waiting for run_result_ack from relay')) }, 10_000)
+    ws.on('open', () => { sendMsg(ws, { version: 1, kind: 'plaintext', from: 'cli', to: 'relay', ts: t(), type: 'run_result_request', req_id: reqId, run_id: runId }) })
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as RelayMessage
+        const msgType = (msg as { type?: string }).type
+        if (msgType === 'run_result_ack' && (msg as { req_id?: string }).req_id === reqId) {
+          const ack = msg as import('./types.js').RunResultAckMsg
+          ws.close()
+          if (!ack.ok) { done(undefined, new Error(`${ack.code ?? 'result_failed'}: ${ack.error ?? 'unknown error'}`)); return }
+          const status = ack.result_status ?? 'missing'
+          let result: AgentTaskResultV1 | null = null
+          try {
+            if (ack.encrypted && eventAesKey) { const dec = decryptEvent(eventAesKey, ack.encrypted) as unknown; const v = validateTaskResult(dec); result = v.ok ? v.value : null }
+            else if (ack.result) { const v = validateTaskResult(ack.result); result = v.ok ? v.value : null }
+          } catch { result = null }
+          // An 'available' status whose content failed to decrypt/validate is 'invalid'.
+          done({ result_status: status === 'available' && !result ? 'invalid' : status, result })
+        } else if (msgType === 'relay_error') { const e = msg as import('./types.js').RelayErrorMsg; ws.terminate(); reject(new Error(`${e.code}: ${e.message}`)) }
+      } catch { /* ignore */ }
+    })
+    ws.on('close', () => done(undefined, new Error('Relay connection closed before run_result_ack')))
     ws.on('error', (err) => done(undefined, err))
   })
 }

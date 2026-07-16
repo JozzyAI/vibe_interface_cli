@@ -21,7 +21,7 @@ const iso = () => new Date().toISOString()
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const tmpDb = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wf-rt-')), 'control.sqlite')
 
-interface TaskDesc { output?: Record<string, unknown>; status?: string; history_complete?: boolean; running?: boolean }
+interface TaskDesc { output?: Record<string, unknown>; status?: string; history_complete?: boolean; running?: boolean; result_status?: string; result_text?: string }
 type Script = (req: AgentTaskCreateRequest) => TaskDesc
 
 /** A deterministic fake Gateway: dedupes by idempotency_key, persists the durable
@@ -52,14 +52,23 @@ class ScriptedFake implements AgentTaskClient {
     const running = t.running && !t.released
     const status = running ? 'running' : (t.status ?? 'completed')
     const terminal = !running && ['completed', 'failed', 'cancelled'].includes(status)
-    const events = (!running && t.output !== undefined) ? [{ type: 'agent.output.delta', payload: { stream: 'stdout', text: JSON.stringify(t.output) } }, { type: 'task.completed', payload: {} }] : []
-    return { status, terminal, history_complete: t.history_complete !== false, events }
+    // Misleading event-history text: a DIFFERENT JSON object than the first-class
+    // result — the runtime must route on result_text, not on these events.
+    const events = (!running && t.output !== undefined) ? [{ type: 'agent.output.delta', payload: { stream: 'stdout', text: JSON.stringify({ status: 'MISLEADING', from: 'events' }) } }, { type: 'task.completed', payload: {} }] : []
+    // First-class AgentTaskResult: available (result_text = the scripted output) unless
+    // the descriptor overrides result_status (missing/invalid).
+    let result_status: string | undefined; let result_text: string | undefined
+    if (!running && status === 'completed') {
+      result_status = t.result_status ?? (t.output !== undefined ? 'available' : 'missing')
+      if (result_status === 'available' && t.output !== undefined) result_text = t.result_text ?? JSON.stringify(t.output)
+    }
+    return { status, terminal, history_complete: t.history_complete !== false, events, result_status, result_text }
   }
-  async getTask(id: string) { const v = this.view(this.byId.get(id)); return { task_id: id, ...v, history_complete: v.history_complete } }
+  async getTask(id: string) { const v = this.view(this.byId.get(id)); return { task_id: id, status: v.status, terminal: v.terminal, history_complete: v.history_complete, result_status: v.result_status, result_text: v.result_text } }
   async waitForTerminal(id: string) {
     const t = this.byId.get(id); const v = this.view(t)
     if (!v.terminal) await sleep(15) // simulate a bounded wait window (avoid a busy loop)
-    return { task_id: id, status: v.status, terminal: v.terminal, history_complete: v.history_complete, events: v.events, next_event_id: v.events.length - 1 }
+    return { task_id: id, status: v.status, terminal: v.terminal, history_complete: v.history_complete, result_status: v.result_status, result_text: v.result_text, events: v.events, next_event_id: v.events.length - 1 }
   }
   async cancelTask(id: string): Promise<void> {
     this.cancels.push(id)
@@ -194,16 +203,17 @@ test('a terminal Agent Task failure maps to a single step + workflow failure', a
   })
 })
 
-test('incomplete task history blocks the workflow (never guesses the missing output)', async () => {
+test('a missing AgentTaskResult blocks the workflow (never guesses from events)', async () => {
   await withStore(async (store) => {
-    const fake = new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 's' }, history_complete: false }))
+    // The backend completed but produced no authoritative final result.
+    const fake = new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 's' }, result_status: 'missing' }))
     const rt = new WorkflowRuntime({ store, taskClient: fake })
     const { workflow_id } = await rt.createWorkflow(plannerExecutorLoopExample(), { objective: 'x' })
     await rt.startWorkflow(workflow_id); await rt.awaitWorkflow(workflow_id)
     const wf = (await store.getWorkflow(workflow_id))!
     assert.equal(wf.status, 'blocked') // non-terminal, no auto-resume
     const blocked = (await store.listWorkflowEvents(workflow_id)).find((e) => e.event_type === 'workflow.blocked')!
-    assert.equal((blocked.payload as any).reason, 'task_history_incomplete')
+    assert.equal((blocked.payload as any).reason, 'task_result_missing')
     assert.equal(wf.total_tasks, 1) // no further task started
   })
 })
