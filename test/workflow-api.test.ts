@@ -95,6 +95,21 @@ async function withGw(taskClientFor: (store: SqliteControlStore) => AgentTaskCli
   try { await fn({ gw, store, runtime, fake }) } finally { try { await runtime.shutdown() } catch { /* */ } try { await gw.close() } catch { /* */ } try { store.closeSync() } catch { /* */ } }
 }
 
+/** A spec with an input/approval pause gate on its first step, then finish. */
+const pauseSpec = (kind: 'input' | 'approval'): WorkflowSpec => ({
+  version: '1', name: `pause-${kind}`, entry_step: 'gate', inputs: { objective: { type: 'string', required: true } },
+  agents: { solo: { agent: 'mock' } }, output_schemas: { o: { fields: { status: { type: 'enum', required: true, enum: ['done'] }, summary: { type: 'string', required: true } } } },
+  limits: { max_tasks: 5, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 2 },
+  steps: [
+    { id: 'gate', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do {{ inputs.objective }}', output_schema: 'o', pause_before: { kind, prompt: kind === 'input' ? 'Enter' : 'Approve?' } },
+    { id: 'finish', type: 'agent_task', agent_role: 'solo', prompt_template: 'Finish', output_schema: 'o' },
+  ],
+  edges: [
+    { from: 'gate', to: 'finish', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
+    { from: 'finish', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } },
+  ],
+})
+
 const soloSpec = (): WorkflowSpec => ({
   version: '1', name: 'single', entry_step: 'solo', inputs: { objective: { type: 'string', required: true } },
   agents: { solo: { agent: 'mock' } }, output_schemas: { o: { fields: { status: { type: 'enum', required: true, enum: ['done'] }, summary: { type: 'string', required: true } } } },
@@ -113,6 +128,58 @@ const workspaceBoundSpec = (): WorkflowSpec => ({
   limits: { max_tasks: 3, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 1 },
   steps: [{ id: 'solo', type: 'agent_task', agent_role: 'solo', prompt_template: 'Do {{ inputs.objective }}', workspace_key_template: '{{ inputs.workspace_key }}', output_schema: 'o' }],
   edges: [{ from: 'solo', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }],
+})
+
+// ── REST human pause / approval ──────────────────────────────────────────────────
+
+test('REST input pause: pending-request → answer (idempotent + conflict) → resume → completes', async () => {
+  await withGw((s) => new ScriptedFake(s, () => ({ output: { status: 'done', summary: 'ok' } })), async ({ gw, store }) => {
+    const created = await req(gw.port, 'POST', '/v1/workflows', { spec: pauseSpec('input'), input_values: { objective: 'ship' } })
+    const id = created.body.workflow_id
+    await req(gw.port, 'POST', `/v1/workflows/${id}/start`)
+    await waitStatus(gw.port, id, ['waiting_input'])
+    // pending-request
+    const pr = await req(gw.port, 'GET', `/v1/workflows/${id}/pending-request`)
+    assert.equal(pr.status, 200); assert.equal(pr.body.request.kind, 'input'); assert.equal(pr.body.request.status, 'pending')
+    const requestId = pr.body.request.request_id
+    // snapshot exposes no task yet
+    assert.equal((await req(gw.port, 'GET', `/v1/workflows/${id}`)).body.total_tasks, 0)
+    // answer (idempotent) + conflict
+    assert.equal((await req(gw.port, 'POST', `/v1/workflows/${id}/answer`, { request_id: requestId, value: 'v1' })).status, 200)
+    assert.equal((await req(gw.port, 'POST', `/v1/workflows/${id}/answer`, { request_id: requestId, value: 'v1' })).status, 200)
+    const conflict = await req(gw.port, 'POST', `/v1/workflows/${id}/answer`, { request_id: requestId, value: 'v2' })
+    assert.equal(conflict.status, 409); assert.equal(conflict.body.code, 'workflow_state_conflict')
+    // request not found (wrong id) → 404
+    assert.equal((await req(gw.port, 'POST', `/v1/workflows/${id}/answer`, { request_id: 'hr_' + '0'.repeat(32), value: 'x' })).status, 404)
+    // resume → completes
+    const resumed = await req(gw.port, 'POST', `/v1/workflows/${id}/resume`)
+    assert.equal(resumed.status, 200)
+    const done = await waitStatus(gw.port, id, ['completed'])
+    assert.equal(done.status, 'completed'); assert.equal(done.total_tasks, 2)
+  })
+})
+
+test('REST approval pause: approve → resume → completes; reject → failed', async () => {
+  await withGw((s) => new ScriptedFake(s, () => ({ output: { status: 'done', summary: 'ok' } })), async ({ gw }) => {
+    // approve path
+    const a = await req(gw.port, 'POST', '/v1/workflows', { spec: pauseSpec('approval'), input_values: { objective: 'x' } })
+    const idA = a.body.workflow_id
+    await req(gw.port, 'POST', `/v1/workflows/${idA}/start`)
+    await waitStatus(gw.port, idA, ['waiting_approval'])
+    const reqA = (await req(gw.port, 'GET', `/v1/workflows/${idA}/pending-request`)).body.request.request_id
+    assert.equal((await req(gw.port, 'POST', `/v1/workflows/${idA}/decision`, { request_id: reqA, approved: true })).status, 200)
+    await req(gw.port, 'POST', `/v1/workflows/${idA}/resume`)
+    assert.equal((await waitStatus(gw.port, idA, ['completed'])).status, 'completed')
+    // reject path
+    const b = await req(gw.port, 'POST', '/v1/workflows', { spec: pauseSpec('approval'), input_values: { objective: 'x' } })
+    const idB = b.body.workflow_id
+    await req(gw.port, 'POST', `/v1/workflows/${idB}/start`)
+    await waitStatus(gw.port, idB, ['waiting_approval'])
+    const reqB = (await req(gw.port, 'GET', `/v1/workflows/${idB}/pending-request`)).body.request.request_id
+    const rej = await req(gw.port, 'POST', `/v1/workflows/${idB}/decision`, { request_id: reqB, approved: false })
+    assert.equal(rej.status, 200); assert.equal(rej.body.status, 'rejected')
+    assert.equal((await req(gw.port, 'GET', `/v1/workflows/${idB}`)).body.status, 'failed')
+  })
 })
 
 // ── REST lifecycle ─────────────────────────────────────────────────────────────

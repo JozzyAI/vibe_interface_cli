@@ -333,6 +333,11 @@ export class GatewayClient {
   async startWorkflow(workflowId: string): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/start`) }
   async getWorkflow(workflowId: string): Promise<unknown> { return this.request('GET', `/v1/workflows/${encodeURIComponent(workflowId)}`) }
   async cancelWorkflow(workflowId: string): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/cancel`) }
+  // human pause / approval operations
+  async getPendingRequest(workflowId: string): Promise<unknown> { return this.request('GET', `/v1/workflows/${encodeURIComponent(workflowId)}/pending-request`) }
+  async answerWorkflowInput(workflowId: string, body: { request_id: string; value: string }): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/answer`, body) }
+  async decideWorkflowApproval(workflowId: string, body: { request_id: string; approved: boolean }): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/decision`, body) }
+  async resumeWorkflow(workflowId: string): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/resume`) }
 
   /**
    * BOUNDED collection of a workflow's events over SSE — the workflow analogue of

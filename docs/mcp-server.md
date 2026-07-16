@@ -76,10 +76,14 @@ real spawned server end-to-end).
 | `vibe_get_workflow_events` | `GET /v1/workflows/:id/events` (SSE) | **bounded** poll; workflow event cursor (distinct from task ids) |
 | `vibe_wait_workflow` | `GET /v1/workflows/:id/events` resume loop | **resumable bounded wait**: return on terminal, blocked, or timeout (`terminal`/`blocked`/`ended_by`) |
 | `vibe_cancel_workflow` | `POST /v1/workflows/:id/cancel` | **destructive** (annotated); idempotent + durable |
+| `vibe_get_pending_request` | `GET /v1/workflows/:id/pending-request` | the human pause (input/approval) awaiting a response, or null |
+| `vibe_answer_workflow_input` | `POST /v1/workflows/:id/answer` | answer an **input** pause `{ request_id, value }` (idempotent; conflict fails closed) |
+| `vibe_decide_workflow_approval` | `POST /v1/workflows/:id/decision` | approve/reject an **approval** pause `{ request_id, approved }` (reject fails the workflow) |
+| `vibe_resume_workflow` | `POST /v1/workflows/:id/resume` | continue a paused workflow from its checkpoint once answered/approved (idempotent) |
 
 ### Workflow tools (durable Workflow Runtime)
 
-Seven workflow tools sit alongside the seven task tools (fourteen total). They are
+Eleven workflow tools sit alongside the seven task tools (eighteen total). They are
 pure HTTP clients of the `/v1/workflows` routes — see
 [`docs/workflow-api.md`](workflow-api.md) for full semantics. Key points:
 
@@ -91,6 +95,10 @@ pure HTTP clients of the `/v1/workflows` routes — see
   resume with `next_event_id`). A timeout or MCP disconnect **never** cancels.
 - **`blocked` is non-terminal** and not auto-resumed; cancellation is explicit
   (`vibe_cancel_workflow` only).
+- **Human pauses:** a `waiting_input`/`waiting_approval` workflow runs no Agent Task
+  until answered/approved. Flow: `vibe_get_pending_request` → `vibe_answer_workflow_input`
+  or `vibe_decide_workflow_approval` → `vibe_resume_workflow`. Responses are idempotent;
+  a conflicting response fails closed; an approval **rejection** fails the workflow.
 - Recommended flow: `vibe_create_workflow` → inspect → `vibe_start_workflow` →
   `vibe_wait_workflow` → `vibe_get_workflow`/`vibe_get_workflow_events` →
   `vibe_cancel_workflow` (only explicitly).
