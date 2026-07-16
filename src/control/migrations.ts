@@ -171,7 +171,32 @@ CREATE TABLE task_results (
 ALTER TABLE tasks ADD COLUMN result_status TEXT;
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }]
+/** Schema v7 — durable Workflow workspace-lease PROJECTION for recovery/inspection
+ *  (the Node remains authoritative). At most one active lease projection per
+ *  (workflow_id, node_id, workspace_key). Additive; no secrets; revisions bounded. */
+const V7 = `
+CREATE TABLE workflow_workspace_leases (
+  workspace_lease_id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  workspace_key TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'exclusive',
+  status TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  base_revision_json TEXT,
+  current_revision_json TEXT,
+  acquired_at TEXT,
+  release_requested_at TEXT,
+  released_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX idx_wf_ws_lease_active ON workflow_workspace_leases(workflow_id, node_id, workspace_key)
+  WHERE status IN ('acquiring','active','release_requested');
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
