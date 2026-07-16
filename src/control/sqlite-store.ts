@@ -21,6 +21,7 @@ import {
   type WorkflowRecord, type CreateWorkflowInput, type WorkflowPatch, type StepExecutionRecord,
   type CreateStepExecutionInput, type StepExecutionPatch, type WorkflowEventInput, type WorkflowEventRecord,
   type WorkflowSnapshot, type TaskResultRecord, type WorkflowWorkspaceLeaseRecord,
+  type WorkflowHumanRequestRecord, type CreateHumanRequestInput,
 } from './records.js'
 import { isValidRevision } from '../lib/workspace-lease.js'
 import {
@@ -641,6 +642,93 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     })()
   }
 
+  // ── human pause / approval gates (workflow_human_requests) ───────────────────
+  private humanRow(id: string): HumanRequestRow | undefined { return this.db.prepare('SELECT * FROM workflow_human_requests WHERE request_id = ?').get(id) as HumanRequestRow | undefined }
+  private toHumanRequest(r: HumanRequestRow): WorkflowHumanRequestRecord {
+    return { request_id: r.request_id, workflow_id: r.workflow_id, step_execution_id: r.step_execution_id, kind: r.kind, prompt: r.prompt, choices: decodeJson(r.choices_json, SIZE_LIMITS.metadata_json, 'human_request.choices') as string[] | null, status: r.status, response_value: r.response_value, created_at: r.created_at, responded_at: r.responded_at, updated_at: r.updated_at, revision: r.revision }
+  }
+
+  async createHumanRequestAndPause(input: CreateHumanRequestInput, waitingStatus: string, pausedEvent: WorkflowEventDraft): Promise<WorkflowHumanRequestRecord> {
+    this.open()
+    if (!isSafeId(input.request_id)) throw new ControlStoreError('invalid_record', 'request_id is not a safe identifier')
+    if (input.kind !== 'input' && input.kind !== 'approval') throw new ControlStoreError('invalid_record', 'human request kind must be input|approval')
+    if (waitingStatus !== 'waiting_input' && waitingStatus !== 'waiting_approval') throw new ControlStoreError('invalid_record', 'waitingStatus must be waiting_input|waiting_approval')
+    return this.db.transaction(() => {
+      const wf = this.workflowRow(input.workflow_id); if (!wf) throw new ControlStoreError('not_found', `workflow not found: ${input.workflow_id}`)
+      let row = this.humanRow(input.request_id)
+      if (!row) {
+        if (!this.stepRow(input.step_execution_id)) throw new ControlStoreError('not_found', `step execution not found: ${input.step_execution_id}`)
+        const now = nowIso()
+        this.db.prepare(`INSERT INTO workflow_human_requests (request_id,workflow_id,step_execution_id,kind,prompt,choices_json,status,response_value,created_at,responded_at,updated_at,revision)
+          VALUES (@id,@wf,@sec,@kind,@prompt,@choices,'pending',NULL,@now,NULL,@now,1)`)
+          .run({ id: input.request_id, wf: input.workflow_id, sec: input.step_execution_id, kind: input.kind, prompt: boundString(input.prompt, 8192, 'human.prompt'), choices: input.choices ? encodeJson(input.choices.slice(0, 200), SIZE_LIMITS.metadata_json, 'human.choices') : null, now })
+        row = this.humanRow(input.request_id)!
+      }
+      // Transition running → waiting_* (idempotent: already waiting on this request → no-op).
+      if (wf.status === 'running') { this.updateWorkflowSync(input.workflow_id, wf.revision, { status: waitingStatus }); this.appendWorkflowEventAuto(input.workflow_id, pausedEvent) }
+      return this.toHumanRequest(this.humanRow(input.request_id)!)
+    })()
+  }
+  async getHumanRequest(requestId: string): Promise<WorkflowHumanRequestRecord | null> { this.open(); const r = this.humanRow(requestId); return r ? this.toHumanRequest(r) : null }
+  async getPendingHumanRequest(workflowId: string): Promise<WorkflowHumanRequestRecord | null> {
+    this.open(); const r = this.db.prepare("SELECT * FROM workflow_human_requests WHERE workflow_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(workflowId) as HumanRequestRow | undefined
+    return r ? this.toHumanRequest(r) : null
+  }
+  async getActiveHumanRequest(workflowId: string): Promise<WorkflowHumanRequestRecord | null> {
+    this.open(); const r = this.db.prepare("SELECT * FROM workflow_human_requests WHERE workflow_id=? AND status IN ('pending','answered','approved') ORDER BY created_at DESC LIMIT 1").get(workflowId) as HumanRequestRow | undefined
+    return r ? this.toHumanRequest(r) : null
+  }
+  async answerHumanRequestInput(requestId: string, value: string): Promise<WorkflowHumanRequestRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.humanRow(requestId); if (!r) throw new ControlStoreError('not_found', `human request not found: ${requestId}`)
+      if (r.kind !== 'input') throw new ControlStoreError('invalid_transition', 'request is not an input request')
+      const v = boundString(value, 8192, 'human.response_value')
+      if (r.status === 'answered') { if (r.response_value !== v) throw new ControlStoreError('invalid_transition', 'conflicting input response'); return this.toHumanRequest(r) } // idempotent
+      if (r.status !== 'pending') throw new ControlStoreError('invalid_transition', `cannot answer a ${r.status} request`)
+      this.db.prepare(`UPDATE workflow_human_requests SET status='answered', response_value=@v, responded_at=@now, revision=revision+1, updated_at=@now WHERE request_id=@id`).run({ id: requestId, v, now: nowIso() })
+      return this.toHumanRequest(this.humanRow(requestId)!)
+    })()
+  }
+  async approveHumanRequest(requestId: string): Promise<WorkflowHumanRequestRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.humanRow(requestId); if (!r) throw new ControlStoreError('not_found', `human request not found: ${requestId}`)
+      if (r.kind !== 'approval') throw new ControlStoreError('invalid_transition', 'request is not an approval request')
+      if (r.status === 'approved') return this.toHumanRequest(r) // idempotent
+      if (r.status === 'rejected') throw new ControlStoreError('invalid_transition', 'request was already rejected')
+      if (r.status !== 'pending') throw new ControlStoreError('invalid_transition', `cannot approve a ${r.status} request`)
+      this.db.prepare(`UPDATE workflow_human_requests SET status='approved', responded_at=@now, revision=revision+1, updated_at=@now WHERE request_id=@id`).run({ id: requestId, now: nowIso() })
+      return this.toHumanRequest(this.humanRow(requestId)!)
+    })()
+  }
+  async rejectHumanRequestAndFailWorkflow(requestId: string, workflowFailedEvent: WorkflowEventDraft): Promise<{ request: WorkflowHumanRequestRecord; workflow: WorkflowRecord }> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.humanRow(requestId); if (!r) throw new ControlStoreError('not_found', `human request not found: ${requestId}`)
+      if (r.kind !== 'approval') throw new ControlStoreError('invalid_transition', 'request is not an approval request')
+      if (r.status === 'approved') throw new ControlStoreError('invalid_transition', 'request was already approved')
+      if (r.status !== 'rejected') {
+        if (r.status !== 'pending') throw new ControlStoreError('invalid_transition', `cannot reject a ${r.status} request`)
+        this.db.prepare(`UPDATE workflow_human_requests SET status='rejected', responded_at=@now, revision=revision+1, updated_at=@now WHERE request_id=@id`).run({ id: requestId, now: nowIso() })
+      }
+      const wf = this.workflowRow(r.workflow_id)!
+      if (!WORKFLOW_TERMINAL_STATUSES.has(wf.status)) { this.updateWorkflowSync(r.workflow_id, wf.revision, { status: 'failed', terminal_at: nowIso() }); this.appendWorkflowEventAuto(r.workflow_id, workflowFailedEvent) }
+      return { request: this.toHumanRequest(this.humanRow(requestId)!), workflow: this.toWorkflow(this.workflowRow(r.workflow_id)!) }
+    })()
+  }
+  async resumeWorkflowRunning(workflowId: string, resumedEvent: WorkflowEventDraft): Promise<{ workflow: WorkflowRecord; resumed: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const cur = this.workflowRow(workflowId); if (!cur) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      if (cur.status === 'running') return { workflow: this.toWorkflow(cur), resumed: false } // idempotent
+      if (cur.status !== 'waiting_input' && cur.status !== 'waiting_approval') throw new ControlStoreError('invalid_transition', `cannot resume from status ${cur.status}`)
+      this.updateWorkflowSync(workflowId, cur.revision, { status: 'running' })
+      this.appendWorkflowEventAuto(workflowId, resumedEvent)
+      return { workflow: this.toWorkflow(this.workflowRow(workflowId)!), resumed: true }
+    })()
+  }
+
   // ── retention (bounded; never touches active records; no scheduler) ──────────
   async pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult> {
     this.open()
@@ -867,6 +955,7 @@ interface TaskEventRow { task_id: string; sequence: number; event_type: string; 
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null }
 interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; created_at: string; updated_at: string }
+interface HumanRequestRow { request_id: string; workflow_id: string; step_execution_id: string; kind: string; prompt: string; choices_json: string | null; status: string; response_value: string | null; created_at: string; responded_at: string | null; updated_at: string; revision: number }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
 
 /** A better-sqlite3 UNIQUE/PRIMARYKEY constraint violation (the idempotency-key

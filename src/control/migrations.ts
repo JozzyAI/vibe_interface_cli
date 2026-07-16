@@ -205,7 +205,31 @@ ALTER TABLE workflow_step_executions ADD COLUMN revision_before_json TEXT;
 ALTER TABLE workflow_step_executions ADD COLUMN revision_after_json TEXT;
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }]
+/** Schema v9 — durable HUMAN PAUSE requests (input / approval gates). At most one
+ *  active request per step execution. Additive; bounded prompt/choices/value; no
+ *  secrets. Enables waiting_input / waiting_approval / resume without event replay. */
+const V9 = `
+CREATE TABLE workflow_human_requests (
+  request_id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  step_execution_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  choices_json TEXT,
+  status TEXT NOT NULL,
+  response_value TEXT,
+  created_at TEXT NOT NULL,
+  responded_at TEXT,
+  updated_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (step_execution_id),
+  FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+  FOREIGN KEY (step_execution_id) REFERENCES workflow_step_executions(step_execution_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_human_req_wf ON workflow_human_requests(workflow_id, status);
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

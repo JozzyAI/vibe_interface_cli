@@ -22,6 +22,10 @@ export interface RenderScope {
   stepOutputs: Record<string, Record<string, unknown>>
   round: number
   context: Partial<Record<ContextGroup, Record<string, unknown>>>
+  /** The current step's answered input-pause response (`pause.response`). Present
+   *  ONLY once the pause is answered — a template referencing it renders `undefined`
+   *  (a required miss) until then, so no task starts before a response exists. */
+  pauseResponse?: string
 }
 
 export type RenderResult =
@@ -58,6 +62,10 @@ function resolveRef(ref: TemplateRef, scope: RenderScope): { value: unknown; req
       const group = scope.context[ref.group as ContextGroup]
       return { value: group ? group[ref.field] : undefined, required: false } // best-effort latest handoff
     }
+    case 'pause':
+      // The answered input pause value MUST be present before the task renders — a
+      // missing response is a required miss (render fails → no task starts).
+      return { value: scope.pauseResponse, required: true }
   }
 }
 

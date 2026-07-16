@@ -88,11 +88,24 @@ export const MAX_ENUM_VALUE_LENGTH = 128
 
 export type StepType = 'agent_task'
 
+/** An optional durable HUMAN PAUSE gate evaluated BEFORE a step's Agent Task is
+ *  created. `input` captures a bounded value; `approval` gates execution (a rejection
+ *  fails the workflow — the documented policy). No Agent Task runs while waiting. */
+export interface StepPauseGate {
+  kind: 'input' | 'approval'
+  /** Bounded human-facing prompt (what to enter / what to approve). */
+  prompt: string
+  /** Optional bounded set of allowed answers (for `input`) / rendered options. */
+  choices?: string[]
+}
+
 export interface AgentTaskStep {
   id: string
   type: 'agent_task'
   /** References a key in `agents`. */
   agent_role: string
+  /** Optional durable human pause evaluated BEFORE the Agent Task runs. */
+  pause_before?: StepPauseGate
   /** Prompt with `{{ … }}` references (see the template grammar). */
   prompt_template: string
   /** References a key in `output_schemas`. */
@@ -199,12 +212,12 @@ export const KNOWN_SPEC_FIELDS: readonly string[] = [
 
 // ── future runtime state (types only — no runtime implemented here) ──────────
 
-export type WorkflowStatus = 'draft' | 'ready' | 'running' | 'blocked' | 'completed' | 'failed' | 'cancelled'
+export type WorkflowStatus = 'draft' | 'ready' | 'running' | 'blocked' | 'waiting_input' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled'
 export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled'
 
-// `blocked` is RESUMABLE (awaiting external input/decision) and therefore NOT
-// terminal; only `completed` / `failed` / `cancelled` are terminal. Resume
-// semantics belong to the future runtime PR.
+// `blocked` and the `waiting_*` pause states are RESUMABLE (awaiting external
+// input/decision) and therefore NOT terminal; only `completed` / `failed` /
+// `cancelled` are terminal.
 const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>(['completed', 'failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set<StepStatus>(['completed', 'failed', 'skipped', 'cancelled'])
 
@@ -273,6 +286,8 @@ export type WorkflowEventType =
   | 'edge.selected'
   | 'workflow.round_advanced'
   | 'workflow.blocked'
+  | 'workflow.paused'
+  | 'workflow.resumed'
   | 'workflow.completed'
   | 'workflow.failed'
   | 'workflow.cancelled'
