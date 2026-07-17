@@ -96,6 +96,23 @@ test('workflowUiHtml: explicit approval + separate start + runtime monitoring + 
   assert.ok(!wv.includes('prompt_template') && !wv.includes('.spec') && !wv.includes('innerHTML'), 'no spec/prompt/innerHTML in the runtime view')
 })
 
+test('workflowUiHtml: accessibility + UX polish (aria-live status, labelled fields, focus target, loading states, keyboard nav)', () => {
+  const html = workflowUiHtml('N1')
+  // a screen-reader live status region + announce() wired for compile/start/cancel results
+  assert.ok(html.includes('role="status"') && html.includes('aria-live="polite"') && html.includes('function announce'))
+  // the primary nav is a real keyboard-focusable button (not a click-only <a>)
+  assert.ok(html.includes('<button id="nav-new"'))
+  // focus is moved to main after navigation; main is a focus target
+  assert.ok(html.includes('id="app" tabindex="-1"') && html.includes('function focusMain') && html.includes('focusMain()'))
+  // form fields are label-associated (for/id) and the form submits (keyboard Enter)
+  assert.ok(html.includes("'for':'f-'+k") && html.includes("el('form'") && html.includes('preventDefault'))
+  // buttons expose disabled + aria-busy loading state; double-submit guarded
+  assert.ok(html.includes('function busy') && html.includes("setAttribute('aria-busy'") && html.includes('if(btn.disabled)return'))
+  // concise event timestamps + readable badges; :focus-visible outlines; mobile table scroll
+  assert.ok(html.includes('function fmtTs') && html.includes('toLocaleTimeString'))
+  assert.ok(html.includes(':focus-visible') && html.includes('tablewrap') && html.includes('@media (max-width:560px)'))
+})
+
 // ── gateway serving + cookie auth ─────────────────────────────────────────────────
 
 function req(port: number, method: string, p: string, opts: { cookie?: string; auth?: boolean; body?: unknown } = {}): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {

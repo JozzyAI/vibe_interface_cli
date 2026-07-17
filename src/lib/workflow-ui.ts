@@ -24,19 +24,25 @@ export function workflowUiHtml(nonce: string): string {
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0d10;color:#e6e9ef}
 @media (prefers-color-scheme:light){body{background:#f6f7f9;color:#1a1d24}}
-header{display:flex;gap:16px;align-items:center;padding:12px 16px;border-bottom:1px solid #2a2f38;position:sticky;top:0;background:inherit}
-header b{font-size:16px}
-nav a{color:inherit;text-decoration:none;opacity:.75;cursor:pointer;padding:4px 8px;border-radius:6px}
-nav a.active,nav a:hover{opacity:1;background:#232833}
-main{max-width:860px;margin:0 auto;padding:16px}
+header{display:flex;gap:12px 16px;align-items:center;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid #2a2f38;position:sticky;top:0;background:inherit;z-index:2}
+h1{font-size:16px;margin:0}
+.navbtn{width:auto;background:transparent;border:1px solid transparent;color:inherit;opacity:.8;cursor:pointer;padding:5px 10px;border-radius:6px;font-weight:600;margin:0}
+.navbtn.active,.navbtn:hover{opacity:1;background:#232833}
+main{max-width:860px;margin:0 auto;padding:16px;outline:none}
+main:focus-visible{outline:2px solid #2b6cff;outline-offset:2px}
 label{display:block;margin:12px 0 4px;font-weight:600;font-size:13px;opacity:.85}
 input,textarea,select,button{font:inherit;color:inherit;background:#151a21;border:1px solid #2a2f38;border-radius:8px;padding:9px 11px;width:100%}
-@media (prefers-color-scheme:light){input,textarea,select,button{background:#fff;border-color:#d4d9e0}header{border-color:#e2e6ec}nav a.active,nav a:hover{background:#e9edf3}}
+:focus-visible{outline:2px solid #2b6cff;outline-offset:2px}
+@media (prefers-color-scheme:light){input,textarea,select,button{background:#fff;border-color:#d4d9e0}header{border-color:#e2e6ec}.navbtn.active,.navbtn:hover{background:#e9edf3}}
 .row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:140px}
+@media (max-width:560px){main{padding:12px}.row>div{min-width:100%}header{gap:8px}.card{padding:12px}}
 textarea{min-height:96px;resize:vertical}
-button{cursor:pointer;background:#2b6cff;border-color:#2b6cff;color:#fff;font-weight:600;margin-top:16px}
+button{cursor:pointer;background:#2b6cff;border-color:#2b6cff;color:#fff;font-weight:600;margin-top:16px;min-height:42px}
 button.sec{background:transparent;border-color:#2a2f38;color:inherit}
-button:disabled{opacity:.5;cursor:default}
+button:disabled{opacity:.55;cursor:progress}
+button[aria-busy=true]::after{content:' …'}
+.sronly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .card{border:1px solid #2a2f38;border-radius:10px;padding:14px;margin:14px 0;background:#0f141b}
 @media (prefers-color-scheme:light){.card{background:#fff;border-color:#e2e6ec}}
 .badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700}
@@ -75,13 +81,19 @@ h2{font-size:15px;margin:16px 0 6px}
 ul{margin:6px 0;padding-left:20px}
 .err{color:#f08a8a}
 </style></head><body>
-<header><b>Vibe · Workflows</b><nav><a id="nav-new">Create workflow</a></nav></header>
-<main id="app"></main>
+<header><h1>Vibe · Workflows</h1><nav aria-label="Primary"><button id="nav-new" type="button" class="navbtn">Create workflow</button></nav></header>
+<p id="status" class="sronly" role="status" aria-live="polite"></p>
+<main id="app" tabindex="-1" aria-live="polite"></main>
 <script nonce="${nonce}">
 "use strict";
 const app=document.getElementById('app');
 const navNew=document.getElementById('nav-new');
+const statusEl=document.getElementById('status');
 const FINAL=new Set(['ready','needs_input','impossible','policy_denied']);
+function announce(m){if(statusEl)statusEl.textContent=String(m||'');} // screen-reader live status
+function focusMain(){try{app.focus();}catch(e){}}
+function busy(btn,on,label){btn.disabled=!!on;btn.setAttribute('aria-busy',on?'true':'false');if(label!=null)btn.textContent=label;}
+function fmtTs(iso){if(!iso)return '';const d=new Date(iso);return isNaN(d.getTime())?String(iso):d.toLocaleTimeString();}
 const el=(t,props,...kids)=>{const n=document.createElement(t);if(props)for(const k in props){if(k==='class')n.className=props[k];else if(k==='text')n.textContent=props[k];else if(k.startsWith('on'))n.addEventListener(k.slice(2),props[k]);else n.setAttribute(k,props[k]);}for(const c of kids)if(c!=null)n.append(c);return n;};
 const SVGNS='http://www.w3.org/2000/svg';
 const sv=(t,props,...kids)=>{const n=document.createElementNS(SVGNS,t);if(props)for(const k in props){if(k==='text')n.textContent=props[k];else n.setAttribute(k,String(props[k]));}for(const c of kids)if(c!=null)n.append(c);return n;};
@@ -141,43 +153,36 @@ navNew.addEventListener('click',()=>go('/ui'));
 let pollTimer=null,disposed=false,stream=null;
 function stopPoll(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null;}}
 function closeStream(){if(stream){try{stream.close();}catch(e){}stream=null;}}
-function route(){stopPoll();closeStream();disposed=false;const u=new URL(location.href);const w=u.searchParams.get('workflow');const d=u.searchParams.get('draft');if(w)workflowView(w);else if(d)draftView(d);else compileView();}
+function route(){stopPoll();closeStream();disposed=false;const u=new URL(location.href);const w=u.searchParams.get('workflow');const d=u.searchParams.get('draft');if(w)workflowView(w);else if(d)draftView(d);else compileView();focusMain();}
 
 // ── compile form ──
 let lastKey=null,lastFp=null;
 function fpOf(o){return JSON.stringify(o);}
 function compileView(){
-  navNew.className='active';
-  const f={};
-  const mk=(k,node)=>{f[k]=node;return node;};
-  const form=el('div',{class:'card'},
+  navNew.className='navbtn active';navNew.setAttribute('aria-current','page');
+  const f={};let submit;
+  const fld=(k,label,node)=>{node.id='f-'+k;node.setAttribute('name',k);f[k]=node;return el('div',null,el('label',{text:label,'for':'f-'+k}),node);};
+  const form=el('form',{novalidate:'',onsubmit:(e)=>{if(e&&e.preventDefault)e.preventDefault();doCompile(f,submit);}},
     el('h2',{text:'Compile a workflow'}),
-    el('label',{text:'Natural-language request'}), mk('nl',el('textarea',{placeholder:'Describe the workflow to build…'})),
-    el('label',{text:'Compiler agent (which model compiles)'}), mk('ca',el('input',{value:'mock',placeholder:'e.g. claude-code'})),
-    el('div',{class:'row'},
-      el('div',null,el('label',{text:'Preferred agents (comma-sep)'}),mk('pa',el('input',{placeholder:'claude-code, codex'}))),
-      el('div',null,el('label',{text:'Excluded agents'}),mk('xa',el('input',{placeholder:'codex'}))),
-      el('div',null,el('label',{text:'Preferred nodes'}),mk('pn',el('input',{placeholder:'node_x'})))
-    ),
-    el('div',{class:'row'},
-      el('div',null,el('label',{text:'Max rounds'}),mk('mr',el('input',{type:'number',min:'1',placeholder:'e.g. 10'}))),
-      el('div',null,el('label',{text:'Max tasks'}),mk('mt',el('input',{type:'number',min:'1',placeholder:'e.g. 20'}))),
-      el('div',null,el('label',{text:'Max runtime (seconds)'}),mk('rt',el('input',{type:'number',min:'1',placeholder:'e.g. 1800'})))
-    ),
-    el('label',{class:'row',style:'align-items:center;gap:8px;font-weight:600'}, mk('vt',el('input',{type:'checkbox',style:'width:auto'})), document.createTextNode(' Require verified tests before completion')),
-    el('div',{class:'muted',id:'compile-msg'})
+    fld('nl','Natural-language request',el('textarea',{placeholder:'Describe the workflow to build…','aria-required':'true'})),
+    fld('ca','Compiler agent (which model compiles)',el('input',{value:'mock',placeholder:'e.g. claude-code','aria-required':'true'})),
+    el('div',{class:'row'},fld('pa','Preferred agents (comma-sep)',el('input',{placeholder:'claude-code, codex'})),fld('xa','Excluded agents',el('input',{placeholder:'codex'})),fld('pn','Preferred nodes',el('input',{placeholder:'node_x'}))),
+    el('div',{class:'row'},fld('mr','Max rounds',el('input',{type:'number',min:'1',placeholder:'e.g. 10'})),fld('mt','Max tasks',el('input',{type:'number',min:'1',placeholder:'e.g. 20'})),fld('rt','Max runtime (seconds)',el('input',{type:'number',min:'1',placeholder:'e.g. 1800'}))),
+    el('label',{class:'row',style:'align-items:center;gap:8px;font-weight:600','for':'f-vt'}, (f.vt=el('input',{type:'checkbox',id:'f-vt',style:'width:auto'})), document.createTextNode(' Require verified tests before completion')),
+    el('div',{class:'err',id:'compile-msg','aria-live':'assertive'})
   );
-  const submit=el('button',{text:'Compile',onclick:()=>doCompile(f,submit)});
+  submit=el('button',{type:'submit',text:'Compile'});
   form.append(submit);
   app.replaceChildren(form);
 }
 function num(v){const n=parseInt(v,10);return Number.isFinite(n)&&n>0?n:undefined;}
 function list(v){return String(v||'').split(',').map(s=>s.trim()).filter(Boolean);}
 function doCompile(f,btn){
+  if(btn.disabled)return; // guard: no double submission while a request is in flight
   const nl=f.nl.value.trim();const ca=f.ca.value.trim();
-  const msg=document.getElementById('compile-msg');msg.className='muted';msg.textContent='';
-  if(!nl){msg.className='err';msg.textContent='A request is required.';return;}
-  if(!ca){msg.className='err';msg.textContent='A compiler agent is required.';return;}
+  const msg=document.getElementById('compile-msg');msg.textContent='';f.nl.setAttribute('aria-invalid','false');
+  if(!nl){msg.textContent='A request is required.';f.nl.setAttribute('aria-invalid','true');try{f.nl.focus();}catch(e){}announce(msg.textContent);return;}
+  if(!ca){msg.textContent='A compiler agent is required.';try{f.ca.focus();}catch(e){}announce(msg.textContent);return;}
   const constraints={};const pa=list(f.pa.value),xa=list(f.xa.value),pn=list(f.pn.value);
   if(pa.length)constraints.preferred_agents=pa;if(xa.length)constraints.excluded_agents=xa;if(pn.length)constraints.preferred_nodes=pn;
   const mr=num(f.mr.value),mt=num(f.mt.value),rt=num(f.rt.value);
@@ -188,19 +193,19 @@ function doCompile(f,btn){
   const fp=fpOf(payload);
   if(fp!==lastFp){lastKey=uuid();lastFp=fp;}
   payload.idempotency_key=lastKey;
-  btn.disabled=true;btn.textContent='Compiling…';
+  busy(btn,true,'Compiling…');announce('Compiling…');
   api('POST','/v1/workflow-drafts/compile',payload).then(r=>{
-    btn.disabled=false;btn.textContent='Compile';
-    if(r.status===401){msg.className='err';msg.textContent='Not authorized — open this page with ?token=<api token>.';return;}
-    if(r.status>=400||!r.body||!r.body.draft_id){msg.className='err';msg.textContent='Compile failed: '+((r.body&&r.body.code)||('http '+r.status));return;}
-    go('/ui?draft='+encodeURIComponent(r.body.draft_id));
-  }).catch(()=>{btn.disabled=false;btn.textContent='Compile';msg.className='err';msg.textContent='Network error.';});
+    if(r.status===401){busy(btn,false,'Compile');msg.textContent='Not authorized — open this page with ?token=<api token>.';announce(msg.textContent);return;}
+    if(r.status>=400||!r.body||!r.body.draft_id){busy(btn,false,'Compile');msg.textContent='Compile failed: '+((r.body&&r.body.code)||('http '+r.status));announce(msg.textContent);return;}
+    announce('Compiled — opening draft.');go('/ui?draft='+encodeURIComponent(r.body.draft_id));
+  }).catch(()=>{busy(btn,false,'Compile');msg.textContent='Network error.';announce(msg.textContent);});
 }
 
 // ── draft view ──
-function badge(status){const m={ready:'b-ready',needs_input:'b-warn',impossible:'b-bad',policy_denied:'b-bad'};return el('span',{class:'badge '+(m[status]||'b-info'),text:status});}
+function badge(status){const m={ready:'b-ready',needs_input:'b-warn',impossible:'b-bad',policy_denied:'b-bad'};return el('span',{class:'badge '+(m[status]||'b-info'),role:'status',text:status});}
 function draftView(id){
-  navNew.className='';
+  navNew.className='navbtn';navNew.removeAttribute('aria-current');
+  announce('Loading draft…');
   app.replaceChildren(el('div',{class:'card'},el('div',{class:'muted',text:'Loading draft '+id+'…'})));
   const load=()=>{
     if(disposed)return;
@@ -216,7 +221,7 @@ function draftView(id){
   };
   load();
 }
-function kvTable(rows){const t=el('table');for(const[k,v]of rows)t.append(el('tr',null,el('th',{text:k}),el('td',{class:'mono',text:v==null?'—':String(v)})));return t;}
+function kvTable(rows){const t=el('table');for(const[k,v]of rows)t.append(el('tr',null,el('th',{scope:'row',text:k}),el('td',{class:'mono',text:v==null?'—':String(v)})));return el('div',{class:'tablewrap'},t);}
 function renderDraft(d){
   const cs=d.compiler_status,vs=d.validation_status;
   const head=el('div',{class:'card'},
@@ -290,14 +295,15 @@ function approveCard(d){
   const msg=el('div',{class:'muted',style:'margin-top:8px'});
   const btn=el('button',{text:'Approve this exact plan'});
   btn.addEventListener('click',()=>{
+    if(btn.disabled)return;
     if(!confirm('Approve this exact workflow (spec_hash '+String(d.spec_hash).slice(0,12)+'…)? This creates a ready workflow but does NOT start it.'))return;
-    btn.disabled=true;btn.textContent='Approving…';msg.className='muted';msg.textContent='';
+    busy(btn,true,'Approving…');announce('Approving…');msg.textContent='';
     api('POST','/v1/workflow-drafts/'+encodeURIComponent(d.draft_id)+'/approve',{spec_hash:d.spec_hash}).then(r=>{
-      if(r.status===200&&r.body&&r.body.workflow_id){go('/ui?workflow='+encodeURIComponent(r.body.workflow_id));return;}
-      btn.disabled=false;btn.textContent='Approve this exact plan';
-      if(r.status===409){msg.className='err';msg.textContent='The draft changed since it was shown — reload and review before approving.';c.append(el('button',{class:'sec',text:'Reload draft',onclick:()=>draftView(d.draft_id)}));return;}
-      msg.className='err';msg.textContent='Approval failed: '+((r.body&&r.body.code)||('http '+r.status));
-    }).catch(()=>{btn.disabled=false;btn.textContent='Approve this exact plan';msg.className='err';msg.textContent='Network error.';});
+      if(r.status===200&&r.body&&r.body.workflow_id){announce('Approved — a ready workflow was created (not started).');go('/ui?workflow='+encodeURIComponent(r.body.workflow_id));return;}
+      busy(btn,false,'Approve this exact plan');
+      if(r.status===409){msg.textContent='The draft changed since it was shown — reload and review before approving.';announce(msg.textContent);c.append(el('button',{class:'sec',text:'Reload draft',onclick:()=>draftView(d.draft_id)}));return;}
+      msg.textContent='Approval failed: '+((r.body&&r.body.code)||('http '+r.status));announce(msg.textContent);
+    }).catch(()=>{busy(btn,false,'Approve this exact plan');msg.textContent='Network error.';announce(msg.textContent);});
   });
   c.append(btn,msg);
   return c;
@@ -307,33 +313,36 @@ function approveCard(d){
 const WF_TERMINAL=new Set(['completed','failed','cancelled']);
 function wfBadge(s){const m={running:'b-info',blocked:'b-warn',completed:'b-ready',failed:'b-bad',cancelled:'b-bad',ready:'b-info'};return el('span',{class:'badge '+(m[s]||'b-info'),text:s});}
 function workflowView(id){
-  navNew.className='';
+  navNew.className='navbtn';navNew.removeAttribute('aria-current');
+  announce('Loading workflow…');
   app.replaceChildren(el('div',{class:'card'},el('div',{class:'muted',text:'Loading workflow '+id+'…'})));
-  const seen=new Set();const events=[];let started=false;
+  const seen=new Set();const events=[];let started=false;let lastStatus=null;
   const state={wf:null};
   const render=()=>{
     if(disposed)return;
     const wf=state.wf;if(!wf)return;
     const s=wf.status;
     const head=el('div',{class:'card'},
+      el('h2',{class:'sronly',text:'Workflow status'}),
       el('div',{class:'row',style:'align-items:center;gap:10px'},wfBadge(s),el('span',{class:'muted',text:(wf.name||'')+' · round '+(wf.current_round==null?'—':wf.current_round)})),
       el('div',{class:'mono muted',style:'margin-top:6px',text:'workflow '+id}),
       kvTable([['current step',wf.current_step_id||'—'],['tasks',wf.total_tasks],['failures',wf.total_failures],['reason',wf.reason||'—']])
     );
     // controls
     const ctl=el('div',{class:'row',style:'gap:10px;margin-top:4px'});
-    if(s==='ready'){const b=el('button',{text:'Start workflow'});b.addEventListener('click',()=>{b.disabled=true;b.textContent='Starting…';api('POST','/v1/workflows/'+encodeURIComponent(id)+'/start').then(()=>{load();}).catch(()=>{b.disabled=false;b.textContent='Start workflow';});});ctl.append(b);}
-    if(!WF_TERMINAL.has(s)&&s!=='ready'){const cb=el('button',{class:'sec',text:'Cancel'});cb.addEventListener('click',()=>{if(!confirm('Cancel this workflow? Its current Agent Task is cancelled; already-finished work keeps its result.'))return;cb.disabled=true;cb.textContent='Cancelling…';api('POST','/v1/workflows/'+encodeURIComponent(id)+'/cancel').then(()=>{load();}).catch(()=>{cb.disabled=false;cb.textContent='Cancel';});});ctl.append(cb);}
+    if(s==='ready'){const b=el('button',{text:'Start workflow'});b.addEventListener('click',()=>{if(b.disabled)return;busy(b,true,'Starting…');announce('Starting workflow…');api('POST','/v1/workflows/'+encodeURIComponent(id)+'/start').then(()=>{announce('Workflow started.');load();}).catch(()=>{busy(b,false,'Start workflow');announce('Could not start.');});});ctl.append(b);}
+    if(!WF_TERMINAL.has(s)&&s!=='ready'){const cb=el('button',{class:'sec',text:'Cancel'});cb.addEventListener('click',()=>{if(cb.disabled)return;if(!confirm('Cancel this workflow? Its current Agent Task is cancelled; already-finished work keeps its result.'))return;busy(cb,true,'Cancelling…');announce('Cancelling…');api('POST','/v1/workflows/'+encodeURIComponent(id)+'/cancel').then(()=>{announce('Cancellation requested.');load();}).catch(()=>{busy(cb,false,'Cancel');announce('Could not cancel.');});});ctl.append(cb);}
     head.append(ctl);
     // steps
     const stc=el('div',{class:'card'},el('h2',{text:'Steps'}));
-    const st=el('table');st.append(el('tr',null,el('th',{text:'Step'}),el('th',{text:'Round'}),el('th',{text:'Status'})));(wf.step_executions||[]).forEach(se=>st.append(el('tr',null,el('td',{text:se.step_id}),el('td',{text:se.round}),el('td',null,wfBadge(se.status)))));stc.append(st);
-    // events (bounded, deduped, no raw task logs — workflow lifecycle events only)
+    const st=el('table');st.append(el('tr',null,el('th',{scope:'col',text:'Step'}),el('th',{scope:'col',text:'Round'}),el('th',{scope:'col',text:'Status'})));(wf.step_executions||[]).forEach(se=>st.append(el('tr',null,el('td',{text:se.step_id}),el('td',{text:se.round}),el('td',null,wfBadge(se.status)))));stc.append((wf.step_executions||[]).length?el('div',{class:'tablewrap'},st):el('div',{class:'muted',text:'No steps yet.'}));
+    // events (bounded, deduped, no raw task logs — workflow LIFECYCLE events only)
     const evc=el('div',{class:'card'},el('h2',{text:'Recent events'}));
-    const et=el('table');et.append(el('tr',null,el('th',{text:'#'}),el('th',{text:'Event'}),el('th',{text:'When'})));
-    events.slice(-40).forEach(e=>et.append(el('tr',null,el('td',{class:'mono',text:e.seq}),el('td',{text:e.type}),el('td',{class:'mono muted',text:e.ts||''}))));
-    evc.append(et);if(!events.length)evc.append(el('div',{class:'muted',text:'No events yet.'}));
+    if(events.length){const et=el('table');et.append(el('tr',null,el('th',{scope:'col',text:'#'}),el('th',{scope:'col',text:'Event'}),el('th',{scope:'col',text:'When'})));events.slice(-40).forEach(e=>et.append(el('tr',null,el('td',{class:'mono',text:e.seq}),el('td',{text:e.type}),el('td',{class:'mono muted',text:fmtTs(e.ts)}))));evc.append(el('div',{class:'tablewrap'},et));}
+    else evc.append(el('div',{class:'muted',text:WF_TERMINAL.has(s)?'No further events.':'Waiting for events…'}));
     app.replaceChildren(head,stc,evc);
+    // announce status transitions for screen readers
+    if(s!==lastStatus){lastStatus=s;announce('Workflow '+s+(wf.reason?' ('+wf.reason+')':'')+'.');}
   };
   // snapshot poll (status/step/round/counters) — stops on terminal / disposal
   const load=()=>{
