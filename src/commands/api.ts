@@ -206,6 +206,7 @@ export function registerApiCommand(program: Command): void {
         process.stdout.write(`  API token file: ${tf.path} (mode 0600, ${tf.created ? 'created' : 'reused'}) — keep it secret; the token itself is never printed\n`)
         process.stdout.write(`  durable store: ${dbPath} (tasks + event history persisted; non-terminal tasks recovered on restart)\n`)
         process.stdout.write(`  workflows: durable Workflow Runtime enabled — POST /v1/workflows to create, /start to run (running workflows recovered on restart)\n`)
+        process.stdout.write(`  workflow UI: open  ${base}/ui?token=<api token>  to compile + preview a workflow draft (loopback)\n`)
         if (relayUrl) {
           process.stdout.write(`  remote execution: ENABLED via relay ${relayUrl} — target a node with node_id (agents: GET /v1/agents)\n`)
         } else {
