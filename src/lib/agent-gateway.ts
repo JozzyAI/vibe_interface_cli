@@ -863,7 +863,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
       let rrec: RunRecord
       try {
-        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id })
+        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id, verify: reqv.verify })
       } catch (err) {
         release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
         // Start DEFINITELY failed → record the canonical failure terminally, once.
@@ -901,6 +901,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           metadata: reqv.metadata,
           encryptionPublicKey, // mandatory — run_start payload is encrypted for the node
           workspaceLeaseId: reqv.workspace_lease_id, // enforced Node-side; never reaches the provider
+          verify: reqv.verify, // enforced Node-side; never reaches the provider
         })
       } else {
         // agent === 'mock' and node 'local' are guaranteed here, so startRun cannot
@@ -912,6 +913,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           workspaceKey: reqv.workspace?.workspace_key,
           permissionMode: reqv.execution?.permission_mode,
           extraMetadata: reqv.metadata,
+          verify: reqv.verify,
         })
       }
       started = true

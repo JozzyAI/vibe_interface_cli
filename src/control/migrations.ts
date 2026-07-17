@@ -293,7 +293,12 @@ CREATE TABLE workflow_drafts (
 );
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }]
+/** Schema v13 — durable Harness-owned test VERIFICATION embedded in a task result.
+ *  Additive nullable column (NULL for every legacy/verifier-less result, so old rows
+ *  stay valid); bounded JSON of the TaskVerificationV1 record. */
+const V13 = `ALTER TABLE task_results ADD COLUMN verification_json TEXT;`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }, { version: 13, sql: V13 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

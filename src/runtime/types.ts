@@ -33,6 +33,10 @@ export type NonRecoverableReason =
   | 'permission_denied'
   | 'unknown_repo'
   | 'invalid_task'
+  // The step declared a Harness test verifier but this node cannot run it (bad
+  // config or the program is not installed). Fail-closed BEFORE any agent runs so
+  // we never produce a "completed" result that can never be trust-verified.
+  | 'verifier_unavailable'
   // The controlled GitHub auth path did not resolve to an allowlisted account
   // (e.g. the Windows GCM / personal-account fallback). Non-recoverable: every
   // agent on this node shares the same broken credential path, so switching

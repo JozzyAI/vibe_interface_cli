@@ -40,6 +40,8 @@ export interface StartRunOpts {
   /** Additional metadata merged into the RunRecord (e.g. Symphony issue fields). */
   extraMetadata?: Record<string, unknown>
   permissionMode?: PermissionMode
+  /** Harness-owned post-task test verifier (argv only); recorded on the RunRecord. */
+  verify?: import('../types.js').RunRecord['verify']
 }
 
 function getBackend(agent: AgentBackend): Backend {
@@ -99,6 +101,7 @@ export async function startRun(opts: StartRunOpts): Promise<RunRecord> {
     branch: opts.branch,
     prompt_file: opts.promptFile,
     permission_mode: opts.permissionMode,
+    ...(opts.verify ? { verify: opts.verify } : {}),
     metadata,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),

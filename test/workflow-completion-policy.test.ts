@@ -20,6 +20,7 @@ import { type AgentTaskClient, type AgentTaskCreateRequest } from '../src/workfl
 import { type WorkspaceLeaseClient } from '../src/workflow/workspace-lease-client.js'
 import { workspaceLeaseId, type WorkspaceLeaseV1, type WorkspaceRevision } from '../src/lib/workspace-lease.js'
 import { buildTaskResult, type EvidenceRef } from '../src/lib/agent-task-result.js'
+import { buildTaskVerification, type TaskVerificationV1 } from '../src/lib/task-verification.js'
 import { evaluateCompletion, assembleEvidence } from '../src/workflow/completion-policy.js'
 import { WORKFLOW_EVENT_CONTRACT_VERSION } from '../src/workflow/contract.js'
 import type { WorkflowSpec, CompletionPolicy } from '../src/workflow/contract.js'
@@ -28,9 +29,11 @@ const iso = () => new Date().toISOString()
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const tmpDb = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wf-cp-')), 'control.sqlite')
 const gitRev = (seed: string): WorkspaceRevision => ({ revision_kind: 'git', head_commit: '0'.repeat(40), dirty: false, state_hash: crypto.createHash('sha256').update(seed).digest('hex'), changed_files: seed === 'after' ? ['a.ts'] : [], observed_at: iso() })
+// Harness-owned verification records: the ONLY source of tests_passed/tests_failed.
+const PASSED_VERIFICATION: TaskVerificationV1 = buildTaskVerification({ argv: ['node', '--test'], exitCode: 0, startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:01Z', output: 'suite green' })
 
 // ── fake Gateway that persists a durable AgentTaskResult (exit code + evidence) ──
-interface TaskDesc { output: Record<string, unknown>; exitCode?: number; evidence?: EvidenceRef[] }
+interface TaskDesc { output: Record<string, unknown>; exitCode?: number; evidence?: EvidenceRef[]; verification?: TaskVerificationV1 }
 class ScriptedFake implements AgentTaskClient {
   byKey = new Map<string, any>(); byId = new Map<string, any>(); creates: AgentTaskCreateRequest[] = []; n = 0
   constructor(public store: SqliteControlStore, private script: (r: AgentTaskCreateRequest) => TaskDesc) {}
@@ -41,7 +44,7 @@ class ScriptedFake implements AgentTaskClient {
     this.store.createTaskDurable({ task_id, agent: req.agent, node_id: req.node_id ?? null, status: 'queued', idempotency_key: req.idempotency_key, request_fingerprint: 'fp:' + req.idempotency_key }, { sequence: 0, event_type: 'task.created', ts: iso(), payload: {} })
     // Persist the durable AgentTaskResult, exactly as the real Gateway would.
     const text = JSON.stringify(d.output)
-    const result = buildTaskResult({ text, processExitCode: d.exitCode ?? 0, evidenceRefs: d.evidence ?? [] })
+    const result = buildTaskResult({ text, processExitCode: d.exitCode ?? 0, evidenceRefs: d.evidence ?? [], ...(d.verification ? { verification: d.verification } : {}) })
     this.store.terminalizeTaskWithResultDurable(task_id, 1, { status: 'completed' }, { sequence: 1, event_type: 'task.completed', ts: iso(), payload: {} }, 'available', result)
     const t = { task_id, req, ...d, key: req.idempotency_key, text }; this.byKey.set(req.idempotency_key, t); this.byId.set(task_id, t); return { task_id }
   }
@@ -99,7 +102,7 @@ test('unit: evaluateCompletion — satisfied/complete, missing/blocked, conflict
   // remaining work declared → blocked
   assert.equal(evaluateCompletion({ require_no_remaining_work: true }, { ...base }, [{ item: 'x' }]).decision, 'blocked')
   // assembleEvidence: repository_changed is SYSTEM-derived from revisions (before != after)
-  const ev = assembleEvidence({ taskStatus: 'completed', result: buildTaskResult({ text: '{}', processExitCode: 0, evidenceRefs: [{ kind: 'tests_passed' }] }), revisionBefore: gitRev('before'), revisionAfter: gitRev('after') })
+  const ev = assembleEvidence({ taskStatus: 'completed', result: buildTaskResult({ text: '{}', processExitCode: 0, verification: PASSED_VERIFICATION }), revisionBefore: gitRev('before'), revisionAfter: gitRev('after') })
   assert.equal(ev.repository_changed, true); assert.equal(ev.tests_passed, true); assert.equal(ev.exit_code, 0)
 })
 
@@ -107,7 +110,7 @@ test('unit: evaluateCompletion — satisfied/complete, missing/blocked, conflict
 
 test('reviewer requests complete with SUFFICIENT evidence → completed (exactly one completion event)', async () => {
   await withStore(async (store) => {
-    const fake = new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 'done' }, exitCode: 0, evidence: [{ kind: 'tests_passed' }] }))
+    const fake = new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 'done' }, exitCode: 0, verification: PASSED_VERIFICATION }))
     const rt = mkRt(store, fake)
     const wf = (await rt.createWorkflow(policySpec({ required_evidence: ['task_status', 'exit_code', 'content_hash'], require_tests_passed: true }), { objective: 'x' })).workflow_id
     await rt.startWorkflow(wf); await rt.awaitWorkflow(wf)
@@ -165,7 +168,7 @@ test('restart PRESERVES evidence and does not re-complete; completion event stay
   let wf = ''
   {
     const store = openControlStore({ path: db })
-    const fake = new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 'done' }, exitCode: 0, evidence: [{ kind: 'tests_passed' }] }))
+    const fake = new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 'done' }, exitCode: 0, verification: PASSED_VERIFICATION }))
     const rt = mkRt(store, fake)
     wf = (await rt.createWorkflow(policySpec({ require_tests_passed: true }), { objective: 'x' })).workflow_id
     await rt.startWorkflow(wf); await rt.awaitWorkflow(wf)
@@ -177,7 +180,7 @@ test('restart PRESERVES evidence and does not re-complete; completion event stay
     // evidence persisted
     assert.equal((await store.getCompletionEvidence(reviewExec(wf)))!.decision, 'complete')
     // recovery does not re-drive/re-complete a terminal workflow
-    const rt = mkRt(store, new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 'done' }, exitCode: 0, evidence: [{ kind: 'tests_passed' }] })))
+    const rt = mkRt(store, new ScriptedFake(store, () => ({ output: { status: 'complete', summary: 'done' }, exitCode: 0, verification: PASSED_VERIFICATION })))
     await rt.recoverWorkflows()
     await sleep(60)
     assert.equal((await store.getWorkflow(wf))!.status, 'completed')

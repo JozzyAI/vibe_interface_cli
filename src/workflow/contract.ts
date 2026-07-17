@@ -113,6 +113,11 @@ export interface AgentTaskStep {
   permission_mode?: 'default' | 'unsafe-skip'
   /** A safe opaque workspace key, OR a single `{{ inputs.<name> }}` reference. */
   workspace_key_template?: string
+  /** Optional Harness-owned test verifier: a TRUSTED argv (never shell text) run by
+   *  the Node after the Agent exits and before the result is finalized, inside the
+   *  leased workspace. Its exit code is the sole source of tests_passed/tests_failed
+   *  evidence for the completion policy. Requires a bound workspace. */
+  verify?: import('../lib/task-verification.js').TaskVerifyConfig
   /**
    * Optional, fail-closed. Declares which bounded context slot this step's
    * VALIDATED output replaces on success — `latest_planner_decision` (planner /

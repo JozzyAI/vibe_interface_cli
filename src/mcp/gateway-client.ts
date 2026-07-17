@@ -56,6 +56,7 @@ export interface StartTaskRequest {
   metadata?: Record<string, unknown>
   idempotency_key?: string
   workspace_lease_id?: string
+  verify?: { argv: string[] }
 }
 
 export function isLoopbackGatewayUrl(url: string): boolean {

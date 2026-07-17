@@ -137,15 +137,17 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
       && (row.process_exit_code ?? null) === (result.process_exit_code ?? null)
       && row.evidence_refs_json === encodeJson(result.evidence_refs ?? [], 256 * 1024, 'task_result.evidence_refs')
       && row.artifact_refs_json === encodeJson(result.artifact_refs ?? [], 256 * 1024, 'task_result.artifact_refs')
+      && (row.verification_json ?? null) === (result.verification ? encodeJson(result.verification, 256 * 1024, 'task_result.verification') : null)
   }
   private writeResultRow(taskId: string, resultStatus: string, result: AgentTaskResultV1 | null): void {
     const now = nowIso()
-    this.db.prepare(`INSERT INTO task_results (task_id,schema_version,result_status,final_output_text,process_exit_code,finalized_at,content_hash,evidence_refs_json,artifact_refs_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
+    this.db.prepare(`INSERT INTO task_results (task_id,schema_version,result_status,final_output_text,process_exit_code,finalized_at,content_hash,evidence_refs_json,artifact_refs_json,verification_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
       taskId, result?.schema_version ?? '1', resultStatus,
       result ? boundString(result.final_output.text, MAX_FINAL_OUTPUT_BYTES, 'task_result.final_output') : null,
       result?.process_exit_code ?? null, result?.finalized_at ?? null, result?.content_hash ?? null,
       encodeJson(result?.evidence_refs ?? [], 256 * 1024, 'task_result.evidence_refs'),
-      encodeJson(result?.artifact_refs ?? [], 256 * 1024, 'task_result.artifact_refs'), now,
+      encodeJson(result?.artifact_refs ?? [], 256 * 1024, 'task_result.artifact_refs'),
+      result?.verification ? encodeJson(result.verification, 256 * 1024, 'task_result.verification') : null, now,
     )
     this.db.prepare('UPDATE tasks SET result_status = ? WHERE task_id = ?').run(resultStatus, taskId)
   }
@@ -164,7 +166,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     const row = this.taskResultRow(taskId); if (!row) return null
     if (row.result_status !== 'available') return { task_id: taskId, result_status: row.result_status, result: null }
     // Revalidate the persisted envelope on read (untrusted JSON; corruption fails closed).
-    const v = validateTaskResult({ schema_version: row.schema_version, final_output: { kind: 'text', text: row.final_output_text ?? '' }, process_exit_code: row.process_exit_code, finalized_at: row.finalized_at ?? '', content_hash: row.content_hash ?? '', evidence_refs: decodeJson(row.evidence_refs_json, 256 * 1024, 'task_result.evidence_refs') ?? [], artifact_refs: decodeJson(row.artifact_refs_json, 256 * 1024, 'task_result.artifact_refs') ?? [] })
+    const v = validateTaskResult({ schema_version: row.schema_version, final_output: { kind: 'text', text: row.final_output_text ?? '' }, process_exit_code: row.process_exit_code, finalized_at: row.finalized_at ?? '', content_hash: row.content_hash ?? '', evidence_refs: decodeJson(row.evidence_refs_json, 256 * 1024, 'task_result.evidence_refs') ?? [], artifact_refs: decodeJson(row.artifact_refs_json, 256 * 1024, 'task_result.artifact_refs') ?? [], ...(row.verification_json != null ? { verification: decodeJson(row.verification_json, 256 * 1024, 'task_result.verification') } : {}) })
     if (!v.ok) throw new ControlStoreError('corruption', `persisted task result is invalid (${v.code})`)
     return { task_id: taskId, result_status: 'available', result: v.value }
   }
@@ -1037,7 +1039,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
 
 // ── row shapes ─────────────────────────────────────────────────────────────────
 interface TaskRow { task_id: string; revision: number; node_id: string | null; agent: string; workspace_key: string | null; permission_mode: string | null; status: string; remote_run_id: string | null; input_text: string | null; metadata_json: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; error_code: string | null; error_message: string | null; history_incomplete: number; history_reason: string | null; history_boundary_sequence: number | null; last_remote_event_sequence: number | null; idempotency_key: string | null; request_fingerprint: string | null; result_status: string | null }
-interface TaskResultRow { task_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
+interface TaskResultRow { task_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; verification_json: string | null; created_at: string }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null }

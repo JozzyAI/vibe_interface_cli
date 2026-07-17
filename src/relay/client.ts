@@ -161,6 +161,7 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     ...(msg.branch && { branch: msg.branch }),
     ...(promptFile && { prompt_file: promptFile }),
     ...(msg.permission_mode && { permission_mode: msg.permission_mode }),
+    ...(msg.verify && { verify: msg.verify }),  // Harness-owned post-task verifier (Node-local; never forwarded to the provider)
     ...(msg.metadata && { metadata: msg.metadata }),
     ...(stopAesKey && { stop_aes_key: stopAesKey }),        // MVP 4D: stored for handleRunStop
     ...(approvalAesKey && { approval_aes_key: approvalAesKey }), // MVP 4F: stored for handleEncryptedApprovalResponse
@@ -254,6 +255,7 @@ async function handleEncryptedRunStart(
     ...(payload.permission_mode && { permission_mode: payload.permission_mode }),
     ...(payload.metadata && { metadata: payload.metadata }),
     ...(payload.workspace_lease_id && { workspace_lease_id: payload.workspace_lease_id }), // from the ENCRYPTED payload (relay never saw it)
+    ...(payload.verify && { verify: payload.verify }), // from the ENCRYPTED payload (relay never saw it)
   }
 
   return handleRunStart(ws, nodeId, config, synthetic, eventAesKey, stopAesKey, approvalAesKey)
@@ -1081,6 +1083,9 @@ export interface RemoteRunStartOpts {
   /** workspace_lease_v1: authorize the run against the node's active workspace lease.
    *  Carried INSIDE the encrypted payload; never forwarded to the provider/prompt. */
   workspaceLeaseId?: string
+  /** Harness-owned post-task verifier config (argv only). Carried INSIDE the
+   *  encrypted payload; never forwarded to the provider/prompt. */
+  verify?: { argv: string[] }
   /** When set, encrypt the run_start payload for the target node. */
   encryptionPublicKey?: string  // target node's X25519 encryption_public_key (base64)
 }
@@ -1131,6 +1136,7 @@ export async function remoteRunStart(
           ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
           ...(opts.metadata && { metadata: opts.metadata }),
           ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
+          ...(opts.verify && { verify: opts.verify }),
         }
         const enc = encryptPayload(opts.encryptionPublicKey, payload)
         capturedEphemeralPrivKey = enc.ephemeralPrivateKey
@@ -1162,6 +1168,7 @@ export async function remoteRunStart(
           ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
           ...(opts.metadata && { metadata: opts.metadata }),
           ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
+          ...(opts.verify && { verify: opts.verify }),
         })
       }
     })

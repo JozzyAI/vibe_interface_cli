@@ -20,6 +20,7 @@
 import type { RunRecord, RunStatus, RunEvent, AgentBackend, PermissionMode } from '../types.js'
 import type { VibeError } from '../types.js'
 import type { RunErrorCode } from './run-error.js'
+import { validateTaskVerifyConfig } from './task-verification.js'
 
 /** Bumped when the wire shape changes incompatibly. Carried on every resource. */
 export const TASK_CONTRACT_VERSION = 1
@@ -211,6 +212,9 @@ export interface CreateTaskRequest {
    *  request fingerprint. Reaches the Node ONLY for authorization — NEVER forwarded
    *  to the provider (prompt/metadata/env) and never logged. */
   workspace_lease_id?: string
+  /** OPTIONAL Harness-owned post-task test verifier (argv only). Reaches the Node
+   *  ONLY for execution — NEVER forwarded to the provider (prompt/env). */
+  verify?: { argv: string[] }
 }
 
 /**
@@ -311,6 +315,15 @@ export function validateCreateTaskRequest(
     }
   }
 
+  // Optional Harness-owned test verifier — a bounded argv (never shell text). It
+  // reaches the Node for execution only and is NEVER forwarded to the provider.
+  let verify: { argv: string[] } | undefined
+  if (b.verify !== undefined) {
+    const vv = validateTaskVerifyConfig(b.verify)
+    if (!vv.ok) return fail(`\`verify\` is invalid: ${vv.message}`)
+    verify = { argv: vv.value.argv }
+  }
+
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }
   if (typeof b.node_id === 'string') value.node_id = b.node_id
   if (workspace && typeof workspace.workspace_key === 'string') value.workspace = { workspace_key: workspace.workspace_key }
@@ -318,6 +331,7 @@ export function validateCreateTaskRequest(
   if (isPlainObject(b.metadata)) value.metadata = b.metadata
   if (typeof b.idempotency_key === 'string') value.idempotency_key = b.idempotency_key
   if (typeof b.workspace_lease_id === 'string') value.workspace_lease_id = b.workspace_lease_id
+  if (verify) value.verify = verify
   return { ok: true, value }
 }
 
