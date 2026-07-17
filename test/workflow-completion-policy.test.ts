@@ -60,6 +60,7 @@ class ChangeLeaseClient implements WorkspaceLeaseClient {
   async acquire(nodeId: string, workflowId: string, workspaceKey: string): Promise<{ lease: WorkspaceLeaseV1; created: boolean }> {
     return { lease: { workspace_lease_id: workspaceLeaseId(workflowId, nodeId, workspaceKey), workflow_id: workflowId, node_id: nodeId, workspace_key: workspaceKey, mode: 'exclusive', status: 'active', base_revision: gitRev('before'), current_revision: gitRev('before'), acquired_at: iso() }, created: true }
   }
+  async get(nodeId: string, leaseId: string): Promise<WorkspaceLeaseV1 | null> { return { workspace_lease_id: leaseId, workflow_id: '', node_id: nodeId, workspace_key: '', mode: 'exclusive', status: 'active', base_revision: gitRev('before'), current_revision: gitRev('before'), acquired_at: iso() } }
   // first observe (before task) = 'before'; subsequent (after task) = 'after' → a change.
   async observeRevision(): Promise<WorkspaceRevision> { return gitRev(this.obs++ === 0 ? 'before' : 'after') }
   async release(_n: string, leaseId: string): Promise<WorkspaceLeaseV1> { return { workspace_lease_id: leaseId, workflow_id: '', node_id: _n, workspace_key: '', mode: 'exclusive', status: 'released' } }

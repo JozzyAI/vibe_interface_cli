@@ -552,7 +552,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
   }
   private leaseRow(id: string): WorkspaceLeaseRow | undefined { return this.db.prepare('SELECT * FROM workflow_workspace_leases WHERE workspace_lease_id = ?').get(id) as WorkspaceLeaseRow | undefined }
   private toLease(r: WorkspaceLeaseRow): WorkflowWorkspaceLeaseRecord {
-    return { workspace_lease_id: r.workspace_lease_id, workflow_id: r.workflow_id, node_id: r.node_id, workspace_key: r.workspace_key, mode: r.mode, status: r.status, revision: r.revision, base_revision: this.decodeRevision(r.base_revision_json, 'lease.base_revision'), current_revision: this.decodeRevision(r.current_revision_json, 'lease.current_revision'), acquired_at: r.acquired_at, release_requested_at: r.release_requested_at, released_at: r.released_at, created_at: r.created_at, updated_at: r.updated_at }
+    return { workspace_lease_id: r.workspace_lease_id, workflow_id: r.workflow_id, node_id: r.node_id, workspace_key: r.workspace_key, mode: r.mode, status: r.status, revision: r.revision, base_revision: this.decodeRevision(r.base_revision_json, 'lease.base_revision'), current_revision: this.decodeRevision(r.current_revision_json, 'lease.current_revision'), acquired_at: r.acquired_at, release_requested_at: r.release_requested_at, released_at: r.released_at, acquire_reason: r.acquire_reason ?? null, created_at: r.created_at, updated_at: r.updated_at }
   }
 
   async recordWorkspaceLeaseIntent(input: { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string }): Promise<WorkflowWorkspaceLeaseRecord> {
@@ -580,8 +580,20 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
       const acq = isIsoUtc(acquiredAt) ? acquiredAt : nowIso()
       const baseJson = reactivating ? this.encodeRevision(baseRevision, 'lease.base_revision') : (r.base_revision_json ?? this.encodeRevision(baseRevision, 'lease.base_revision'))
       const curJson = this.encodeRevision(currentRevision ?? baseRevision, 'lease.current_revision')
-      this.db.prepare(`UPDATE workflow_workspace_leases SET status='active', base_revision_json=@base, current_revision_json=@cur, acquired_at=@acq2, release_requested_at=NULL, released_at=NULL, revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
+      this.db.prepare(`UPDATE workflow_workspace_leases SET status='active', base_revision_json=@base, current_revision_json=@cur, acquired_at=@acq2, release_requested_at=NULL, released_at=NULL, acquire_reason=NULL, revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
         .run({ id: leaseId, base: baseJson, cur: curJson, acq2: reactivating ? acq : (r.acquired_at ?? acq), now: nowIso() })
+      return this.toLease(this.leaseRow(leaseId)!)
+    })()
+  }
+  /** Set (or clear, with null) the SANITIZED reason a lease acquisition is unresolved
+   *  or failed. Only meaningful while `status='acquiring'`; cleared automatically on
+   *  activate/release. Idempotent. */
+  async setWorkspaceLeaseAcquireReason(leaseId: string, reason: string | null): Promise<WorkflowWorkspaceLeaseRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.leaseRow(leaseId); if (!r) throw new ControlStoreError('not_found', `lease not found: ${leaseId}`)
+      this.db.prepare(`UPDATE workflow_workspace_leases SET acquire_reason=@reason, revision=revision+1, updated_at=@now WHERE workspace_lease_id=@id`)
+        .run({ id: leaseId, reason: reason === null ? null : boundString(reason, 256, 'lease.acquire_reason'), now: nowIso() })
       return this.toLease(this.leaseRow(leaseId)!)
     })()
   }
@@ -1043,7 +1055,7 @@ interface TaskResultRow { task_id: string; schema_version: string; result_status
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null }
-interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; created_at: string; updated_at: string }
+interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; acquire_reason: string | null; created_at: string; updated_at: string }
 interface HumanRequestRow { request_id: string; workflow_id: string; step_execution_id: string; kind: string; prompt: string; choices_json: string | null; status: string; response_value: string | null; created_at: string; responded_at: string | null; updated_at: string; revision: number }
 interface DraftRow { draft_id: string; idempotency_key: string | null; request_fingerprint: string | null; compiler_task_id: string | null; compiler_capability_json: string | null; constraints_json: string | null; inventory_snapshot_json: string | null; inventory_hash: string | null; spec_json: string | null; input_values_json: string | null; spec_hash: string | null; policy_summary_json: string | null; policy_summary_hash: string | null; preview_json: string | null; rationale_json: string | null; warnings_json: string | null; questions_json: string | null; compiler_status: string; validation_status: string; approval_status: string; materialized_workflow_id: string | null; created_at: string; updated_at: string }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }

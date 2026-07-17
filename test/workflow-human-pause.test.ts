@@ -54,6 +54,9 @@ class FakeLeaseClient implements WorkspaceLeaseClient {
     const id = workspaceLeaseId(workflowId, nodeId, workspaceKey); this.active.set(id, workflowId)
     return { lease: { workspace_lease_id: id, workflow_id: workflowId, node_id: nodeId, workspace_key: workspaceKey, mode: 'exclusive', status: 'active', base_revision: R0, current_revision: R0, acquired_at: iso() }, created: true }
   }
+  async get(nodeId: string, leaseId: string): Promise<WorkspaceLeaseV1 | null> {
+    const wf = this.active.get(leaseId); return wf ? { workspace_lease_id: leaseId, workflow_id: wf, node_id: nodeId, workspace_key: '', mode: 'exclusive', status: 'active', base_revision: R0, current_revision: R0, acquired_at: iso() } : null
+  }
   async observeRevision(): Promise<WorkspaceRevision> { return R0 }
   async release(_n: string, leaseId: string): Promise<WorkspaceLeaseV1> { this.releases.push(leaseId); this.active.delete(leaseId); return { workspace_lease_id: leaseId, workflow_id: '', node_id: _n, workspace_key: '', mode: 'exclusive', status: 'released' } }
 }
