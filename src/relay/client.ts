@@ -20,6 +20,7 @@ import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from
 import { openNodeJournal } from '../node-journal/sqlite-journal.js'
 import { RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY } from '../node-journal/contract.js'
 import { withVerifierSandboxCapability } from '../runtime/sandbox.js'
+import { handleWorkspaceLeaseRequest, handleWorkspaceRevisionRequest, isWorkspaceLeaseRequestType, isWorkspaceRevisionRequestType, workspaceLeaseCapability } from './node-lease-dispatch.js'
 import { validateTaskResult, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
 import { WorkspaceLeaseError, observeWorkspaceRevision, type WorkspaceLeaseV1 } from '../lib/workspace-lease.js'
 import { isIsoUtc as journalIsoOk, nowIso as journalNowIso } from '../node-journal/serialization.js'
@@ -461,10 +462,18 @@ export async function relayNodeDaemon(
     transport: 'relay',
     // Advertise journaled replay only when the journal actually opened, so a
     // client can detect replay support (absence ⇒ live-only, older behavior).
+    // `workspace_lease_v1` is derived from the SAME authority (nodeJournal) that backs
+    // the TOTAL lease handlers via `workspaceLeaseCapability`, so the capability can
+    // never be advertised without the acquire/get/release handlers being able to run
+    // (which would strand the Gateway on a silent timeout).
     // `verify-sandbox` is appended only when the enforcing verifier-sandbox probe
     // passes; evaluated once at register time (probe cached per process) → a
     // bubblewrap install/removal needs a Node restart to change the advertisement.
-    capabilities: withVerifierSandboxCapability(nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY] : ['run', 'stream', 'stop', 'workspace']),
+    capabilities: withVerifierSandboxCapability([
+      'run', 'stream', 'stop', 'workspace',
+      ...(nodeJournal ? [RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY] : []),
+      ...(workspaceLeaseCapability(nodeJournal) ? [workspaceLeaseCapability(nodeJournal)!] : []),
+    ]),
     agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
@@ -647,42 +656,21 @@ export async function relayNodeDaemon(
           } catch (err) {
             sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'run_result_ack', req_id: reqId, run_id: runId, ok: false, error: (err as Error).message, code: 'internal_error' })
           }
-        } else if (msg.type === 'workspace_lease_acquire' || msg.type === 'workspace_lease_get' || msg.type === 'workspace_lease_release') {
-          // workspace_lease_v1: the Node is the authority. Physical paths + revision
-          // observation stay Node-local; only bounded opaque lease data is returned.
+        } else if (isWorkspaceLeaseRequestType((msg as { type?: string }).type)) {
+          // workspace_lease_v1: the Node is the authority. The handler is TOTAL — it
+          // ALWAYS yields exactly one structured ack (success or sanitized error), so a
+          // lease request can never be silently dropped (the failure that stranded the
+          // Gateway). Physical paths stay Node-local; only bounded opaque lease data
+          // crosses. Deterministic lease_id idempotency + containment are unchanged.
           const reqId = (msg as { req_id: string }).req_id
-          const leaseAck = (fields: Record<string, unknown>): void => sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'workspace_lease_ack', req_id: reqId, ...fields } as never)
-          if (!nodeJournal) { leaseAck({ ok: false, error: 'node cannot enforce workspace leases', code: 'workspace_lease_unavailable' }); }
-          else {
-            try {
-              if (msg.type === 'workspace_lease_acquire') {
-                const m = msg as import('./types.js').WorkspaceLeaseAcquireRequestMsg
-                // Contain the (untrusted) key + observe the base revision LOCALLY.
-                const wsr = resolveContainedWorkspace(m.workspace_key, config.workspace_root)
-                if (!wsr.ok) { leaseAck({ ok: false, error: 'invalid workspace key', code: 'workspace_lease_invalid' }) }
-                else { const base = observeWorkspaceRevision(wsr.path); const r = nodeJournal.acquireWorkspaceLease(m.workflow_id, nodeId, m.workspace_key, base); leaseAck({ ok: true, created: r.created, lease: r.lease }) }
-              } else if (msg.type === 'workspace_lease_get') {
-                const lease = nodeJournal.getWorkspaceLease((msg as { workspace_lease_id: string }).workspace_lease_id)
-                if (!lease) leaseAck({ ok: false, error: 'no such lease', code: 'workspace_lease_invalid' }); else leaseAck({ ok: true, lease })
-              } else {
-                const r = nodeJournal.releaseWorkspaceLease((msg as { workspace_lease_id: string }).workspace_lease_id)
-                leaseAck({ ok: true, lease: r.lease })
-              }
-            } catch (err) {
-              if (err instanceof WorkspaceLeaseError) leaseAck({ ok: false, error: 'workspace lease operation failed', code: err.code })
-              else leaseAck({ ok: false, error: 'internal error', code: 'internal_error' })
-            }
-          }
-        } else if (msg.type === 'workspace_revision_observe') {
-          // workspace_lease_v1: a FRESH read-only revision observation, resolved +
-          // observed LOCALLY. Only bounded revision evidence leaves the node; no path.
-          const m = msg as import('./types.js').WorkspaceRevisionObserveRequestMsg
-          const revAck = (fields: Record<string, unknown>): void => sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'workspace_revision_ack', req_id: m.req_id, ...fields } as never)
-          try {
-            const wsr = resolveContainedWorkspace(m.workspace_key, config.workspace_root)
-            if (!wsr.ok) revAck({ ok: false, error: 'invalid workspace key', code: 'workspace_revision_unavailable' })
-            else revAck({ ok: true, revision: observeWorkspaceRevision(wsr.path) })
-          } catch { revAck({ ok: false, error: 'internal error', code: 'internal_error' }) }
+          const body = handleWorkspaceLeaseRequest(msg as never, { nodeId, workspaceRoot: config.workspace_root, authority: nodeJournal })
+          sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'workspace_lease_ack', req_id: reqId, ...body } as never)
+        } else if (isWorkspaceRevisionRequestType((msg as { type?: string }).type)) {
+          // workspace_lease_v1: a FRESH read-only revision observation, resolved locally.
+          // TOTAL handler → always exactly one structured ack.
+          const reqId = (msg as { req_id: string }).req_id
+          const body = handleWorkspaceRevisionRequest(msg as never, { nodeId, workspaceRoot: config.workspace_root, authority: nodeJournal })
+          sendMsg(ws, { version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(), type: 'workspace_revision_ack', req_id: reqId, ...body } as never)
         } else if (msg.type === 'run_replay_open') {
           // Journaled replay (run_event_replay_v1): serve THIS subscriber replay+live
           // race-free from the node journal. Events for an ENCRYPTED run are
@@ -1820,7 +1808,7 @@ function oneShotLease(relay: string, token: string, request: (reqId: string) => 
       try {
         const m = JSON.parse(raw.toString()) as RelayMessage
         if ((m as { type?: string }).type === 'workspace_lease_ack' && (m as { req_id?: string }).req_id === reqId) { ws.close(); done(m as import('./types.js').WorkspaceLeaseAckMsg) }
-        else if ((m as { type?: string }).type === 'relay_error') { const e = m as import('./types.js').RelayErrorMsg; ws.terminate(); reject(new RemoteLeaseError(e.message, e.code)) }
+        else if ((m as { type?: string }).type === 'relay_error' && (m as { req_id?: string }).req_id === reqId) { const e = m as import('./types.js').RelayErrorMsg; ws.terminate(); done(undefined, new RemoteLeaseError(e.message ?? 'relay could not route the request', e.code ?? 'workspace_lease_unavailable')) }
       } catch { /* ignore */ }
     })
     ws.on('close', () => done(undefined, new RemoteLeaseError('relay closed before workspace_lease_ack', 'workspace_lease_unavailable')))
@@ -1858,6 +1846,8 @@ export function remoteWorkspaceRevisionObserve(relay: string, token: string, nod
           const a = m as import('./types.js').WorkspaceRevisionAckMsg
           ws.close()
           if (a.ok && a.revision) done(a.revision); else done(undefined, new RemoteLeaseError(a.error ?? 'revision observation failed', a.code ?? 'workspace_revision_unavailable'))
+        } else if ((m as { type?: string }).type === 'relay_error' && (m as { req_id?: string }).req_id === reqId) {
+          const e = m as import('./types.js').RelayErrorMsg; ws.terminate(); done(undefined, new RemoteLeaseError(e.message ?? 'relay could not route the request', e.code ?? 'workspace_revision_unavailable'))
         }
       } catch { /* ignore */ }
     })
