@@ -463,9 +463,10 @@ export async function relayNodeDaemon(
     // Advertise journaled replay only when the journal actually opened, so a
     // client can detect replay support (absence ⇒ live-only, older behavior).
     // `workspace_lease_v1` is derived from the SAME authority (nodeJournal) that backs
-    // the TOTAL lease handlers via `workspaceLeaseCapability`, so the capability can
-    // never be advertised without the acquire/get/release handlers being able to run
-    // (which would strand the Gateway on a silent timeout).
+    // the TOTAL lease handlers via `workspaceLeaseCapability`, so the capability is
+    // advertised only when the acquire/get/release handlers can run. NOTE: this proves
+    // only LOCAL handler availability, NOT end-to-end relay reachability — a relay that
+    // does not forward the request type still fails (fast + structured, not silently).
     // `verify-sandbox` is appended only when the enforcing verifier-sandbox probe
     // passes; evaluated once at register time (probe cached per process) → a
     // bubblewrap install/removal needs a Node restart to change the advertisement.

@@ -104,6 +104,12 @@ export function handleWorkspaceRevisionRequest(msg: { workspace_key?: string }, 
  * The workspace-lease capability to advertise — derived from the SAME authority that
  * backs the handlers, so `workspace_lease_v1` is advertised IFF the acquire/get/release
  * handlers can actually run. Returns the capability string, or null when unavailable.
+ *
+ * SCOPE: advertising this capability proves ONLY that the Node has the local authority
+ * and handlers required to serve workspace-lease requests. It does NOT prove the RPC is
+ * reachable end-to-end — a request must still be forwarded by the relay and routed back;
+ * a relay that does not forward the request type still fails (now fast + structured, via
+ * the relay `default` case, rather than a silent timeout).
  */
 export function workspaceLeaseCapability(authority: NodeLeaseAuthority | undefined): string | null {
   return authority ? WORKSPACE_LEASE_CAPABILITY : null
