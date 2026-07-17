@@ -257,15 +257,25 @@ export async function runSupervisor(run_id: string): Promise<void> {
       // completion policy sees only this system-observed evidence.
       let verification: TaskVerificationV1 | undefined
       if (record.verify) {
+        // Re-check the capability (profile + sandbox) now; if it regressed since the
+        // pre-agent preflight, FAIL the run closed rather than complete unverified.
+        const pf = verifierPreflight(record.verify)
+        if (!pf.ok) {
+          const message = `test verifier unavailable after agent run: ${pf.message}`
+          appendEvent({ type: 'error', run_id, session_id, message, code: 'verifier_unavailable', ts: ts() })
+          updateRun(run_id, { status: 'failed', final_agent: agent, switched, failure_reason: 'verifier_unavailable', recoverable: false, ...(switchReason && { switch_reason: switchReason }), ...(handoffStr && { handoff_path: handoffStr }), child_pid: undefined })
+          appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+          return
+        }
         try {
           verification = await runVerifier(record.verify, record.workspace_path)
-          appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: `✔ test verification: ${verification.kind} (exit ${verification.exit_code})`, ts: ts() })
+          appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: `verification: ${verification.kind} via profile "${verification.profile}" (exit ${verification.exit_code})`, ts: ts() })
         } catch (err) {
-          // A structurally-invalid config slipped past preflight (should not happen):
-          // record a fail-closed tests_failed rather than silently completing unverified.
-          const nowIso = ts()
-          verification = { schema_version: '1', kind: 'tests_failed', argv: record.verify.argv, exit_code: 1, started_at: nowIso, finished_at: nowIso, content_hash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' }
+          // The sandboxed verifier could not run — fail closed (never complete unverified).
           appendEvent({ type: 'error', run_id, session_id, message: `test verifier error: ${(err as Error).message}`, code: 'verifier_error', ts: ts() })
+          updateRun(run_id, { status: 'failed', final_agent: agent, switched, failure_reason: 'verifier_unavailable', recoverable: false, ...(switchReason && { switch_reason: switchReason }), ...(handoffStr && { handoff_path: handoffStr }), child_pid: undefined })
+          appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+          return
         }
       }
       // Finalize the authoritative AgentTaskResult from the adapter's OWN completion

@@ -30,7 +30,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const tmpDb = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wf-cp-')), 'control.sqlite')
 const gitRev = (seed: string): WorkspaceRevision => ({ revision_kind: 'git', head_commit: '0'.repeat(40), dirty: false, state_hash: crypto.createHash('sha256').update(seed).digest('hex'), changed_files: seed === 'after' ? ['a.ts'] : [], observed_at: iso() })
 // Harness-owned verification records: the ONLY source of tests_passed/tests_failed.
-const PASSED_VERIFICATION: TaskVerificationV1 = buildTaskVerification({ argv: ['node', '--test'], exitCode: 0, startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:01Z', output: 'suite green' })
+const PASSED_VERIFICATION: TaskVerificationV1 = buildTaskVerification({ profile: 'node-test', argv: ['node', '--test'], exitCode: 0, startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:01Z', output: 'suite green' })
 
 // ── fake Gateway that persists a durable AgentTaskResult (exit code + evidence) ──
 interface TaskDesc { output: Record<string, unknown>; exitCode?: number; evidence?: EvidenceRef[]; verification?: TaskVerificationV1 }

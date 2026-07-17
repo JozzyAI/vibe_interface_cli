@@ -1085,7 +1085,7 @@ export interface RemoteRunStartOpts {
   workspaceLeaseId?: string
   /** Harness-owned post-task verifier config (argv only). Carried INSIDE the
    *  encrypted payload; never forwarded to the provider/prompt. */
-  verify?: { argv: string[] }
+  verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
   /** When set, encrypt the run_start payload for the target node. */
   encryptionPublicKey?: string  // target node's X25519 encryption_public_key (base64)
 }

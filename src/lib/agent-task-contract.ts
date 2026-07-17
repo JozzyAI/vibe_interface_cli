@@ -214,7 +214,7 @@ export interface CreateTaskRequest {
   workspace_lease_id?: string
   /** OPTIONAL Harness-owned post-task test verifier (argv only). Reaches the Node
    *  ONLY for execution — NEVER forwarded to the provider (prompt/env). */
-  verify?: { argv: string[] }
+  verify?: { profile: string }
 }
 
 /**
@@ -317,11 +317,11 @@ export function validateCreateTaskRequest(
 
   // Optional Harness-owned test verifier — a bounded argv (never shell text). It
   // reaches the Node for execution only and is NEVER forwarded to the provider.
-  let verify: { argv: string[] } | undefined
+  let verify: { profile: string } | undefined
   if (b.verify !== undefined) {
     const vv = validateTaskVerifyConfig(b.verify)
     if (!vv.ok) return fail(`\`verify\` is invalid: ${vv.message}`)
-    verify = { argv: vv.value.argv }
+    verify = { profile: vv.value.profile }
   }
 
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }

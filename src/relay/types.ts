@@ -59,7 +59,7 @@ export interface RunStartPayload {
   repo_url?: string
   branch?: string
   workspace_lease_id?: string // carried INSIDE the encrypted run_start payload (relay never reads it)
-  verify?: { argv: string[] } // Harness-owned post-task verifier config (argv only; never forwarded to the provider)
+  verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
 }
 
 // ── MVP 4C: encrypted run_event stream ─────────────────────────────────────
@@ -276,7 +276,7 @@ export interface RunStartMsg extends RelayMsgBase {
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
   workspace_lease_id?: string // workspace_lease_v1: authorize the run against the Node's active workspace lease (never forwarded to the provider)
-  verify?: { argv: string[] } // Harness-owned post-task verifier config (argv only; never forwarded to the provider)
+  verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
 }
 
 // ── cli → relay → node daemon (bidirectional stop) ────────────────────────

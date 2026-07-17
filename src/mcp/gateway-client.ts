@@ -56,7 +56,7 @@ export interface StartTaskRequest {
   metadata?: Record<string, unknown>
   idempotency_key?: string
   workspace_lease_id?: string
-  verify?: { argv: string[] }
+  verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
 }
 
 export function isLoopbackGatewayUrl(url: string): boolean {

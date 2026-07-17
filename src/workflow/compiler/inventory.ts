@@ -15,6 +15,9 @@ export interface InventoryAgent {
   workspace_supported: boolean
   /** Bounded capability tags (e.g. 'run', 'workspace_lease_v1'). */
   capabilities: string[]
+  /** Harness verifier profile IDs this placement can run under an enforcing sandbox.
+   *  SAFE ids only — never argv/commands. Empty ⇒ the Node can't enforce verification. */
+  verifier_profiles?: string[]
 }
 
 export interface Inventory {
