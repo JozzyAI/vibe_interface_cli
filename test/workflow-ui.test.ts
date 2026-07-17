@@ -43,6 +43,31 @@ test('workflowUiHtml: a self-contained page with a nonce-locked script, no exter
   assert.ok(!html.includes('nl_request') || html.indexOf('nl_request') === html.lastIndexOf('nl_request'), 'the request field is a form input, not rendered from a draft')
 })
 
+// ── trusted workflow map ──────────────────────────────────────────────────────────
+
+test('workflowUiHtml: a trusted SVG workflow map with distinct normal/loop/terminal edges, escaped labels, and NO execution logic', () => {
+  const html = workflowUiHtml('N1')
+  // an SVG map built from the server preview (createElementNS, not innerHTML)
+  assert.ok(html.includes('function buildMap'), 'builds a map')
+  assert.ok(html.includes('createElementNS') && !html.includes('innerHTML'), 'SVG via createElementNS; never innerHTML')
+  // loop edges are unmistakable (distinct class + dashed style + a loop label + marker)
+  assert.ok(html.includes('e-loop') && html.includes('.e-loop') && html.includes('⟲ loop') && html.includes('a-loop'))
+  assert.ok(html.includes('stroke-dasharray'), 'loop edges are dashed (distinct from solid normal edges)')
+  // complete / blocked / failed terminal routes are DISTINCT (classes + colors)
+  for (const t of ['e-complete', 'e-failed', 'e-blocked', 'term-complete', 'term-failed', 'term-blocked']) assert.ok(html.includes(t), `has ${t}`)
+  assert.ok(html.includes('#3ec27a') && html.includes('#e06666') && html.includes('#e0b24d'), 'distinct terminal colors')
+  // long labels do not break layout (truncation helper + full value in a <title>)
+  assert.ok(html.includes('trunc=') && html.includes("sv('title'"), 'truncates + keeps a title tooltip')
+  // each step node shows role, agent and node
+  assert.ok(html.includes("s0.agent") && html.includes("s0.node_id") && html.includes("s0.role"))
+  // the map is horizontally scrollable on mobile; the accessible text/list fallback remains
+  assert.ok(html.includes('mapwrap') && html.includes('overflow-x:auto'))
+  assert.ok(html.includes('function kvTable') && html.includes("'Steps'") && html.includes("'Edges'"), 'text/list fallback retained')
+  // the visualization contains NO execution logic (buildMap never calls the API)
+  const body = html.slice(html.indexOf('function buildMap'), html.indexOf('function mapLegend'))
+  assert.ok(!body.includes('fetch(') && !body.includes('api('), 'the map builder performs no I/O')
+})
+
 // ── gateway serving + cookie auth ─────────────────────────────────────────────────
 
 function req(port: number, method: string, p: string, opts: { cookie?: string; auth?: boolean; body?: unknown } = {}): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {

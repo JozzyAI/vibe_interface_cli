@@ -49,6 +49,29 @@ th{opacity:.7;font-weight:600}
 .muted{opacity:.65;font-size:13px}
 .rationale{border-left:3px solid #f0c060;padding-left:10px}
 h2{font-size:15px;margin:16px 0 6px}
+/* trusted workflow map (SVG; no execution logic) */
+.mapwrap{overflow-x:auto;overflow-y:hidden;border:1px solid #232833;border-radius:8px;background:#0b0f15;padding:8px}
+@media (prefers-color-scheme:light){.mapwrap{background:#f9fafc;border-color:#e2e6ec}}
+.wfmap{display:block;max-width:100%;height:auto}
+.wfmap .nrect{fill:#151a21;stroke:#2b6cff;stroke-width:1.5}
+@media (prefers-color-scheme:light){.wfmap .nrect{fill:#fff;stroke:#2b6cff}}
+.wfmap .nt-title{font:700 12px system-ui,sans-serif}
+.wfmap .nt-sub{font:11px ui-monospace,monospace;opacity:.75}
+.wfmap text{fill:#e6e9ef}
+@media (prefers-color-scheme:light){.wfmap text{fill:#1a1d24}}
+.wfmap .term{stroke-width:1.5}
+.wfmap .term-complete{fill:#12351f;stroke:#3ec27a}.wfmap .tt-complete{fill:#7ee0a0}
+.wfmap .term-failed{fill:#3a1717;stroke:#e06666}.wfmap .tt-failed{fill:#f08a8a}
+.wfmap .term-blocked{fill:#3a2c12;stroke:#e0b24d}.wfmap .tt-blocked{fill:#f0c060}
+.wfmap .e-normal{stroke:#7f8a99;stroke-width:1.6;fill:none}
+.wfmap .e-loop{stroke:#f0c060;stroke-width:1.8;stroke-dasharray:6 4;fill:none}
+.wfmap .e-complete{stroke:#3ec27a;stroke-width:1.8;fill:none}
+.wfmap .e-failed{stroke:#e06666;stroke-width:1.8;fill:none}
+.wfmap .e-blocked{stroke:#e0b24d;stroke-width:1.8;fill:none}
+.wfmap .looplbl{font:700 12px system-ui,sans-serif;fill:#f0c060}
+.maplegend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;opacity:.85;margin:6px 2px}
+.maplegend span{display:inline-flex;align-items:center;gap:5px}
+.maplegend i{width:18px;height:0;border-top-width:2px;border-top-style:solid;display:inline-block}
 ul{margin:6px 0;padding-left:20px}
 .err{color:#f08a8a}
 </style></head><body>
@@ -60,6 +83,55 @@ const app=document.getElementById('app');
 const navNew=document.getElementById('nav-new');
 const FINAL=new Set(['ready','needs_input','impossible','policy_denied']);
 const el=(t,props,...kids)=>{const n=document.createElement(t);if(props)for(const k in props){if(k==='class')n.className=props[k];else if(k==='text')n.textContent=props[k];else if(k.startsWith('on'))n.addEventListener(k.slice(2),props[k]);else n.setAttribute(k,props[k]);}for(const c of kids)if(c!=null)n.append(c);return n;};
+const SVGNS='http://www.w3.org/2000/svg';
+const sv=(t,props,...kids)=>{const n=document.createElementNS(SVGNS,t);if(props)for(const k in props){if(k==='text')n.textContent=props[k];else n.setAttribute(k,String(props[k]));}for(const c of kids)if(c!=null)n.append(c);return n;};
+const trunc=(s,max)=>{s=String(s==null?'':s);return s.length>max?s.slice(0,max-1)+'…':s;};
+// Deterministic layered layout → a trusted SVG map. Pure presentation: NO execution logic.
+function buildMap(p){
+  const steps=(p.steps||[]).slice(),edges=(p.edges||[]).slice();
+  if(!steps.length)return null;
+  const byId={};steps.forEach(s=>byId[s.id]=s);
+  const level={};steps.forEach(s=>level[s.id]=0);
+  const stepEdges=edges.filter(e=>!e.loop&&!e.terminal&&byId[e.from]&&byId[e.to]);
+  for(let it=0;it<=steps.length;it++)for(const e of stepEdges)if(level[e.to]<level[e.from]+1)level[e.to]=level[e.from]+1;
+  let maxStepLevel=0;steps.forEach(s=>{if(level[s.id]>maxStepLevel)maxStepLevel=level[s.id];});
+  const termLevel=maxStepLevel+1;const terms={};
+  edges.filter(e=>e.terminal).forEach(e=>{terms[e.to]=true;});
+  const rows={};steps.forEach(s=>{(rows[level[s.id]]=rows[level[s.id]]||[]).push({kind:'step',id:s.id,ref:s});});
+  Object.keys(terms).sort().forEach(t=>{(rows[termLevel]=rows[termLevel]||[]).push({kind:'term',id:t});});
+  const NW=176,NH=58,HG=30,VG=64;const pos={};
+  const levs=Object.keys(rows).map(Number).sort((a,b)=>a-b);
+  let maxCols=1;levs.forEach(l=>{if(rows[l].length>maxCols)maxCols=rows[l].length;});
+  const W=maxCols*(NW+HG)+HG,H=(levs.length)*(NH+VG)+VG;
+  levs.forEach((l,ri)=>{const r=rows[l];const rowW=r.length*(NW+HG)-HG;const startX=Math.max(HG,(W-rowW)/2);r.forEach((nd,i)=>{pos[nd.id]={x:startX+i*(NW+HG),y:VG/2+ri*(NH+VG),nd};});});
+  const s=sv('svg',{viewBox:'0 0 '+W+' '+H,class:'wfmap',width:W,height:H,role:'img','aria-label':'Workflow map (steps, edges and terminal routes)'});
+  // arrowheads per edge color
+  const defs=sv('defs');
+  [['a-normal','#7f8a99'],['a-loop','#f0c060'],['a-complete','#3ec27a'],['a-failed','#e06666'],['a-blocked','#e0b24d']].forEach(([id,col])=>{const m=sv('marker',{id:id,markerWidth:8,markerHeight:8,refX:7,refY:3,orient:'auto'});m.append(sv('path',{d:'M0,0 L7,3 L0,6 z',fill:col}));defs.append(m);});
+  s.append(defs);
+  const termClass=t=>t==='$complete'?'complete':t==='$failed'?'failed':'blocked';
+  // edges
+  edges.forEach(e=>{const a=pos[e.from],b=pos[e.to];if(!a||!b)return;
+    const ax=a.x+NW/2,ay=a.y+NH,bx=b.x+NW/2,by=b.y;
+    let cls,mk;
+    if(e.loop){cls='e-loop';mk='a-loop';const cx=Math.max(ax,bx)+NW*0.7;const d='M'+ax+','+ay+' C'+cx+','+ay+' '+cx+','+by+' '+bx+','+by;s.append(sv('path',{class:cls,d:d,'marker-end':'url(#'+mk+')'}));s.append(sv('text',{class:'looplbl',x:(cx+Math.max(ax,bx))/2,y:(ay+by)/2,'text-anchor':'middle',text:'⟲ loop'}));return;}
+    if(e.terminal){const tc=termClass(e.to);cls='e-'+tc;mk='a-'+tc;}else{cls='e-normal';mk='a-normal';}
+    const mid=(ay+by)/2;const d='M'+ax+','+ay+' C'+ax+','+mid+' '+bx+','+mid+' '+bx+','+by;
+    s.append(sv('path',{class:cls,d:d,'marker-end':'url(#'+mk+')'}));
+  });
+  // nodes
+  Object.keys(pos).forEach(id=>{const{x,y,nd}=pos[id];const g=sv('g',{transform:'translate('+x+','+y+')'});
+    if(nd.kind==='term'){const tc=termClass(id);const r=sv('rect',{class:'term term-'+tc,x:NW*0.15,y:NH*0.22,rx:16,width:NW*0.7,height:NH*0.5});const t=sv('text',{class:'tt-'+tc,x:NW/2,y:NH*0.55,'text-anchor':'middle','font-weight':'700',text:id});g.append(r,t);}
+    else{const s0=nd.ref;const rect=sv('rect',{class:'nrect',x:0,y:0,rx:9,width:NW,height:NH});const title=sv('title',{text:id+' — '+(s0.agent||'—')+(s0.node_id?'@'+s0.node_id:'')+(s0.role?' ('+s0.role+')':'')});
+      const t1=sv('text',{class:'nt-title',x:12,y:22,text:trunc(id,22)});
+      const t2=sv('text',{class:'nt-sub',x:12,y:40,text:trunc((s0.agent||'—')+(s0.node_id?'@'+s0.node_id:''),26)});
+      const t3=sv('text',{class:'nt-sub',x:12,y:53,text:trunc('role: '+(s0.role||'—')+(s0.workspace?' · ws':'')+(s0.permission_mode?' · '+s0.permission_mode:''),30)});
+      g.append(rect,title,t1,t2,t3);}
+    s.append(g);
+  });
+  return s;
+}
+function mapLegend(){const L=el('div',{class:'maplegend'});const seg=(cls,label)=>el('span',null,el('i',{class:'',style:'border-top-color:'+cls}),document.createTextNode(label));L.append(seg('#7f8a99','normal'),seg('#f0c060','loop'),seg('#3ec27a','→ complete'),seg('#e06666','→ failed'),seg('#e0b24d','→ blocked'));return L;}
 const uuid=()=>{try{return crypto.randomUUID().replace(/-/g,'').slice(0,24);}catch(e){return 'k'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);}};
 function api(method,path,body){return fetch(path,{method,credentials:'same-origin',headers:body?{'content-type':'application/json'}:{},body:body?JSON.stringify(body):undefined}).then(async r=>{let j=null;try{j=await r.json();}catch(e){}return{status:r.status,body:j};});}
 function go(url){history.pushState(null,'',url);route();}
@@ -160,6 +232,9 @@ function renderDraft(d){
 function previewCard(d){
   const p=d.preview,ps=p.policy_summary||{};
   const c=el('div',{class:'card'},el('h2',{text:'Preview'}));
+  // trusted graphical map (server preview only) — with a text/list fallback below.
+  const map=buildMap(p);
+  if(map){c.append(el('h2',{text:'Workflow map'}),el('div',{class:'mapwrap'},map),mapLegend(),el('div',{class:'muted',text:'A read-only view of the server preview — no execution.'}));}
   // roles
   const rt=el('table');rt.append(el('tr',null,el('th',{text:'Role'}),el('th',{text:'Agent'}),el('th',{text:'Node'})));(ps.roles||[]).forEach(r=>rt.append(el('tr',null,el('td',{text:r.role}),el('td',{text:r.agent}),el('td',{class:'mono',text:r.node_id||'local'}))));
   c.append(el('h2',{text:'Roles & assignments'}),rt);
