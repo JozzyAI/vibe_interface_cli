@@ -747,6 +747,21 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, evidence: decodeJson(r.evidence_json, SIZE_LIMITS.metadata_json, 'completion.evidence'), decision: r.decision, created_at: r.created_at }
   }
 
+  // ── no-progress (stall) signal fingerprints (workflow_stall_rounds) ──────────
+  async recordStallRound(workflowId: string, round: number, fingerprint: string, signals: unknown): Promise<void> {
+    this.open()
+    this.db.transaction(() => {
+      if (this.db.prepare('SELECT 1 FROM workflow_stall_rounds WHERE workflow_id=? AND round=?').get(workflowId, round)) return // first-write-wins (no double-count)
+      if (!this.workflowRow(workflowId)) throw new ControlStoreError('not_found', `workflow not found: ${workflowId}`)
+      this.db.prepare('INSERT INTO workflow_stall_rounds (workflow_id,round,fingerprint,signals_json,created_at) VALUES (@wf,@r,@fp,@sig,@now)')
+        .run({ wf: workflowId, r: round, fp: boundString(fingerprint, 128, 'stall.fingerprint'), sig: signals != null ? encodeJson(signals, SIZE_LIMITS.metadata_json, 'stall.signals') : null, now: nowIso() })
+    })()
+  }
+  async listStallRounds(workflowId: string): Promise<Array<{ round: number; fingerprint: string }>> {
+    this.open()
+    return (this.db.prepare('SELECT round, fingerprint FROM workflow_stall_rounds WHERE workflow_id=? ORDER BY round ASC').all(workflowId) as Array<{ round: number; fingerprint: string }>)
+  }
+
   // ── retention (bounded; never touches active records; no scheduler) ──────────
   async pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult> {
     this.open()

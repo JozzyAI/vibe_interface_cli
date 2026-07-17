@@ -34,6 +34,7 @@ export type WorkflowBlockReason =
   | 'agent_blocked'            // an agent output declared status blocked
   | 'routed_blocked'           // routing selected the reserved $blocked target
   | 'workspace_revision_conflict' // an out-of-band workspace change diverged from the lease's expected revision
+  | 'no_progress'              // stall_policy: configured signals unchanged for max_stalled_rounds loop rounds
 
 export class WorkflowRuntimeError extends Error {
   constructor(

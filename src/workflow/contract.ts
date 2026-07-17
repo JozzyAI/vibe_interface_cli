@@ -212,6 +212,22 @@ export interface CompletionPolicy {
   require_tests_passed?: boolean
 }
 
+/** Signals compared across consecutive loop rounds to detect no-progress. Each is a
+ *  deterministic value the RUNTIME derives — no LLM judgment. */
+export type StallSignal = 'planner_next_step' | 'remaining_work' | 'workspace_revision' | 'verified_evidence'
+export const STALL_SIGNALS: readonly StallSignal[] = ['planner_next_step', 'remaining_work', 'workspace_revision', 'verified_evidence']
+
+/** Optional, bounded no-progress detection, evaluated ONLY when an explicit loop edge
+ *  is taken. When ALL configured `signals` remain unchanged for `max_stalled_rounds`
+ *  consecutive loop rounds, the workflow is `blocked` (reason `no_progress`) instead of
+ *  looping again. No automatic repair; no LLM-based progress judgment. */
+export interface StallPolicy {
+  /** Consecutive unchanged loop rounds (≥ 1) that trigger a no-progress block. */
+  max_stalled_rounds: number
+  /** Which signals must all be unchanged. Non-empty. */
+  signals: StallSignal[]
+}
+
 export interface WorkflowSpec {
   version: '1'
   name: string
@@ -226,12 +242,14 @@ export interface WorkflowSpec {
   /** Optional, bounded. Gates `$complete` on verified evidence. Omitted → the
    *  agent's requested completion completes the workflow directly (prior behavior). */
   completion_policy?: CompletionPolicy
+  /** Optional, bounded no-progress detection on loop edges. Omitted → loops as before. */
+  stall_policy?: StallPolicy
 }
 
 /** Fail-closed allow-list of top-level fields (no forward-compat extras in v1). */
 export const KNOWN_SPEC_FIELDS: readonly string[] = [
   'version', 'name', 'description', 'entry_step', 'inputs',
-  'agents', 'output_schemas', 'limits', 'steps', 'edges', 'completion_policy',
+  'agents', 'output_schemas', 'limits', 'steps', 'edges', 'completion_policy', 'stall_policy',
 ]
 
 // ── future runtime state (types only — no runtime implemented here) ──────────

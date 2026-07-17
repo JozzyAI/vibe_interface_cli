@@ -245,7 +245,22 @@ CREATE TABLE workflow_completion_evidence (
 );
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }]
+/** Schema v11 — durable NO-PROGRESS (stall) signal fingerprints, one row per loop
+ *  round (first-write-wins), so a restart never double-counts a round. Additive;
+ *  bounded fingerprint + signals JSON; no secrets. */
+const V11 = `
+CREATE TABLE workflow_stall_rounds (
+  workflow_id TEXT NOT NULL,
+  round INTEGER NOT NULL,
+  fingerprint TEXT NOT NULL,
+  signals_json TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (workflow_id, round),
+  FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+);
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
