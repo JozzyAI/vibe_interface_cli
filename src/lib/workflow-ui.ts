@@ -138,9 +138,10 @@ function go(url){history.pushState(null,'',url);route();}
 window.addEventListener('popstate',route);
 navNew.addEventListener('click',()=>go('/ui'));
 
-let pollTimer=null,disposed=false;
+let pollTimer=null,disposed=false,stream=null;
 function stopPoll(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null;}}
-function route(){stopPoll();disposed=false;const u=new URL(location.href);const d=u.searchParams.get('draft');if(d)draftView(d);else compileView();}
+function closeStream(){if(stream){try{stream.close();}catch(e){}stream=null;}}
+function route(){stopPoll();closeStream();disposed=false;const u=new URL(location.href);const w=u.searchParams.get('workflow');const d=u.searchParams.get('draft');if(w)workflowView(w);else if(d)draftView(d);else compileView();}
 
 // ── compile form ──
 let lastKey=null,lastFp=null;
@@ -225,7 +226,7 @@ function renderDraft(d){
   const blocks=[head];
   if(cs==='needs_input'&&Array.isArray(d.questions)&&d.questions.length){const ul=el('ul');d.questions.forEach(q=>ul.append(el('li',{text:q})));blocks.push(el('div',{class:'card'},el('h2',{text:'Needs input'}),ul));}
   if(cs==='impossible'||cs==='policy_denied'||vs==='invalid'){const ul=el('ul');(d.warnings||[]).forEach(w=>ul.append(el('li',{text:w})));blocks.push(el('div',{class:'card'},el('h2',{text:cs==='policy_denied'?'Policy denied':(vs==='invalid'?'Not valid':'Cannot compile')}),(d.warnings&&d.warnings.length)?ul:el('div',{class:'muted',text:'No further detail.'})));}
-  if(cs==='ready'&&vs==='valid'&&d.preview){blocks.push(previewCard(d));}
+  if(cs==='ready'&&vs==='valid'&&d.preview){blocks.push(previewCard(d));blocks.push(approveCard(d));}
   if(d.rationale&&Object.keys(d.rationale).length){const pre=el('div',{class:'mono'});pre.textContent=JSON.stringify(d.rationale,null,2);blocks.push(el('div',{class:'card rationale'},el('h2',{text:'Compiler rationale'}),el('div',{class:'muted',text:'Model-generated — not authoritative.'}),pre));}
   app.replaceChildren(...blocks);
 }
@@ -265,7 +266,104 @@ function previewCard(d){
   c.append(el('h2',{text:'Hashes'}),kvTable([['spec_hash',d.spec_hash],['policy_summary_hash',d.policy_summary_hash],['inventory_hash',d.inventory_hash]]));
   return c;
 }
-window.addEventListener('pagehide',()=>{disposed=true;stopPoll();});
+// ── approval (explicit; binds to the exact spec_hash; NEVER starts) ──
+function approveCard(d){
+  const ps=(d.preview&&d.preview.policy_summary)||{};
+  const c=el('div',{class:'card'});
+  c.append(el('h2',{text:'Approve'}));
+  if(d.materialized_workflow_id){
+    c.append(el('div',{class:'muted',text:'This draft is approved.'}),
+      el('div',{class:'mono',style:'margin:6px 0',text:'workflow '+d.materialized_workflow_id}),
+      el('button',{text:'Open workflow',onclick:()=>go('/ui?workflow='+encodeURIComponent(d.materialized_workflow_id))}));
+    return c;
+  }
+  c.append(el('div',{class:'muted',text:'Review the exact plan below, then approve. Approval creates a ready workflow — it does NOT start it.'}));
+  c.append(el('h2',{text:'Confirmation summary'}),kvTable([
+    ['agents/nodes',(ps.roles||[]).map(r=>r.role+'='+r.agent+(r.node_id?'@'+r.node_id:'')).join(', ')||'—'],
+    ['workspace access',(ps.workspace_access||[]).map(w=>w.step).join(', ')||'none'],
+    ['permissions',(ps.permissions||[]).map(x=>x.step+':'+x.permission_mode).join(', ')||'default'],
+    ['network capable',String(!!ps.network_capable)],
+    ['completion policy',ps.completion_policy?JSON.stringify(ps.completion_policy):'none'],
+    ['side-effect warnings',(ps.external_side_effect_warnings||[]).join(' · ')||'none'],
+    ['spec_hash',d.spec_hash]
+  ]));
+  const msg=el('div',{class:'muted',style:'margin-top:8px'});
+  const btn=el('button',{text:'Approve this exact plan'});
+  btn.addEventListener('click',()=>{
+    if(!confirm('Approve this exact workflow (spec_hash '+String(d.spec_hash).slice(0,12)+'…)? This creates a ready workflow but does NOT start it.'))return;
+    btn.disabled=true;btn.textContent='Approving…';msg.className='muted';msg.textContent='';
+    api('POST','/v1/workflow-drafts/'+encodeURIComponent(d.draft_id)+'/approve',{spec_hash:d.spec_hash}).then(r=>{
+      if(r.status===200&&r.body&&r.body.workflow_id){go('/ui?workflow='+encodeURIComponent(r.body.workflow_id));return;}
+      btn.disabled=false;btn.textContent='Approve this exact plan';
+      if(r.status===409){msg.className='err';msg.textContent='The draft changed since it was shown — reload and review before approving.';c.append(el('button',{class:'sec',text:'Reload draft',onclick:()=>draftView(d.draft_id)}));return;}
+      msg.className='err';msg.textContent='Approval failed: '+((r.body&&r.body.code)||('http '+r.status));
+    }).catch(()=>{btn.disabled=false;btn.textContent='Approve this exact plan';msg.className='err';msg.textContent='Network error.';});
+  });
+  c.append(btn,msg);
+  return c;
+}
+
+// ── runtime view: monitor a ready/running/terminal workflow ──
+const WF_TERMINAL=new Set(['completed','failed','cancelled']);
+function wfBadge(s){const m={running:'b-info',blocked:'b-warn',completed:'b-ready',failed:'b-bad',cancelled:'b-bad',ready:'b-info'};return el('span',{class:'badge '+(m[s]||'b-info'),text:s});}
+function workflowView(id){
+  navNew.className='';
+  app.replaceChildren(el('div',{class:'card'},el('div',{class:'muted',text:'Loading workflow '+id+'…'})));
+  const seen=new Set();const events=[];let started=false;
+  const state={wf:null};
+  const render=()=>{
+    if(disposed)return;
+    const wf=state.wf;if(!wf)return;
+    const s=wf.status;
+    const head=el('div',{class:'card'},
+      el('div',{class:'row',style:'align-items:center;gap:10px'},wfBadge(s),el('span',{class:'muted',text:(wf.name||'')+' · round '+(wf.current_round==null?'—':wf.current_round)})),
+      el('div',{class:'mono muted',style:'margin-top:6px',text:'workflow '+id}),
+      kvTable([['current step',wf.current_step_id||'—'],['tasks',wf.total_tasks],['failures',wf.total_failures],['reason',wf.reason||'—']])
+    );
+    // controls
+    const ctl=el('div',{class:'row',style:'gap:10px;margin-top:4px'});
+    if(s==='ready'){const b=el('button',{text:'Start workflow'});b.addEventListener('click',()=>{b.disabled=true;b.textContent='Starting…';api('POST','/v1/workflows/'+encodeURIComponent(id)+'/start').then(()=>{load();}).catch(()=>{b.disabled=false;b.textContent='Start workflow';});});ctl.append(b);}
+    if(!WF_TERMINAL.has(s)&&s!=='ready'){const cb=el('button',{class:'sec',text:'Cancel'});cb.addEventListener('click',()=>{if(!confirm('Cancel this workflow? Its current Agent Task is cancelled; already-finished work keeps its result.'))return;cb.disabled=true;cb.textContent='Cancelling…';api('POST','/v1/workflows/'+encodeURIComponent(id)+'/cancel').then(()=>{load();}).catch(()=>{cb.disabled=false;cb.textContent='Cancel';});});ctl.append(cb);}
+    head.append(ctl);
+    // steps
+    const stc=el('div',{class:'card'},el('h2',{text:'Steps'}));
+    const st=el('table');st.append(el('tr',null,el('th',{text:'Step'}),el('th',{text:'Round'}),el('th',{text:'Status'})));(wf.step_executions||[]).forEach(se=>st.append(el('tr',null,el('td',{text:se.step_id}),el('td',{text:se.round}),el('td',null,wfBadge(se.status)))));stc.append(st);
+    // events (bounded, deduped, no raw task logs — workflow lifecycle events only)
+    const evc=el('div',{class:'card'},el('h2',{text:'Recent events'}));
+    const et=el('table');et.append(el('tr',null,el('th',{text:'#'}),el('th',{text:'Event'}),el('th',{text:'When'})));
+    events.slice(-40).forEach(e=>et.append(el('tr',null,el('td',{class:'mono',text:e.seq}),el('td',{text:e.type}),el('td',{class:'mono muted',text:e.ts||''}))));
+    evc.append(et);if(!events.length)evc.append(el('div',{class:'muted',text:'No events yet.'}));
+    app.replaceChildren(head,stc,evc);
+  };
+  // snapshot poll (status/step/round/counters) — stops on terminal / disposal
+  const load=()=>{
+    if(disposed)return;
+    api('GET','/v1/workflows/'+encodeURIComponent(id)).then(r=>{
+      if(disposed)return;
+      if(r.status===401){app.replaceChildren(el('div',{class:'card err',text:'Not authorized — open with ?token=<api token>.'}));return;}
+      if(r.status===404){app.replaceChildren(el('div',{class:'card err',text:'No such workflow.'}));return;}
+      if(r.status>=400||!r.body){app.replaceChildren(el('div',{class:'card err',text:'Error loading workflow.'}));return;}
+      state.wf=r.body;render();
+      if(!started&&!WF_TERMINAL.has(r.body.status)){started=true;openEvents();}
+      if(!WF_TERMINAL.has(r.body.status)&&!disposed)pollTimer=setTimeout(load,1500);else closeStream();
+    }).catch(()=>{if(!disposed)pollTimer=setTimeout(load,2500);});
+  };
+  // live events via SSE (same-origin cookie auth). EventSource resumes with Last-Event-ID
+  // on reconnect; we dedupe by seq so nothing is displayed twice. A disconnect NEVER cancels.
+  const WF_EVENT_TYPES=['workflow.created','workflow.validated','workflow.started','step.started','step.task_created','step.completed','step.failed','edge.selected','workflow.round_advanced','workflow.blocked','workflow.paused','workflow.resumed','workflow.completed','workflow.failed','workflow.cancelled'];
+  const onEv=(ev)=>{if(disposed)return;let d={};try{d=JSON.parse(ev.data)||{};}catch(e){}const seq=Number(d.seq!=null?d.seq:ev.lastEventId);if(!Number.isFinite(seq)||seen.has(seq))return;seen.add(seq);events.push({seq:seq,type:String(d.type||'event'),ts:String(d.ts||'')});events.sort((a,b)=>a.seq-b.seq);render();};
+  const openEvents=()=>{
+    closeStream();if(disposed||typeof EventSource==='undefined')return;
+    try{stream=new EventSource('/v1/workflows/'+encodeURIComponent(id)+'/events');}catch(e){return;}
+    // the gateway emits NAMED SSE events (event: <type>); register the known types.
+    stream.onmessage=onEv; // (default/unnamed frames, if any)
+    WF_EVENT_TYPES.forEach(t=>stream.addEventListener(t,onEv));
+    stream.onerror=()=>{/* browser auto-reconnects with Last-Event-ID; never cancels execution */};
+  };
+  load();
+}
+
+window.addEventListener('pagehide',()=>{disposed=true;stopPoll();closeStream();});
 route();
 </script>
 </body></html>`

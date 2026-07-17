@@ -15,6 +15,8 @@ import { openControlStore, type SqliteControlStore } from '../src/control/sqlite
 import { startAgentGateway } from '../src/lib/agent-gateway.js'
 import { workflowUiHtml } from '../src/lib/workflow-ui.js'
 import { WorkflowCompiler } from '../src/workflow/compiler/compiler.js'
+import { WorkflowRuntime } from '../src/workflow/runtime.js'
+import type { AgentTaskClient, AgentTaskCreateRequest } from '../src/workflow/task-client.js'
 
 const TOKEN = `wfui-${Math.random().toString(36).slice(2)}`
 const tmpDb = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wfui-')), 'control.sqlite')
@@ -66,6 +68,32 @@ test('workflowUiHtml: a trusted SVG workflow map with distinct normal/loop/termi
   // the visualization contains NO execution logic (buildMap never calls the API)
   const body = html.slice(html.indexOf('function buildMap'), html.indexOf('function mapLegend'))
   assert.ok(!body.includes('fetch(') && !body.includes('api('), 'the map builder performs no I/O')
+})
+
+// ── approval + runtime controls (pure render structure) ──────────────────────────
+
+test('workflowUiHtml: explicit approval + separate start + runtime monitoring + cancel are present and safe', () => {
+  const html = workflowUiHtml('N1')
+  // approval: a confirmation summary incl. the exact spec_hash, an explicit Approve
+  // that binds to that hash, never starts, and a 409 → reload/review path.
+  assert.ok(html.includes('function approveCard'))
+  assert.ok(html.includes('/approve') && html.includes('spec_hash:d.spec_hash'), 'approves with the displayed spec_hash')
+  assert.ok(html.includes('does NOT start') && html.includes("confirm("), 'explicit + never starts')
+  assert.ok(html.includes('reload and review'), 'hash mismatch (409) requires reload/review')
+  assert.ok(html.includes("go('/ui?workflow='"), 'approval navigates to the workflow, not a start')
+  // start is a SEPARATE action using the workflow start API
+  assert.ok(html.includes('/start') && html.includes("Start workflow"))
+  // runtime monitoring: snapshot + events, status/step/round/counters, cancel with confirm
+  assert.ok(html.includes('function workflowView') && html.includes('/v1/workflows/'))
+  assert.ok(html.includes('WF_TERMINAL') && html.includes('current_step_id') && html.includes('total_tasks') && html.includes('total_failures'))
+  // live events via EventSource, deduped by seq (resume without duplicate display); disconnect never cancels
+  assert.ok(html.includes('EventSource') && html.includes('seen.has(seq)') && html.includes('never cancels'))
+  assert.ok(html.includes('/cancel') && html.includes('Cancel'), 'explicit cancel with confirmation')
+  // reload restores the same workflow view via ?workflow=<id>
+  assert.ok(html.includes("u.searchParams.get('workflow')"))
+  // safety: values via textContent; the runtime view never renders the spec/prompt/raw task logs
+  const wv = html.slice(html.indexOf('function workflowView'), html.indexOf('window.addEventListener(\'pagehide'))
+  assert.ok(!wv.includes('prompt_template') && !wv.includes('.spec') && !wv.includes('innerHTML'), 'no spec/prompt/innerHTML in the runtime view')
 })
 
 // ── gateway serving + cookie auth ─────────────────────────────────────────────────
@@ -177,4 +205,65 @@ test('the UI drives the real compile + draft routes: compile → draft (ready) r
     // the draft projection never exposes the request/prompt/token
     assert.ok(!g1.body.includes('nl_request') && !g1.body.includes(TOKEN))
   })
+})
+
+// ── full flow: compile → approve → start → monitor → cancel (three separate actions) ──
+
+class RunFake implements AgentTaskClient {
+  byKey = new Map<string, any>(); byId = new Map<string, any>(); n = 0
+  constructor(public store: SqliteControlStore, private running = false) {}
+  async createTask(r: AgentTaskCreateRequest) {
+    const ex = this.byKey.get(r.idempotency_key); if (ex) return { task_id: ex.task_id }
+    const id = 'task_' + (++this.n)
+    this.store.createTaskDurable({ task_id: id, agent: r.agent, node_id: r.node_id ?? null, status: 'queued', idempotency_key: r.idempotency_key, request_fingerprint: 'fp' }, { sequence: 0, event_type: 'task.created', ts: new Date().toISOString(), payload: {} })
+    const t = { task_id: id, released: !this.running }; this.byKey.set(r.idempotency_key, t); this.byId.set(id, t); return { task_id: id }
+  }
+  private v(t: any) { const run = this.running && !t.released; const status = run ? 'running' : 'completed'; return { status, terminal: !run, history_complete: true, result_status: run ? undefined : 'available', result_text: run ? undefined : JSON.stringify({ status: 'done', summary: 'ok' }), events: [], next_event_id: -1 } }
+  async getTask(id: string) { return { task_id: id, ...this.v(this.byId.get(id)) } }
+  async waitForTerminal(id: string) { await new Promise((r) => setTimeout(r, 5)); return { task_id: id, ...this.v(this.byId.get(id)) } }
+  async cancelTask(id: string) { const t = this.byId.get(id); if (t) t.released = true }
+}
+
+test('UI flow: compile → APPROVE (exact hash → one ready wf, never started; retry idempotent; wrong hash → no wf) → separate START (idempotent) → reload snapshot → CANCEL (idempotent)', async () => {
+  const store = openControlStore({ path: tmpDb() })
+  const model = { compile: async () => ({ task_id: 'ct', status: 'available' as const, output_text: JSON.stringify({ schema_version: '1', status: 'ready', workflow_spec: readySpec, input_values: { objective: 'x' }, rationale: {}, questions: [], warnings: [] }) }) }
+  const inventory = { snapshot: async () => ({ observed_at: '2026-01-01T00:00:00Z', agents: [{ agent: 'mock', permission_modes: ['default'], workspace_supported: false, capabilities: ['run'] }] }) }
+  const compiler = new WorkflowCompiler({ store, model, inventory })
+  const fake = new RunFake(store, true) // task stays running until cancelled
+  let runtime: WorkflowRuntime | undefined
+  const gw = await startAgentGateway({ host: '127.0.0.1', port: 0, apiToken: TOKEN, taskStore: store, controlStore: store, getWorkflowRuntime: () => runtime, getWorkflowCompiler: () => compiler })
+  runtime = new WorkflowRuntime({ store, taskClient: fake, waitWindowMs: 20 })
+  try {
+    // 1) compile
+    const draft = JSON.parse((await req(gw.port, 'POST', '/v1/workflow-drafts/compile', { auth: true, body: { nl_request: 'ship', compiler_agent: 'mock', idempotency_key: 'k' } })).body)
+    assert.equal(draft.compiler_status, 'ready'); const hash = draft.spec_hash
+    // 2a) wrong-hash approval → 409, NO workflow materialized
+    const bad = await req(gw.port, 'POST', `/v1/workflow-drafts/${draft.draft_id}/approve`, { auth: true, body: { spec_hash: 'wronghash' } })
+    assert.equal(bad.status, 409)
+    assert.equal((await req(gw.port, 'GET', `/v1/workflow-drafts/${draft.draft_id}`, { auth: true })).body.includes('"materialized_workflow_id":null') ? 'none' : JSON.parse((await req(gw.port, 'GET', `/v1/workflow-drafts/${draft.draft_id}`, { auth: true })).body).materialized_workflow_id, 'none')
+    // 2b) exact-hash approval → ONE ready workflow, NOT started
+    const ap = await req(gw.port, 'POST', `/v1/workflow-drafts/${draft.draft_id}/approve`, { auth: true, body: { spec_hash: hash } })
+    assert.equal(ap.status, 200); const wfId = JSON.parse(ap.body).workflow_id; assert.ok(wfId)
+    assert.equal(JSON.parse((await req(gw.port, 'GET', `/v1/workflows/${wfId}`, { auth: true })).body).status, 'ready', 'approval never starts')
+    // approval retry → same workflow (idempotent)
+    const ap2 = await req(gw.port, 'POST', `/v1/workflow-drafts/${draft.draft_id}/approve`, { auth: true, body: { spec_hash: hash } })
+    assert.equal(JSON.parse(ap2.body).workflow_id, wfId)
+    assert.equal((await store.listWorkflows({})).length, 1, 'exactly one workflow')
+    // 3) separate START (idempotent)
+    await req(gw.port, 'POST', `/v1/workflows/${wfId}/start`, { auth: true })
+    await req(gw.port, 'POST', `/v1/workflows/${wfId}/start`, { auth: true }) // idempotent
+    // reload snapshot restores running state
+    let snap: any
+    for (let i = 0; i < 30; i++) { snap = JSON.parse((await req(gw.port, 'GET', `/v1/workflows/${wfId}`, { auth: true })).body); if (snap.status === 'running') break; await new Promise((r) => setTimeout(r, 40)) }
+    assert.equal(snap.status, 'running')
+    assert.equal(snap.total_tasks, 1, 'started exactly once (one task)')
+    // 4) explicit CANCEL (idempotent)
+    await req(gw.port, 'POST', `/v1/workflows/${wfId}/cancel`, { auth: true })
+    let c: any
+    for (let i = 0; i < 30; i++) { c = JSON.parse((await req(gw.port, 'GET', `/v1/workflows/${wfId}`, { auth: true })).body); if (c.status === 'cancelled') break; await new Promise((r) => setTimeout(r, 40)) }
+    assert.equal(c.status, 'cancelled')
+    const c2 = JSON.parse((await req(gw.port, 'POST', `/v1/workflows/${wfId}/cancel`, { auth: true })).body); assert.equal(c2.status, 'cancelled') // idempotent
+    // the snapshot never exposes a token
+    assert.ok(!JSON.stringify(c).includes(TOKEN))
+  } finally { try { await runtime.shutdown() } catch { /* */ } try { await gw.close() } catch { /* */ } try { store.closeSync() } catch { /* */ } }
 })
