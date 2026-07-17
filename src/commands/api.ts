@@ -150,9 +150,10 @@ export function registerApiCommand(program: Command): void {
       // The WorkflowRuntime's task client targets THIS gateway over loopback, so it
       // is built AFTER listen and injected via a lazy accessor (undefined until then).
       let workflowRuntime: import('../workflow/runtime.js').WorkflowRuntime | undefined
+      let workflowCompiler: import('../workflow/compiler/compiler.js').WorkflowCompiler | undefined
       let server
       try {
-        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store, controlStore: store, getWorkflowRuntime: () => workflowRuntime })
+        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store, controlStore: store, getWorkflowRuntime: () => workflowRuntime, getWorkflowCompiler: () => workflowCompiler })
       } catch (err) {
         try { store.closeSync() } catch { /* ignore */ }
         fail('serve_failed', `could not start the gateway: ${(err as Error).message}`)
@@ -181,8 +182,20 @@ export function registerApiCommand(program: Command): void {
         }
         workflowRuntime = new WorkflowRuntime({ store, taskClient, leaseClient })
         await workflowRuntime.recoverWorkflows()
+        // The natural-language Workflow Compiler runs its model through the SAME durable
+        // Agent Task path (over loopback) and consumes a safe inventory snapshot of the
+        // gateway's agents/nodes. Compile creates an immutable draft; approve materializes
+        // a ready workflow (never started).
+        const { WorkflowCompiler } = await import('../workflow/compiler/compiler.js')
+        const { AgentTaskCompilerModelClient } = await import('../workflow/compiler/model-client.js')
+        const { GatewayInventoryProvider } = await import('../workflow/compiler/inventory-gateway.js')
+        const inventory = new GatewayInventoryProvider({
+          localAgents: ['mock'],
+          ...(relayUrl && relayToken ? { fetchNodes: async () => { const { fetchRemoteNodes } = await import('../relay/client.js'); return (await fetchRemoteNodes(relayUrl!, relayToken!)).map((n) => ({ node_id: n.node_id, status: n.status, agents: n.agents, capabilities: n.capabilities })) } } : {}),
+        })
+        workflowCompiler = new WorkflowCompiler({ store, model: new AgentTaskCompilerModelClient(taskClient), inventory })
       } catch (err) {
-        if (!opts.quiet) process.stderr.write(`warning: workflow runtime init/recovery hit an error (workflow routes remain available): ${(err as Error).message}\n`)
+        if (!opts.quiet) process.stderr.write(`warning: workflow runtime/compiler init hit an error (workflow routes remain available): ${(err as Error).message}\n`)
       }
       if (!opts.quiet) {
         if (!isLoopbackHost(host)) {

@@ -160,11 +160,11 @@ test('protocol: initialize negotiates version (prefers 2025-11-25) + declares to
 test('protocol: tools/list has exact names, no deferred fields, cancel marked destructive', async () => {
   const r: any = await srv().handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
   const names = r.result.tools.map((t: any) => t.name).sort()
-  // Seven task tools + eleven workflow tools (existing task tools unchanged).
+  // Seven task tools + fourteen workflow tools (existing task tools unchanged).
   assert.deepEqual(names, [
-    'vibe_answer_workflow_input', 'vibe_cancel_task', 'vibe_cancel_workflow', 'vibe_create_workflow', 'vibe_decide_workflow_approval',
+    'vibe_answer_workflow_input', 'vibe_approve_workflow_draft', 'vibe_cancel_task', 'vibe_cancel_workflow', 'vibe_compile_workflow', 'vibe_create_workflow', 'vibe_decide_workflow_approval',
     'vibe_get_pending_request', 'vibe_get_task', 'vibe_get_task_events',
-    'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_list_agents', 'vibe_list_workflows', 'vibe_resume_workflow', 'vibe_run_task',
+    'vibe_get_workflow', 'vibe_get_workflow_draft', 'vibe_get_workflow_events', 'vibe_list_agents', 'vibe_list_workflows', 'vibe_resume_workflow', 'vibe_run_task',
     'vibe_start_task', 'vibe_start_workflow', 'vibe_wait_task', 'vibe_wait_workflow',
   ])
   for (const toolName of ['vibe_start_task', 'vibe_run_task']) {
@@ -441,7 +441,7 @@ test('stdio: CLI serves MCP; initialize/tools/list/tools/call over stdin; no non
   for (const l of lines) { const j = JSON.parse(l); assert.equal(j.jsonrpc, '2.0') } // ONLY protocol JSON on stdout
   const byId = Object.fromEntries(lines.map((l) => JSON.parse(l)).filter((j: any) => j.id != null).map((j: any) => [j.id, j]))
   assert.equal(byId[1].result.serverInfo.name, 'vibe-agent-gateway')
-  assert.equal(byId[2].result.tools.length, 18) // 7 task tools + 11 workflow tools
+  assert.equal(byId[2].result.tools.length, 21) // 7 task tools + 14 workflow tools
   assert.ok(JSON.parse(byId[3].result.content[0].text).agents.length >= 1)
   assert.ok(!out.includes(TOKEN) && !err.includes(TOKEN), 'token never on stdout/stderr')
 })

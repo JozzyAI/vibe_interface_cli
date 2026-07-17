@@ -21,7 +21,7 @@ import {
   type WorkflowRecord, type CreateWorkflowInput, type WorkflowPatch, type StepExecutionRecord,
   type CreateStepExecutionInput, type StepExecutionPatch, type WorkflowEventInput, type WorkflowEventRecord,
   type WorkflowSnapshot, type TaskResultRecord, type WorkflowWorkspaceLeaseRecord,
-  type WorkflowHumanRequestRecord, type CreateHumanRequestInput,
+  type WorkflowHumanRequestRecord, type CreateHumanRequestInput, type WorkflowDraftRecord,
 } from './records.js'
 import { isValidRevision } from '../lib/workspace-lease.js'
 import {
@@ -762,6 +762,60 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     return (this.db.prepare('SELECT round, fingerprint FROM workflow_stall_rounds WHERE workflow_id=? ORDER BY round ASC').all(workflowId) as Array<{ round: number; fingerprint: string }>)
   }
 
+  // ── compiler WorkflowDrafts (workflow_drafts) — immutable + idempotent ───────
+  private draftRow(id: string): DraftRow | undefined { return this.db.prepare('SELECT * FROM workflow_drafts WHERE draft_id = ?').get(id) as DraftRow | undefined }
+  private toDraft(r: DraftRow): WorkflowDraftRecord {
+    const L = SIZE_LIMITS.metadata_json
+    return { draft_id: r.draft_id, idempotency_key: r.idempotency_key, request_fingerprint: r.request_fingerprint, compiler_task_id: r.compiler_task_id, compiler_capability: decodeJson(r.compiler_capability_json, L, 'draft.capability'), constraints: decodeJson(r.constraints_json, L, 'draft.constraints'), inventory_snapshot: decodeJson(r.inventory_snapshot_json, L, 'draft.inventory'), inventory_hash: r.inventory_hash, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'draft.spec'), input_values: decodeJson(r.input_values_json, L, 'draft.input_values'), spec_hash: r.spec_hash, policy_summary: decodeJson(r.policy_summary_json, L, 'draft.policy_summary'), policy_summary_hash: r.policy_summary_hash, preview: decodeJson(r.preview_json, L, 'draft.preview'), rationale: decodeJson(r.rationale_json, L, 'draft.rationale'), warnings: decodeJson(r.warnings_json, L, 'draft.warnings'), questions: decodeJson(r.questions_json, L, 'draft.questions'), compiler_status: r.compiler_status, validation_status: r.validation_status, approval_status: r.approval_status, materialized_workflow_id: r.materialized_workflow_id, created_at: r.created_at, updated_at: r.updated_at }
+  }
+  async createDraft(input: { draft_id: string; idempotency_key: string | null; request_fingerprint: string; constraints: unknown; inventory_snapshot: unknown; inventory_hash: string }): Promise<{ draft: WorkflowDraftRecord; created: boolean }> {
+    this.open()
+    if (!isSafeId(input.draft_id)) throw new ControlStoreError('invalid_record', 'draft_id is not a safe identifier')
+    return this.db.transaction(() => {
+      const existing = this.draftRow(input.draft_id)
+      if (existing) return { draft: this.toDraft(existing), created: false } // create-or-return by the stable draft_id (captures the ORIGINAL inventory once)
+      const now = nowIso(); const L = SIZE_LIMITS.metadata_json
+      this.db.prepare(`INSERT INTO workflow_drafts (draft_id,idempotency_key,request_fingerprint,constraints_json,inventory_snapshot_json,inventory_hash,compiler_status,validation_status,approval_status,created_at,updated_at)
+        VALUES (@id,@key,@rf,@con,@inv,@ih,'pending','pending','unapproved',@now,@now)`)
+        .run({ id: input.draft_id, key: input.idempotency_key, rf: boundString(input.request_fingerprint, 128, 'draft.request_fingerprint'), con: encodeJson(input.constraints ?? null, L, 'draft.constraints'), inv: encodeJson(input.inventory_snapshot ?? null, L, 'draft.inventory'), ih: boundString(input.inventory_hash, 128, 'draft.inventory_hash'), now })
+      return { draft: this.toDraft(this.draftRow(input.draft_id)!), created: true }
+    })()
+  }
+  async bindDraftCompilerTask(draftId: string, taskId: string, capability?: unknown): Promise<void> {
+    this.open()
+    this.db.transaction(() => {
+      const r = this.draftRow(draftId); if (!r) throw new ControlStoreError('not_found', `draft not found: ${draftId}`)
+      if (r.compiler_task_id !== null && r.compiler_task_id !== taskId) throw new ControlStoreError('invalid_transition', 'draft compiler task is immutable once bound')
+      if (r.compiler_task_id === null) this.db.prepare('UPDATE workflow_drafts SET compiler_task_id=@t, compiler_capability_json=@cap, updated_at=@now WHERE draft_id=@id').run({ id: draftId, t: taskId, cap: capability !== undefined ? encodeJson(capability, SIZE_LIMITS.metadata_json, 'draft.capability') : null, now: nowIso() })
+    })()
+  }
+  async finalizeDraft(draftId: string, patch: { compiler_status: string; validation_status: string; spec?: unknown; input_values?: unknown; spec_hash?: string | null; policy_summary?: unknown; policy_summary_hash?: string | null; preview?: unknown; rationale?: unknown; warnings?: unknown; questions?: unknown }): Promise<WorkflowDraftRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.draftRow(draftId); if (!r) throw new ControlStoreError('not_found', `draft not found: ${draftId}`)
+      if (r.compiler_status !== 'pending') return this.toDraft(r) // first finalize wins (immutable content)
+      const L = SIZE_LIMITS.metadata_json
+      this.db.prepare(`UPDATE workflow_drafts SET compiler_status=@cs, validation_status=@vs, spec_json=@spec, input_values_json=@iv, spec_hash=@sh, policy_summary_json=@ps, policy_summary_hash=@psh, preview_json=@pv, rationale_json=@ra, warnings_json=@wa, questions_json=@qu, updated_at=@now WHERE draft_id=@id`)
+        .run({ id: draftId, cs: boundString(patch.compiler_status, 32, 'draft.status'), vs: boundString(patch.validation_status, 32, 'draft.vstatus'),
+          spec: patch.spec !== undefined ? encodeJson(patch.spec, SIZE_LIMITS.spec_json, 'draft.spec') : null, iv: patch.input_values !== undefined ? encodeJson(patch.input_values, L, 'draft.input_values') : null,
+          sh: patch.spec_hash ?? null, ps: patch.policy_summary !== undefined ? encodeJson(patch.policy_summary, L, 'draft.policy_summary') : null, psh: patch.policy_summary_hash ?? null,
+          pv: patch.preview !== undefined ? encodeJson(patch.preview, L, 'draft.preview') : null, ra: patch.rationale !== undefined ? encodeJson(patch.rationale, L, 'draft.rationale') : null,
+          wa: patch.warnings !== undefined ? encodeJson(patch.warnings, L, 'draft.warnings') : null, qu: patch.questions !== undefined ? encodeJson(patch.questions, L, 'draft.questions') : null, now: nowIso() })
+      return this.toDraft(this.draftRow(draftId)!)
+    })()
+  }
+  async getDraft(draftId: string): Promise<WorkflowDraftRecord | null> { this.open(); const r = this.draftRow(draftId); return r ? this.toDraft(r) : null }
+  async getDraftByIdempotencyKey(key: string): Promise<WorkflowDraftRecord | null> { this.open(); const r = this.db.prepare('SELECT * FROM workflow_drafts WHERE idempotency_key = ?').get(key) as DraftRow | undefined; return r ? this.toDraft(r) : null }
+  async approveDraftWithWorkflow(draftId: string, workflowId: string): Promise<WorkflowDraftRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.draftRow(draftId); if (!r) throw new ControlStoreError('not_found', `draft not found: ${draftId}`)
+      if (r.materialized_workflow_id !== null) return this.toDraft(r) // idempotent (already approved + materialized)
+      this.db.prepare("UPDATE workflow_drafts SET approval_status='approved', materialized_workflow_id=@wf, updated_at=@now WHERE draft_id=@id").run({ id: draftId, wf: workflowId, now: nowIso() })
+      return this.toDraft(this.draftRow(draftId)!)
+    })()
+  }
+
   // ── retention (bounded; never touches active records; no scheduler) ──────────
   async pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult> {
     this.open()
@@ -989,6 +1043,7 @@ interface WorkflowRow { workflow_id: string; revision: number; spec_version: str
 interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null }
 interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; created_at: string; updated_at: string }
 interface HumanRequestRow { request_id: string; workflow_id: string; step_execution_id: string; kind: string; prompt: string; choices_json: string | null; status: string; response_value: string | null; created_at: string; responded_at: string | null; updated_at: string; revision: number }
+interface DraftRow { draft_id: string; idempotency_key: string | null; request_fingerprint: string | null; compiler_task_id: string | null; compiler_capability_json: string | null; constraints_json: string | null; inventory_snapshot_json: string | null; inventory_hash: string | null; spec_json: string | null; input_values_json: string | null; spec_hash: string | null; policy_summary_json: string | null; policy_summary_hash: string | null; preview_json: string | null; rationale_json: string | null; warnings_json: string | null; questions_json: string | null; compiler_status: string; validation_status: string; approval_status: string; materialized_workflow_id: string | null; created_at: string; updated_at: string }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
 
 /** A better-sqlite3 UNIQUE/PRIMARYKEY constraint violation (the idempotency-key

@@ -338,6 +338,10 @@ export class GatewayClient {
   async answerWorkflowInput(workflowId: string, body: { request_id: string; value: string }): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/answer`, body) }
   async decideWorkflowApproval(workflowId: string, body: { request_id: string; approved: boolean }): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/decision`, body) }
   async resumeWorkflow(workflowId: string): Promise<unknown> { return this.request('POST', `/v1/workflows/${encodeURIComponent(workflowId)}/resume`) }
+  // natural-language workflow compiler (drafts)
+  async compileWorkflow(body: { nl_request: string; constraints?: unknown; compiler_agent: string; compiler_node_id?: string; idempotency_key?: string }): Promise<unknown> { return this.request('POST', '/v1/workflow-drafts/compile', body) }
+  async getWorkflowDraft(draftId: string): Promise<unknown> { return this.request('GET', `/v1/workflow-drafts/${encodeURIComponent(draftId)}`) }
+  async approveWorkflowDraft(draftId: string, body: { spec_hash: string }): Promise<unknown> { return this.request('POST', `/v1/workflow-drafts/${encodeURIComponent(draftId)}/approve`, body) }
 
   /**
    * BOUNDED collection of a workflow's events over SSE — the workflow analogue of

@@ -68,12 +68,12 @@ let rpcId = 1
 const call = (mcp: McpServer, name: string, args: Record<string, unknown> = {}) => mcp.handle({ jsonrpc: '2.0', id: rpcId++, method: 'tools/call', params: { name, arguments: args } })
 const sc = (r: any) => r.result.structuredContent
 
-test('MCP: tools/list exposes the seven task tools plus the eleven workflow tools', async () => {
+test('MCP: tools/list exposes the seven task tools plus the fourteen workflow tools', async () => {
   await withMcp((s) => new Fake(s, acceptanceScript), async ({ mcp }) => {
     const list = await mcp.handle({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
     const names = ((list as any).result.tools as Array<{ name: string }>).map((t) => t.name).sort()
-    assert.equal(names.length, 18)
-    for (const n of ['vibe_list_workflows', 'vibe_create_workflow', 'vibe_start_workflow', 'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_wait_workflow', 'vibe_cancel_workflow', 'vibe_get_pending_request', 'vibe_answer_workflow_input', 'vibe_decide_workflow_approval', 'vibe_resume_workflow']) assert.ok(names.includes(n), `has ${n}`)
+    assert.equal(names.length, 21)
+    for (const n of ['vibe_list_workflows', 'vibe_create_workflow', 'vibe_start_workflow', 'vibe_get_workflow', 'vibe_get_workflow_events', 'vibe_wait_workflow', 'vibe_cancel_workflow', 'vibe_get_pending_request', 'vibe_answer_workflow_input', 'vibe_decide_workflow_approval', 'vibe_resume_workflow', 'vibe_compile_workflow', 'vibe_get_workflow_draft', 'vibe_approve_workflow_draft']) assert.ok(names.includes(n), `has ${n}`)
     for (const n of ['vibe_start_task', 'vibe_run_task', 'vibe_get_task', 'vibe_get_task_events', 'vibe_wait_task', 'vibe_cancel_task', 'vibe_list_agents']) assert.ok(names.includes(n), `retains ${n}`)
   })
 })

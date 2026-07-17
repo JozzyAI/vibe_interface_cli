@@ -1,0 +1,35 @@
+/**
+ * Production InventoryProvider: a SAFE snapshot of assignable agents/nodes built from
+ * the gateway's local agents + (when a relay is configured) the online remote nodes.
+ * It reads only advertised, bounded metadata — never tokens, keys, or paths — and it
+ * does not let the compiler touch the relay/Node directly (this provider does, once,
+ * to build the snapshot the compiler then consumes as data).
+ */
+import type { Inventory, InventoryAgent, InventoryProvider } from './inventory.js'
+
+export interface RemoteNodeInfo { node_id: string; status: string; agents?: string[]; capabilities?: string[] }
+export interface GatewayInventoryOptions {
+  localAgents: string[]
+  fetchNodes?: () => Promise<RemoteNodeInfo[]>
+}
+
+export class GatewayInventoryProvider implements InventoryProvider {
+  constructor(private readonly opts: GatewayInventoryOptions) {}
+  async snapshot(): Promise<Inventory> {
+    const agents: InventoryAgent[] = []
+    for (const a of this.opts.localAgents) agents.push({ agent: a, permission_modes: ['default'], workspace_supported: false, capabilities: [] })
+    if (this.opts.fetchNodes) {
+      let nodes: RemoteNodeInfo[] = []
+      try { nodes = await this.opts.fetchNodes() } catch { nodes = [] }
+      for (const n of nodes) {
+        if (n.status !== 'online') continue
+        const caps = Array.isArray(n.capabilities) ? n.capabilities : []
+        const wsSupported = caps.includes('workspace')
+        for (const a of Array.isArray(n.agents) ? n.agents : []) {
+          agents.push({ agent: a, node_id: n.node_id, permission_modes: ['default'], workspace_supported: wsSupported, capabilities: caps })
+        }
+      }
+    }
+    return { agents, observed_at: new Date().toISOString() }
+  }
+}

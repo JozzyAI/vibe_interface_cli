@@ -260,7 +260,40 @@ CREATE TABLE workflow_stall_rounds (
 );
 `
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }]
+/** Schema v12 — IMMUTABLE natural-language compiler WorkflowDraft records. One row per
+ *  (request, inventory) via a unique idempotency_key so compile + recovery never create
+ *  duplicates. Content is frozen at finalize; approval binds a materialized workflow
+ *  once. Additive; bounded JSON; no secrets. */
+const V12 = `
+CREATE TABLE workflow_drafts (
+  draft_id TEXT PRIMARY KEY,
+  idempotency_key TEXT UNIQUE,
+  request_fingerprint TEXT,
+  compiler_task_id TEXT,
+  compiler_capability_json TEXT,
+  constraints_json TEXT,
+  inventory_snapshot_json TEXT,
+  inventory_hash TEXT,
+  spec_json TEXT,
+  input_values_json TEXT,
+  spec_hash TEXT,
+  policy_summary_json TEXT,
+  policy_summary_hash TEXT,
+  preview_json TEXT,
+  rationale_json TEXT,
+  warnings_json TEXT,
+  questions_json TEXT,
+  compiler_status TEXT NOT NULL,
+  validation_status TEXT NOT NULL,
+  approval_status TEXT NOT NULL,
+  materialized_workflow_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (materialized_workflow_id) REFERENCES workflows(workflow_id) ON DELETE SET NULL
+);
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {
