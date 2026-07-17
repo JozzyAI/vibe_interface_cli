@@ -18,6 +18,7 @@ import { WorkflowRuntime } from '../src/workflow/runtime.js'
 import { GatewayClient } from '../src/mcp/gateway-client.js'
 import { GatewayAgentTaskClient, type AgentTaskClient, type AgentTaskCreateRequest } from '../src/workflow/task-client.js'
 import { plannerExecutorLoopExample } from '../src/workflow/examples.js'
+import { WorkflowCompiler } from '../src/workflow/compiler/compiler.js'
 import type { WorkflowSpec } from '../src/workflow/contract.js'
 
 const TOKEN = `wfapi-${Math.random().toString(36).slice(2)}`
@@ -385,4 +386,46 @@ test('REST real-Gateway acceptance: a single-step workflow runs through the real
     delete process.env.VIBE_MOCK_OUTPUT
     try { await runtime.shutdown() } catch { /* */ } try { await gw.close() } catch { /* */ } try { store.closeSync() } catch { /* */ }
   }
+})
+
+// ── REST compiler (compile → get → approve → start) ──────────────────────────────
+
+test('REST compiler: compile → draft → approve by exact spec_hash creates a ready workflow (not started); start begins it; wrong hash conflicts', async () => {
+  const store = openControlStore({ path: tmpDb() })
+  let runtime: WorkflowRuntime | undefined
+  // a fake compiler model returning a valid ready spec; a fake inventory with claude on node_x
+  const readySpec = {
+    version: '1', name: 'compiled', entry_step: 'go', inputs: { objective: { type: 'string', required: true } },
+    agents: { only: { agent: 'mock', node_id: 'node_x' } },
+    output_schemas: { o: { fields: { status: { type: 'enum', required: true, enum: ['done'] }, summary: { type: 'string', required: true } } } },
+    limits: { max_tasks: 2, max_runtime_seconds: 60, max_step_attempts: 1, max_failures: 1 },
+    steps: [{ id: 'go', type: 'agent_task', agent_role: 'only', prompt_template: 'Do {{ inputs.objective }}', output_schema: 'o' }],
+    edges: [{ from: 'go', to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }],
+    completion_policy: {},
+  }
+  const model = { compile: async () => ({ task_id: 'ct_1', status: 'available' as const, output_text: JSON.stringify({ schema_version: '1', status: 'ready', workflow_spec: readySpec, input_values: { objective: 'ship' }, rationale: {}, questions: [], warnings: [] }) }) }
+  const inventory = { snapshot: async () => ({ observed_at: '2026-01-01T00:00:00Z', agents: [{ agent: 'mock', permission_modes: ['default'], workspace_supported: false, capabilities: ['run'] }, { agent: 'mock', node_id: 'node_x', permission_modes: ['default'], workspace_supported: true, capabilities: ['run', 'workspace'] }] }) }
+  const compiler = new WorkflowCompiler({ store, model, inventory })
+  const gw = await startAgentGateway({ host: '127.0.0.1', port: 0, apiToken: TOKEN, taskStore: store, controlStore: store, getWorkflowRuntime: () => runtime, getWorkflowCompiler: () => compiler })
+  runtime = new WorkflowRuntime({ store, taskClient: new ScriptedFake(store, () => ({ output: { status: 'done', summary: 'ok' } })), waitWindowMs: 20 })
+  try {
+    // compile
+    const c = await req(gw.port, 'POST', '/v1/workflow-drafts/compile', { nl_request: 'build a thing', compiler_agent: 'mock' })
+    assert.equal(c.status, 201); assert.equal(c.body.compiler_status, 'ready'); assert.equal(c.body.validation_status, 'valid')
+    const draftId = c.body.draft_id; const specHash = c.body.spec_hash
+    assert.ok(draftId && specHash); assert.ok(c.body.preview && c.body.policy_summary)
+    // get
+    const g = await req(gw.port, 'GET', `/v1/workflow-drafts/${draftId}`)
+    assert.equal(g.status, 200); assert.equal(g.body.spec_hash, specHash)
+    // approve with wrong hash → 409
+    const bad = await req(gw.port, 'POST', `/v1/workflow-drafts/${draftId}/approve`, { spec_hash: 'nope' })
+    assert.equal(bad.status, 409); assert.equal(bad.body.code, 'approval_hash_conflict')
+    // approve with exact hash → a ready workflow (NOT started)
+    const a = await req(gw.port, 'POST', `/v1/workflow-drafts/${draftId}/approve`, { spec_hash: specHash })
+    assert.equal(a.status, 200); const wfId = a.body.workflow_id; assert.ok(wfId)
+    assert.equal((await req(gw.port, 'GET', `/v1/workflows/${wfId}`)).body.status, 'ready', 'approve does not start')
+    // starting still requires the explicit start action
+    const started = await req(gw.port, 'POST', `/v1/workflows/${wfId}/start`)
+    assert.ok(['running', 'ready'].includes(started.body.status))
+  } finally { try { await runtime.shutdown() } catch { /* */ } try { await gw.close() } catch { /* */ } try { store.closeSync() } catch { /* */ } }
 })

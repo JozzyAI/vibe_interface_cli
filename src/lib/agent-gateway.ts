@@ -44,6 +44,7 @@ import type { GatewayTaskStore, ControlStore } from '../control/store.js'
 import { ControlStoreError, type CreateTaskInput, type TaskEventInput, type TaskRecord } from '../control/records.js'
 import { validateTaskResult, type AgentTaskResultV1, type TaskResultStatus } from './agent-task-result.js'
 import { listWorkflowsController, createWorkflowController, startWorkflowController, getWorkflowController, cancelWorkflowController, getPendingRequestController, answerInputController, decideApprovalController, resumeWorkflowController } from '../workflow/api.js'
+import { compileWorkflowController, getWorkflowDraftController, approveWorkflowDraftController } from '../workflow/compiler/api.js'
 import { streamWorkflowEvents } from '../workflow/event-stream.js'
 import { workflowApiError } from '../workflow/api-contract.js'
 
@@ -166,6 +167,9 @@ export interface AgentGatewayOptions {
    *  targets THIS gateway over loopback, so it is constructed AFTER listen and
    *  injected here. Returns undefined until wired (routes then answer 503). */
   getWorkflowRuntime?: () => import('../workflow/runtime.js').WorkflowRuntime | undefined
+  /** Lazy accessor for the WorkflowCompiler (constructed after listen, like the
+   *  runtime). Returns undefined until wired (draft routes then answer 503). */
+  getWorkflowCompiler?: () => import('../workflow/compiler/compiler.js').WorkflowCompiler | undefined
 }
 
 // ── auth ─────────────────────────────────────────────────────────────────────
@@ -1124,6 +1128,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   // (503 until it is wired post-listen); read routes need only the store.
   const controlStore: ControlStore | undefined = opts.controlStore
   const getWorkflowRuntime = opts.getWorkflowRuntime
+  const getWorkflowCompiler = opts.getWorkflowCompiler
   const workflowStreams = new Set<http.ServerResponse>() // open workflow SSE responses (ended on shutdown)
   function wfUnavailable(res: http.ServerResponse): void { sendJson(res, 503, workflowApiError('workflow_runtime_unavailable', 'the workflow runtime is not available yet')) }
 
@@ -1190,6 +1195,44 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     return sendError(res, apiError('task_not_found', 'not found'), 404)
   }
 
+  // ── workflow-draft (compiler) routes ──
+  async function handleWorkflowDrafts(req: http.IncomingMessage, res: http.ServerResponse, parts: string[], method: string): Promise<void> {
+    if (!controlStore) return sendError(res, apiError('task_not_found', 'the workflow compiler is not enabled on this gateway'), 404)
+    const compiler = getWorkflowCompiler?.()
+    const readJson = async (): Promise<{ ok: true; value: unknown } | { ok: false }> => {
+      const body = await readBody(req, MAX_BODY_BYTES)
+      if (!body.ok) { sendError(res, apiError('invalid_request', `request body exceeds ${MAX_BODY_BYTES} bytes`), 413); return { ok: false } }
+      try { return { ok: true, value: JSON.parse(body.text) } } catch { sendJson(res, 400, { error: true, code: 'invalid_request', message: 'malformed JSON body' }); return { ok: false } }
+    }
+    if (parts.length === 2) { // /v1/workflow-drafts
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (parts[1] !== 'workflow-drafts') return sendError(res, apiError('task_not_found', 'not found'), 404)
+      if (!compiler) return sendJson(res, 503, { error: true, code: 'compiler_unavailable', message: 'the workflow compiler is not available yet' })
+      // POST /v1/workflow-drafts is the base for /compile; require the /compile suffix.
+      return sendError(res, apiError('task_not_found', 'use POST /v1/workflow-drafts/compile'), 404)
+    }
+    if (parts.length === 3 && parts[2] === 'compile') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (!compiler) return sendJson(res, 503, { error: true, code: 'compiler_unavailable', message: 'the workflow compiler is not available yet' })
+      const parsed = await readJson(); if (!parsed.ok) return
+      const r = await compileWorkflowController(compiler, parsed.value); return sendJson(res, r.status, r.body)
+    }
+    const draftId = decodeURIComponent(parts[2])
+    if (!draftId) return sendError(res, apiError('invalid_request', 'missing draft id'), 400)
+    if (parts.length === 3) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+      if (!compiler) return sendJson(res, 503, { error: true, code: 'compiler_unavailable', message: 'the workflow compiler is not available yet' })
+      const r = await getWorkflowDraftController(compiler, draftId); return sendJson(res, r.status, r.body)
+    }
+    if (parts.length === 4 && parts[3] === 'approve') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+      if (!compiler) return sendJson(res, 503, { error: true, code: 'compiler_unavailable', message: 'the workflow compiler is not available yet' })
+      const parsed = await readJson(); if (!parsed.ok) return
+      const r = await approveWorkflowDraftController(compiler, draftId, parsed.value); return sendJson(res, r.status, r.body)
+    }
+    return sendError(res, apiError('task_not_found', 'not found'), 404)
+  }
+
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
@@ -1213,6 +1256,9 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         // /v1/workflows and sub-resources (durable Workflow Runtime lifecycle)
         if (parts.length >= 2 && parts[0] === 'v1' && parts[1] === 'workflows') {
           return await handleWorkflows(req, res, parts, method)
+        }
+        if (parts.length >= 2 && parts[0] === 'v1' && parts[1] === 'workflow-drafts') {
+          return await handleWorkflowDrafts(req, res, parts, method)
         }
         // /v1/tasks/:id  and sub-resources
         if (parts.length >= 3 && parts[0] === 'v1' && parts[1] === 'tasks') {

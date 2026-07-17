@@ -269,6 +269,37 @@ export interface CreateHumanRequestInput {
   choices: string[] | null
 }
 
+/** An IMMUTABLE natural-language compiler WorkflowDraft. Content fields are frozen once
+ *  finalized; only approval binds a materialized workflow (once). No secrets/tokens. */
+export interface WorkflowDraftRecord {
+  draft_id: string
+  idempotency_key: string | null
+  /** Hash of the NORMALIZED request + constraints (NO volatile inventory fields) —
+   *  the compile-operation request identity, distinct from inventory provenance. */
+  request_fingerprint: string | null
+  compiler_task_id: string | null
+  /** Bounded, safe compiler-task capability/permission summary (no secrets). */
+  compiler_capability: unknown
+  constraints: unknown
+  inventory_snapshot: unknown
+  inventory_hash: string | null
+  spec: unknown
+  input_values: unknown
+  spec_hash: string | null
+  policy_summary: unknown
+  policy_summary_hash: string | null
+  preview: unknown
+  rationale: unknown
+  warnings: unknown
+  questions: unknown
+  compiler_status: string   // pending | ready | needs_input | impossible | policy_denied
+  validation_status: string // pending | valid | invalid
+  approval_status: string   // unapproved | approved
+  materialized_workflow_id: string | null
+  created_at: string
+  updated_at: string
+}
+
 /** Durable ControlStore PROJECTION of a Node workspace lease held by a workflow.
  *  The Node remains authoritative — this row supports recovery/inspection only.
  *  Never carries tokens/keys/paths; revisions are bounded WorkspaceRevision JSON. */

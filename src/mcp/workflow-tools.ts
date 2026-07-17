@@ -203,5 +203,36 @@ export function createWorkflowTools(client: GatewayClient): ToolDef[] {
         try { return ok({ workflow: await client.resumeWorkflow(id.value), next: { tool: 'vibe_wait_workflow', arguments: { workflow_id: id.value } } }) } catch (e) { return fromGatewayError(e) }
       },
     },
+    {
+      name: 'vibe_compile_workflow',
+      description: 'Compile a NATURAL-LANGUAGE workflow request into an immutable WorkflowDraft (validated spec candidate, normalized inputs, deterministic preview, policy summary, and a canonical spec_hash). This does NOT create or start a workflow — inspect the preview, then call vibe_approve_workflow_draft with the exact spec_hash. Idempotent: the same request + inventory returns the same draft. The compiler LLM is never authoritative — the spec is re-validated by trusted code.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['nl_request', 'compiler_agent'], properties: { nl_request: { type: 'string', description: 'the natural-language workflow request' }, constraints: { type: 'object', description: 'optional bounded user constraints' }, compiler_agent: { type: 'string', description: 'the agent to run the compiler model (e.g. claude-code)' }, compiler_node_id: { type: 'string' }, idempotency_key: { type: 'string', description: 'optional: same key + same request returns the same draft (safe retry)' } } },
+      handler: async (args) => {
+        const nl = reqString(args, 'nl_request'); if (!nl.ok) return nl.err
+        const ca = reqString(args, 'compiler_agent'); if (!ca.ok) return ca.err
+        if (args.constraints !== undefined && (typeof args.constraints !== 'object' || args.constraints === null || Array.isArray(args.constraints))) return toolError('invalid_request', '`constraints` must be an object')
+        try { const draft = await client.compileWorkflow({ nl_request: nl.value, constraints: args.constraints, compiler_agent: ca.value, ...(typeof args.compiler_node_id === 'string' ? { compiler_node_id: args.compiler_node_id } : {}), ...(typeof args.idempotency_key === 'string' ? { idempotency_key: args.idempotency_key } : {}) }); return ok({ draft, next: { tool: 'vibe_approve_workflow_draft', arguments: { draft_id: (draft as { draft_id?: string }).draft_id, spec_hash: (draft as { spec_hash?: string }).spec_hash } } }) } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_get_workflow_draft',
+      description: 'Get an immutable WorkflowDraft (compiler + validation + approval status, canonical spec_hash / policy_summary_hash / inventory_hash, the validated workflow_spec, the deterministic preview + policy summary, rationale, warnings, and questions).',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['draft_id'], properties: { draft_id: { type: 'string' } } },
+      annotations: { readOnlyHint: true },
+      handler: async (args) => {
+        const id = reqString(args, 'draft_id'); if (!id.ok) return id.err
+        try { return ok(await client.getWorkflowDraft(id.value)) } catch (e) { return fromGatewayError(e) }
+      },
+    },
+    {
+      name: 'vibe_approve_workflow_draft',
+      description: 'Approve a ready+valid WorkflowDraft by its EXACT inspected spec_hash and materialize exactly ONE ready workflow. Approval binds to the exact spec/policy/inventory the draft captured; a hash mismatch returns a conflict. This does NOT start the workflow — call vibe_start_workflow afterward. Idempotent for the same hash. Any Agent/Node/permission/limit/route/policy change requires a new draft + approval.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['draft_id', 'spec_hash'], properties: { draft_id: { type: 'string' }, spec_hash: { type: 'string', description: 'the exact spec_hash you inspected' } } },
+      handler: async (args) => {
+        const id = reqString(args, 'draft_id'); if (!id.ok) return id.err
+        const sh = reqString(args, 'spec_hash'); if (!sh.ok) return sh.err
+        try { const r = await client.approveWorkflowDraft(id.value, { spec_hash: sh.value }); return ok({ draft: r, next: { tool: 'vibe_start_workflow', arguments: { workflow_id: (r as { workflow_id?: string }).workflow_id } } }) } catch (e) { return fromGatewayError(e) }
+      },
+    },
   ]
 }

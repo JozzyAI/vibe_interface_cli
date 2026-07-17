@@ -11,7 +11,26 @@ import type {
   WorkflowRecord, CreateWorkflowInput, WorkflowPatch, StepExecutionRecord,
   CreateStepExecutionInput, StepExecutionPatch, WorkflowEventInput, WorkflowEventRecord,
   WorkflowSnapshot, WorkflowWorkspaceLeaseRecord, WorkflowHumanRequestRecord, CreateHumanRequestInput,
+  WorkflowDraftRecord,
 } from './records.js'
+
+/** Durable IMMUTABLE compiler WorkflowDraft persistence — the ONLY store surface the
+ *  Workflow Compiler depends on (it never touches the relay/Node/runtime). */
+export interface WorkflowDraftStore {
+  /** Create-or-return a draft by its stable draft_id. Captures ONE inventory snapshot
+   *  + the request fingerprint at creation; a retry returns the existing draft (and
+   *  never re-snapshots). `idempotency_key` is the caller's compile-operation key (null
+   *  when unkeyed → a new operation each call). */
+  createDraft(input: { draft_id: string; idempotency_key: string | null; request_fingerprint: string; constraints: unknown; inventory_snapshot: unknown; inventory_hash: string }): Promise<{ draft: WorkflowDraftRecord; created: boolean }>
+  /** Bind the compiler Agent Task + safe capability summary once (immutable). */
+  bindDraftCompilerTask(draftId: string, taskId: string, capability?: unknown): Promise<void>
+  /** Finalize the draft content (first finalize wins; a finalized draft is immutable). */
+  finalizeDraft(draftId: string, patch: { compiler_status: string; validation_status: string; spec?: unknown; input_values?: unknown; spec_hash?: string | null; policy_summary?: unknown; policy_summary_hash?: string | null; preview?: unknown; rationale?: unknown; warnings?: unknown; questions?: unknown }): Promise<WorkflowDraftRecord>
+  getDraft(draftId: string): Promise<WorkflowDraftRecord | null>
+  getDraftByIdempotencyKey(key: string): Promise<WorkflowDraftRecord | null>
+  /** Bind approval + the materialized workflow id once (idempotent). */
+  approveDraftWithWorkflow(draftId: string, workflowId: string): Promise<WorkflowDraftRecord>
+}
 
 /** A workflow event without a `sequence` — the store assigns the next contiguous
  *  sequence when it appends the event inside a runtime composite. */
@@ -112,7 +131,7 @@ export interface WorkflowFilters { status?: string }
 export interface HealthCheck { ok: boolean; schema_version: number; foreign_keys: boolean; journal_mode: string; busy_timeout: number }
 export interface CleanupResult { removed: number }
 
-export interface ControlStore {
+export interface ControlStore extends WorkflowDraftStore {
   // lifecycle
   migrate(): Promise<number>
   healthCheck(): Promise<HealthCheck>
