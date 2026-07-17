@@ -195,6 +195,8 @@ export interface ControlStore extends WorkflowDraftStore {
   recordWorkspaceLeaseIntent(input: { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string }): Promise<WorkflowWorkspaceLeaseRecord>
   /** Promote an intent to `active` with the observed base + current revision. Idempotent. */
   markWorkspaceLeaseActive(leaseId: string, baseRevision: unknown, currentRevision: unknown, acquiredAt: string): Promise<WorkflowWorkspaceLeaseRecord>
+  /** Set/clear the sanitized reason an acquire is unresolved/failed (cleared on activate). */
+  setWorkspaceLeaseAcquireReason(leaseId: string, reason: string | null): Promise<WorkflowWorkspaceLeaseRecord>
   /** Update the expected current revision after a step terminalizes. */
   setWorkspaceLeaseRevision(leaseId: string, currentRevision: unknown): Promise<WorkflowWorkspaceLeaseRecord>
   /** Persist release INTENT (status `release_requested`). Idempotent; terminal-safe. */

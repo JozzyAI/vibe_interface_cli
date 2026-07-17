@@ -316,6 +316,9 @@ export interface WorkflowWorkspaceLeaseRecord {
   acquired_at: string | null
   release_requested_at: string | null
   released_at: string | null
+  /** Sanitized reason an acquire is unresolved/failed (e.g. `acquire_unconfirmed`,
+   *  `lease_outcome_unknown`, `workspace_lease_conflict`); NULL when active/released. */
+  acquire_reason: string | null
   created_at: string
   updated_at: string
 }

@@ -77,6 +77,12 @@ export class WorkflowRuntime {
   private stopped = false
   private readonly pumps = new Map<string, Promise<void>>()
   private readonly aborts = new Map<string, AbortController>()
+  /** Coalesce concurrent lease acquisition/reconciliation per workflow — repeated Start
+   *  requests and recovery calls share ONE in-flight attempt (deterministic lease ids +
+   *  idempotent Node acquire ⇒ never a second lease). */
+  private readonly leaseWork = new Map<string, Promise<'acquired' | 'pending' | 'blocked'>>()
+  /** One pending background lease-reconcile timer per workflow (coalesced). */
+  private readonly leaseReconcileTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
   constructor(opts: WorkflowRuntimeOptions) {
     this.store = opts.store
@@ -142,9 +148,16 @@ export class WorkflowRuntime {
       throw new WorkflowRuntimeError('workspace_lease_unsupported', 'workspace-bound workflow requires a workspace lease client (Node-enforced leases); refusing to run unleased')
     }
     // Acquire ALL required workspace leases BEFORE the durable ready→running
-    // transition. On conflict the workflow stays `ready`, any partially-acquired
-    // leases are released, and no task starts — an explicit later start retries.
-    if (this.leaseClient) await this.acquireWorkflowLeases(workflowId, spec, inputs)
+    // transition. Bounded + reconciling + coalesced: on a definitive block or an
+    // unconfirmed/unknown outcome the workflow stays `ready` (no workflow.started,
+    // no task), a sanitized reason is durably recorded (visible after reload), and an
+    // unknown outcome is reconciled in the background. Only when ALL leases are active
+    // do we transition ready→running. Never starts an Agent Task on a pending lease.
+    if (this.leaseClient) {
+      const outcome = await this.acquireOrReconcileLeases(workflowId, spec, inputs)
+      if (outcome === 'blocked') throw new WorkflowRuntimeError('workspace_lease_conflict', 'a required workspace could not be leased (see the workspace lease reason)', {})
+      if (outcome === 'pending') { this.scheduleLeaseReconcile(workflowId); throw new WorkflowRuntimeError('workspace_lease_pending', 'workspace lease acquisition is unconfirmed; it is being reconciled and Start can be safely retried', {}) }
+    }
     const r = await this.store.startWorkflowDurably(workflowId, { event_type: 'workflow.started', ts: new Date().toISOString(), payload: {}, contract_version: CV } as WorkflowEventDraft)
     this.ensurePump(workflowId)
     return r.workflow
@@ -163,6 +176,18 @@ export class WorkflowRuntime {
     // Also finish any pending lease releases for workflows that terminalized before
     // their release completed (e.g. a crash right after terminalization). Idempotent.
     await this.recoverLeaseReleases().catch(() => { /* best effort; retried next recover */ })
+    // RECONCILE-AFTER-RESTART: a `ready` workflow left with an `acquiring` lease (its
+    // Start crashed/lost the acquire ack) is resolved against the Node's authoritative
+    // state — a lost-ack lease continues the Start (workflow.started once), otherwise it
+    // is reconciled/retried. Deterministic ids + idempotent acquire ⇒ no duplicate lease
+    // or task. Best-effort + coalesced; the background timer keeps unknowns moving.
+    if (this.leaseClient) {
+      const ready = await this.store.listWorkflows({ status: 'ready' }).catch(() => [])
+      for (const wf of ready) {
+        const leases = await this.store.listWorkspaceLeaseProjections(wf.workflow_id).catch(() => [])
+        if (leases.some((l) => l.status === 'acquiring')) this.scheduleLeaseReconcile(wf.workflow_id)
+      }
+    }
     return running.map((w) => w.workflow_id)
   }
 
@@ -186,7 +211,9 @@ export class WorkflowRuntime {
   async shutdown(): Promise<void> {
     this.stopped = true
     for (const ac of this.aborts.values()) { try { ac.abort() } catch { /* */ } }
-    await Promise.allSettled([...this.pumps.values()])
+    for (const t of this.leaseReconcileTimers.values()) { try { clearTimeout(t) } catch { /* */ } }
+    this.leaseReconcileTimers.clear()
+    await Promise.allSettled([...this.pumps.values(), ...this.leaseWork.values()])
   }
 
   /** Test/consumer helper: ensure the pump ran and await it to quiescence. */
@@ -645,28 +672,114 @@ export class WorkflowRuntime {
     return { node_id: role.node_id, workspace_key: ws.workspaceKey, workspace_lease_id: workspaceLeaseId(wf.workflow_id, role.node_id, ws.workspaceKey) }
   }
 
-  /** Acquire ALL required leases (sorted node_id then workspace_key) before the
-   *  workflow starts. On conflict: release any already acquired, throw (workflow
-   *  stays `ready`). Idempotent across restarts (deterministic lease ids). */
-  private async acquireWorkflowLeases(workflowId: string, spec: WorkflowSpec, inputValues: Record<string, unknown>): Promise<void> {
-    if (!this.leaseClient) return
+  /** Acquire ALL required leases, RECONCILING ambiguous outcomes, COALESCED per
+   *  workflow. Returns:
+   *   - `acquired` : every lease is durably `active` → caller may transition to running.
+   *   - `pending`  : an acquire outcome is unconfirmed/unknown → workflow stays `ready`,
+   *                  a reason is durable, and the caller schedules background reconcile.
+   *   - `blocked`  : a definitive failure (e.g. conflict) → workflow stays `ready`, a
+   *                  reason is durable, and only an explicit retry re-attempts.
+   *  Deterministic lease ids + idempotent Node acquire ⇒ reissuing never creates a
+   *  second lease. Repeated concurrent callers share the SAME in-flight promise. */
+  private acquireOrReconcileLeases(workflowId: string, spec: WorkflowSpec, inputValues: Record<string, unknown>): Promise<'acquired' | 'pending' | 'blocked'> {
+    const existing = this.leaseWork.get(workflowId)
+    if (existing) return existing // coalesce repeated Start + recovery calls
+    const p = this.doAcquireOrReconcile(workflowId, spec, inputValues).finally(() => { this.leaseWork.delete(workflowId) })
+    this.leaseWork.set(workflowId, p)
+    return p
+  }
+
+  private async doAcquireOrReconcile(workflowId: string, spec: WorkflowSpec, inputValues: Record<string, unknown>): Promise<'acquired' | 'pending' | 'blocked'> {
+    if (!this.leaseClient) return 'acquired'
     const resolved = resolveWorkspaceTargets(workflowId, spec, inputValues)
     if (!resolved.ok) throw new WorkflowRuntimeError(resolved.code === 'workspace_node_ambiguous' ? 'workspace_node_ambiguous' : 'runtime_internal', `workspace lease target unresolved for step ${resolved.step_id}`, { step_id: resolved.step_id })
-    if (resolved.targets.length === 0) return
-    const acquired: WorkspaceTarget[] = []
+    if (resolved.targets.length === 0) return 'acquired'
+    const activated: WorkspaceTarget[] = []
     for (const tgt of resolved.targets) {
-      await this.store.recordWorkspaceLeaseIntent({ workspace_lease_id: tgt.workspace_lease_id, workflow_id: workflowId, node_id: tgt.node_id, workspace_key: tgt.workspace_key })
-      try {
-        const { lease } = await this.leaseClient.acquire(tgt.node_id, workflowId, tgt.workspace_key)
-        await this.store.markWorkspaceLeaseActive(lease.workspace_lease_id, lease.base_revision ?? null, lease.current_revision ?? lease.base_revision ?? null, lease.acquired_at ?? new Date().toISOString())
-        acquired.push(tgt)
-      } catch (err) {
-        await this.rollbackAcquired(acquired) // free partially-acquired workspaces
-        if (err instanceof WorkspaceLeaseError && err.code === 'workspace_lease_conflict') throw new WorkflowRuntimeError('workspace_lease_conflict', 'a required workspace is already leased by another workflow', { workspace_key: tgt.workspace_key })
-        if (err instanceof TransientWorkspaceLeaseError) throw new WorkflowRuntimeError('workspace_lease_unavailable', 'workspace lease service unavailable', {})
-        throw err
-      }
+      const outcome = await this.reconcileOneLease(workflowId, tgt)
+      if (outcome === 'active') { activated.push(tgt); continue }
+      // Not fully acquired → do NOT hold a partial set while blocked/pending: release
+      // the ones we just activated (best effort; deterministic ids keep this idempotent).
+      await this.rollbackAcquired(activated)
+      return outcome
     }
+    return 'acquired'
+  }
+
+  /** Acquire (bounded) then RECONCILE one lease against the Node's authoritative state.
+   *  Never leaves the CURRENT lease's outcome unrecorded: success → `active`; a lost/
+   *  timed-out ack that the Node actually honored → `active`; a confirmed non-creation →
+   *  `pending` (safe retry); an unknown outcome → `pending` (background reconcile); a
+   *  definitive conflict/invalid → `blocked`. */
+  private async reconcileOneLease(workflowId: string, tgt: WorkspaceTarget): Promise<'active' | 'pending' | 'blocked'> {
+    const proj = await this.store.getWorkspaceLeaseProjection(tgt.workspace_lease_id)
+    if (proj?.status === 'active') return 'active' // already held (idempotent)
+    await this.store.recordWorkspaceLeaseIntent({ workspace_lease_id: tgt.workspace_lease_id, workflow_id: workflowId, node_id: tgt.node_id, workspace_key: tgt.workspace_key })
+    try {
+      const { lease } = await this.leaseClient!.acquire(tgt.node_id, workflowId, tgt.workspace_key) // bounded (Node ack timeout)
+      await this.store.markWorkspaceLeaseActive(lease.workspace_lease_id, lease.base_revision ?? null, lease.current_revision ?? lease.base_revision ?? null, lease.acquired_at ?? new Date().toISOString())
+      return 'active'
+    } catch (err) {
+      if (err instanceof WorkspaceLeaseError) { // a STRUCTURED, definitive Node verdict (conflict / invalid key)
+        await this.setLeaseReason(tgt.workspace_lease_id, err.code)
+        return 'blocked'
+      }
+      if (err instanceof TransientWorkspaceLeaseError) return this.reconcileAmbiguousAcquire(workflowId, tgt) // timeout/transport = AMBIGUOUS
+      throw err
+    }
+  }
+
+  /** The acquire ack was lost/timed out — ask the Node whether the (deterministic) lease
+   *  is actually active. Active → adopt it (`active`); definitively absent → `pending`
+   *  with `acquire_unconfirmed` (safe retry); still unknown → `pending` with
+   *  `lease_outcome_unknown` (background reconcile). Never creates a second lease. */
+  private async reconcileAmbiguousAcquire(workflowId: string, tgt: WorkspaceTarget): Promise<'active' | 'pending'> {
+    try {
+      const lease = await this.leaseClient!.get(tgt.node_id, tgt.workspace_lease_id)
+      if (lease && lease.status === 'active' && lease.workflow_id === workflowId) {
+        await this.store.markWorkspaceLeaseActive(lease.workspace_lease_id, lease.base_revision ?? null, lease.current_revision ?? lease.base_revision ?? null, lease.acquired_at ?? new Date().toISOString())
+        return 'active' // lost-ack recovery: the Node had honored the acquire
+      }
+      await this.setLeaseReason(tgt.workspace_lease_id, lease === null ? 'acquire_unconfirmed' : 'lease_outcome_unknown')
+      return 'pending'
+    } catch { // the reconcile probe ALSO failed → truly unknown; keep acquiring + reconcile later
+      await this.setLeaseReason(tgt.workspace_lease_id, 'lease_outcome_unknown')
+      return 'pending'
+    }
+  }
+
+  private async setLeaseReason(leaseId: string, reason: string | null): Promise<void> {
+    try { await this.store.setWorkspaceLeaseAcquireReason(leaseId, reason) } catch { /* best effort; the durable status still gates */ }
+  }
+
+  /** Schedule ONE background reconcile for a workflow whose lease outcome is unknown.
+   *  Coalesced (one timer/workflow), unref'd, self-stops on resolution/terminal/stop. */
+  private scheduleLeaseReconcile(workflowId: string): void {
+    if (this.stopped || this.leaseReconcileTimers.has(workflowId)) return
+    const timer = setTimeout(() => {
+      this.leaseReconcileTimers.delete(workflowId)
+      void this.reconcileAndMaybeStart(workflowId).catch(() => { /* retried next recover / start */ })
+    }, Math.min(this.backoffMaxMs, this.backoffBaseMs * 4))
+    timer.unref?.()
+    this.leaseReconcileTimers.set(workflowId, timer)
+  }
+
+  /** Reconcile a still-`ready` workflow's leases; if they all become active, CONTINUE
+   *  the original Start (append workflow.started exactly once). Used by the background
+   *  timer and by post-restart recovery. Idempotent + coalesced. */
+  private async reconcileAndMaybeStart(workflowId: string): Promise<void> {
+    if (this.stopped) return
+    const wf = await this.store.getWorkflow(workflowId)
+    if (!wf || wf.status !== 'ready') return // running/terminal/blocked → nothing to reconcile
+    const spec = this.loadSpec(wf); if (!spec) return
+    const outcome = await this.acquireOrReconcileLeases(workflowId, spec, (wf.input_values ?? {}) as Record<string, unknown>)
+    if (outcome === 'acquired') {
+      await this.store.startWorkflowDurably(workflowId, { event_type: 'workflow.started', ts: new Date().toISOString(), payload: {}, contract_version: CV } as WorkflowEventDraft) // idempotent → started once
+      this.ensurePump(workflowId)
+    } else if (outcome === 'pending') {
+      this.scheduleLeaseReconcile(workflowId) // keep reconciling in the background
+    }
+    // 'blocked' → stop; the durable reason is visible and only an explicit retry re-attempts.
   }
 
   private async rollbackAcquired(targets: WorkspaceTarget[]): Promise<void> {

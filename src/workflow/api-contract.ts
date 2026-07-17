@@ -20,6 +20,7 @@ export type WorkflowApiErrorCode =
   | 'invalid_workflow_inputs'
   | 'workflow_state_conflict'
   | 'workspace_lease_conflict'     // a required Node workspace is already leased by another workflow
+  | 'workspace_lease_pending'      // the lease acquire outcome is unconfirmed/unknown — reconciling; retry Start
   | 'workspace_lease_unsupported'  // a workspace-bound workflow cannot start without a lease authority
   | 'workspace_lease_unavailable'  // the workspace-lease service was unreachable at start
   | 'workflow_storage_failure'
@@ -43,6 +44,7 @@ const RETRYABLE: Record<WorkflowApiErrorCode, boolean> = {
   invalid_workflow_inputs: false,
   workflow_state_conflict: false,
   workspace_lease_conflict: false,
+  workspace_lease_pending: true,
   workspace_lease_unsupported: false,
   workspace_lease_unavailable: true,
   workflow_storage_failure: true,
@@ -63,6 +65,7 @@ export function workflowErrorHttpStatus(code: WorkflowApiErrorCode): number {
     case 'human_request_not_found': return 404
     case 'workflow_state_conflict': return 409
     case 'workspace_lease_conflict': return 409
+    case 'workspace_lease_pending': return 503
     case 'workspace_lease_unsupported': return 422
     case 'workspace_lease_unavailable': return 503
     case 'workflow_runtime_unavailable': return 503
@@ -81,6 +84,7 @@ export function mapThrownError(err: unknown): { error: WorkflowApiError; status:
     else if (err.code === 'invalid_input_values') code = 'invalid_workflow_inputs'
     else if (err.code === 'invalid_transition') code = 'workflow_state_conflict'
     else if (err.code === 'workspace_lease_conflict') code = 'workspace_lease_conflict'
+    else if (err.code === 'workspace_lease_pending') code = 'workspace_lease_pending'
     else if (err.code === 'workspace_lease_unsupported') code = 'workspace_lease_unsupported'
     else if (err.code === 'workspace_lease_unavailable') code = 'workspace_lease_unavailable'
     else if (err.code === 'workspace_node_ambiguous') code = 'invalid_workflow_spec' // a workspace-bound step lacks an explicit node_id
@@ -239,11 +243,13 @@ export function toRevisionView(rev: unknown): RevisionView | null {
  *  (node_id / workspace_key) only — never a filesystem path, token, or credential. */
 export interface WorkspaceLeaseView {
   workspace_lease_id: string; node_id: string; workspace_key: string; status: string
+  /** Sanitized reason a lease is unresolved/failed while `acquiring` (null otherwise). */
+  acquire_reason: string | null
   base_revision: RevisionView | null; current_revision: RevisionView | null
   acquired_at: string | null; release_requested_at: string | null; released_at: string | null
 }
 export function toWorkspaceLeaseView(l: WorkflowWorkspaceLeaseRecord): WorkspaceLeaseView {
-  return { workspace_lease_id: l.workspace_lease_id, node_id: l.node_id, workspace_key: l.workspace_key, status: l.status, base_revision: toRevisionView(l.base_revision), current_revision: toRevisionView(l.current_revision), acquired_at: l.acquired_at, release_requested_at: l.release_requested_at, released_at: l.released_at }
+  return { workspace_lease_id: l.workspace_lease_id, node_id: l.node_id, workspace_key: l.workspace_key, status: l.status, acquire_reason: l.acquire_reason ?? null, base_revision: toRevisionView(l.base_revision), current_revision: toRevisionView(l.current_revision), acquired_at: l.acquired_at, release_requested_at: l.release_requested_at, released_at: l.released_at }
 }
 
 export interface StepExecutionView {
