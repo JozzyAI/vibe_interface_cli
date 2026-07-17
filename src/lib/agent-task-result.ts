@@ -15,6 +15,7 @@
  * workflow objective is complete.
  */
 import crypto from 'crypto'
+import { validateTaskVerification, verificationsEquivalent, type TaskVerificationV1 } from './task-verification.js'
 
 export const AGENT_TASK_RESULT_SCHEMA_VERSION = '1'
 
@@ -42,6 +43,10 @@ export interface AgentTaskResultV1 {
   content_hash: string
   evidence_refs: EvidenceRef[]
   artifact_refs: ArtifactRef[]
+  /** Optional, Harness-owned structured test verification (the ONLY authoritative
+   *  source of tests_passed/tests_failed evidence). Absent for a run with no verifier
+   *  configured — such results stay fully backward-compatible. */
+  verification?: TaskVerificationV1
 }
 
 // ── bounds ───────────────────────────────────────────────────────────────────
@@ -63,6 +68,7 @@ export interface BuildResultInput {
   finalizedAt?: string
   evidenceRefs?: EvidenceRef[]
   artifactRefs?: ArtifactRef[]
+  verification?: TaskVerificationV1
 }
 
 /** Build a well-formed AgentTaskResultV1 (computes the content hash). The caller
@@ -76,6 +82,7 @@ export function buildTaskResult(input: BuildResultInput): AgentTaskResultV1 {
     content_hash: computeResultContentHash(input.text),
     evidence_refs: input.evidenceRefs ?? [],
     artifact_refs: input.artifactRefs ?? [],
+    ...(input.verification ? { verification: input.verification } : {}),
   }
 }
 
@@ -115,6 +122,12 @@ export function validateTaskResult(obj: unknown): ResultValidateResult {
   if (o.content_hash !== computeResultContentHash(text)) return { ok: false, code: 'content_hash_mismatch', message: 'content_hash does not match final_output.text' }
   if (!boundedRefs(o.evidence_refs)) return { ok: false, code: 'invalid_result', message: 'evidence_refs must be a bounded array of {kind,...}' }
   if (!boundedRefs(o.artifact_refs)) return { ok: false, code: 'invalid_result', message: 'artifact_refs must be a bounded array of {kind,ref,...}' }
+  let verification: TaskVerificationV1 | undefined
+  if (o.verification !== undefined && o.verification !== null) {
+    const vv = validateTaskVerification(o.verification)
+    if (!vv.ok) return { ok: false, code: 'invalid_result', message: `verification invalid: ${vv.message}` }
+    verification = vv.value
+  }
   return {
     ok: true,
     value: {
@@ -122,6 +135,7 @@ export function validateTaskResult(obj: unknown): ResultValidateResult {
       process_exit_code: (o.process_exit_code as number | null | undefined) ?? null,
       finalized_at: o.finalized_at, content_hash: o.content_hash,
       evidence_refs: o.evidence_refs as EvidenceRef[], artifact_refs: o.artifact_refs as ArtifactRef[],
+      ...(verification ? { verification } : {}),
     },
   }
 }
@@ -131,4 +145,5 @@ export function validateTaskResult(obj: unknown): ResultValidateResult {
  *  conflict on re-persist. */
 export function resultsEquivalent(a: AgentTaskResultV1, b: AgentTaskResultV1): boolean {
   return a.content_hash === b.content_hash && a.final_output.text === b.final_output.text && (a.process_exit_code ?? null) === (b.process_exit_code ?? null)
+    && verificationsEquivalent(a.verification, b.verification)
 }

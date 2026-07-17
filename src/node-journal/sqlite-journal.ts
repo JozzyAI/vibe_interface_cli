@@ -133,7 +133,10 @@ CREATE TABLE workspace_revisions (
  *  the lease id so the Node can refuse a lease release while any bound run is still
  *  non-terminal (a provider may still be writing). Additive; legacy rows NULL. */
 const V4 = `ALTER TABLE runs ADD COLUMN workspace_lease_id TEXT;`
-const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }]
+// v5 — durable Harness-owned test VERIFICATION embedded in a run result (additive,
+// nullable; NULL for every legacy/verifier-less run result).
+const V5 = `ALTER TABLE run_results ADD COLUMN verification_json TEXT;`
+const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }]
 export const LATEST_JOURNAL_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 const LATEST = LATEST_JOURNAL_SCHEMA_VERSION
 
@@ -174,7 +177,7 @@ interface Sub {
 }
 
 interface RunRow { remote_run_id: string; created_at: string; updated_at: string; status: string; terminal_at: string | null; last_sequence: number; earliest_retained_sequence: number; terminal_event_recorded: number; workspace_lease_id: string | null }
-interface ResultRow { remote_run_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; created_at: string }
+interface ResultRow { remote_run_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; verification_json: string | null; created_at: string }
 interface LeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; base_revision_json: string | null; current_revision_json: string | null; created_at: string; updated_at: string }
 function isUniqueError(e: unknown): boolean { if (!(e instanceof Error)) return false; const c = (e as unknown as { code?: unknown }).code; return typeof c === 'string' && c.startsWith('SQLITE_CONSTRAINT') }
 function boundFinal(text: string): string { if (Buffer.byteLength(text, 'utf8') > MAX_FINAL_OUTPUT_BYTES) throw new JournalError('too_large', 'run_result.final_output exceeds the size limit'); return text }
@@ -380,6 +383,7 @@ export class SqliteNodeJournal implements NodeJournal {
       && (row.process_exit_code ?? null) === (result.process_exit_code ?? null)
       && row.evidence_refs_json === encodeJson(result.evidence_refs ?? [], 256 * 1024, 'run_result.evidence_refs')
       && row.artifact_refs_json === encodeJson(result.artifact_refs ?? [], 256 * 1024, 'run_result.artifact_refs')
+      && (row.verification_json ?? null) === (result.verification ? encodeJson(result.verification, 256 * 1024, 'run_result.verification') : null)
   }
   persistRunResult(remoteRunId: string, resultStatus: string, result: AgentTaskResultV1 | null): { applied: boolean } {
     this.open(); this.assertId(remoteRunId)
@@ -388,12 +392,13 @@ export class SqliteNodeJournal implements NodeJournal {
       const existing = this.resultRow(remoteRunId)
       if (existing) { if (this.resultMatches(existing, resultStatus, result)) return { applied: false }; throw new JournalError('result_conflict', 'a different run result already exists (content mismatch)') }
       const now = nowIso()
-      this.db.prepare(`INSERT INTO run_results (remote_run_id,schema_version,result_status,final_output_text,process_exit_code,finalized_at,content_hash,evidence_refs_json,artifact_refs_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
+      this.db.prepare(`INSERT INTO run_results (remote_run_id,schema_version,result_status,final_output_text,process_exit_code,finalized_at,content_hash,evidence_refs_json,artifact_refs_json,verification_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
         remoteRunId, result?.schema_version ?? '1', resultStatus,
         result ? boundFinal(result.final_output.text) : null,
         result?.process_exit_code ?? null, result?.finalized_at ?? null, result?.content_hash ?? null,
         encodeJson(result?.evidence_refs ?? [], 256 * 1024, 'run_result.evidence_refs'),
-        encodeJson(result?.artifact_refs ?? [], 256 * 1024, 'run_result.artifact_refs'), now,
+        encodeJson(result?.artifact_refs ?? [], 256 * 1024, 'run_result.artifact_refs'),
+        result?.verification ? encodeJson(result.verification, 256 * 1024, 'run_result.verification') : null, now,
       )
       return { applied: true }
     })()
@@ -402,7 +407,7 @@ export class SqliteNodeJournal implements NodeJournal {
     this.open()
     const row = this.resultRow(remoteRunId); if (!row) return null
     if (row.result_status !== 'available') return { remote_run_id: remoteRunId, result_status: row.result_status, result: null }
-    const v = validateTaskResult({ schema_version: row.schema_version, final_output: { kind: 'text', text: row.final_output_text ?? '' }, process_exit_code: row.process_exit_code, finalized_at: row.finalized_at ?? '', content_hash: row.content_hash ?? '', evidence_refs: decodeJson(row.evidence_refs_json, 256 * 1024, 'run_result.evidence_refs'), artifact_refs: decodeJson(row.artifact_refs_json, 256 * 1024, 'run_result.artifact_refs') })
+    const v = validateTaskResult({ schema_version: row.schema_version, final_output: { kind: 'text', text: row.final_output_text ?? '' }, process_exit_code: row.process_exit_code, finalized_at: row.finalized_at ?? '', content_hash: row.content_hash ?? '', evidence_refs: decodeJson(row.evidence_refs_json, 256 * 1024, 'run_result.evidence_refs'), artifact_refs: decodeJson(row.artifact_refs_json, 256 * 1024, 'run_result.artifact_refs'), ...(row.verification_json != null ? { verification: decodeJson(row.verification_json, 256 * 1024, 'run_result.verification') } : {}) })
     if (!v.ok) throw new JournalError('corruption', `persisted run result is invalid (${v.code})`)
     return { remote_run_id: remoteRunId, result_status: 'available', result: v.value }
   }

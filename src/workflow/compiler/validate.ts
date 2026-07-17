@@ -55,11 +55,13 @@ export function validateReady(specInput: unknown, inputValuesInput: unknown, inv
   const roles = spec.agents as Record<string, WorkflowAgentRole>
   const permByRole = new Map<string, Set<string>>()
   const wsByRole = new Set<string>()
+  const verifyProfilesByRole = new Map<string, Set<string>>()
   for (const step of spec.steps) {
-    const s = step as { agent_role?: string; permission_mode?: string; workspace_key_template?: string }
+    const s = step as { agent_role?: string; permission_mode?: string; workspace_key_template?: string; verify?: { profile?: string } }
     if (s.agent_role) {
       if (s.permission_mode) { const set = permByRole.get(s.agent_role) ?? new Set(); set.add(s.permission_mode); permByRole.set(s.agent_role, set) }
       if (s.workspace_key_template !== undefined) wsByRole.add(s.agent_role)
+      if (s.verify && typeof s.verify.profile === 'string') { const set = verifyProfilesByRole.get(s.agent_role) ?? new Set(); set.add(s.verify.profile); verifyProfilesByRole.set(s.agent_role, set) }
     }
   }
   for (const [roleName, role] of Object.entries(roles)) {
@@ -67,6 +69,11 @@ export function validateReady(specInput: unknown, inputValuesInput: unknown, inv
     if (!placement) { issues.push({ code: 'agent_not_in_inventory', message: `agent "${role.agent}"${role.node_id ? ` on node ${role.node_id}` : ''} is not available in the inventory`, path: `/agents/${roleName}` }); continue }
     for (const mode of permByRole.get(roleName) ?? []) if (!placement.permission_modes.includes(mode) || !policy.allowed_permission_modes.includes(mode)) issues.push({ code: 'permission_not_enforceable', message: `permission_mode "${mode}" is not enforceable for role ${roleName}`, path: `/agents/${roleName}` })
     if (wsByRole.has(roleName) && !placement.workspace_supported) issues.push({ code: 'workspace_not_supported', message: `role ${roleName} requires a workspace but its placement does not support one`, path: `/agents/${roleName}` })
+    // A verifier profile must be ADVERTISED by the placement's Node (i.e. the Node
+    // can enforce the verifier sandbox). Node policy owns the command; the spec only
+    // names a profile the Node already offers.
+    const advertised = new Set(placement.verifier_profiles ?? [])
+    for (const profile of verifyProfilesByRole.get(roleName) ?? []) if (!advertised.has(profile)) issues.push({ code: 'verifier_profile_not_advertised', message: `verifier profile "${profile}" is not advertised by the placement for role ${roleName} (the Node cannot enforce it)`, path: `/agents/${roleName}` })
   }
 
   // (8) enforce workflow limits + system policy caps.

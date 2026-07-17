@@ -23,6 +23,9 @@ export interface AgentTaskCreateRequest {
    *  the Gateway (which forwards it to the Node for enforcement only) — NEVER reaches
    *  the provider prompt/env. Absent for unmanaged steps. */
   workspace_lease_id?: string
+  /** OPTIONAL Harness-owned post-task test verifier (argv only). Forwarded to the
+   *  Node for enforcement; never reaches the provider prompt/env. */
+  verify?: import('../lib/task-verification.js').TaskVerifyConfig
 }
 
 export interface AgentTaskRef { task_id: string }
@@ -119,6 +122,7 @@ export class GatewayAgentTaskClient implements AgentTaskClient {
         ...(req.metadata ? { metadata: req.metadata } : {}),
         idempotency_key: req.idempotency_key,
         ...(req.workspace_lease_id ? { workspace_lease_id: req.workspace_lease_id } : {}),
+        ...(req.verify ? { verify: req.verify } : {}),
       })
     } catch (err) { classify(err) }
     const taskId = taskIdOf(task, '')

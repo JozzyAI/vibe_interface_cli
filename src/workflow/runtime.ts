@@ -300,6 +300,7 @@ export class WorkflowRuntime {
       metadata: { workflow_id: workflowId, step_execution_id: step.step_execution_id, step_id: step.step_id, round: step.round, attempt: step.attempt },
       idempotency_key: step.step_execution_id,
       ...(leaseId ? { workspace_lease_id: leaseId } : {}),
+      ...(specStep.verify ? { verify: specStep.verify } : {}),
     }
 
     // Create with bounded backoff on transient failures; a fatal failure fails the

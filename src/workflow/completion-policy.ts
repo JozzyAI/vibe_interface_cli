@@ -20,6 +20,7 @@ export function isCompletableSpec(spec: WorkflowSpec): boolean {
   return Array.isArray(spec.edges) && spec.edges.some((e) => e && (e as { to?: unknown }).to === '$complete')
 }
 import type { EvidenceRef, AgentTaskResultV1 } from '../lib/agent-task-result.js'
+import { verificationTestsResult } from '../lib/task-verification.js'
 import type { WorkspaceRevision } from '../lib/workspace-lease.js'
 
 /** Bounded, SYSTEM-OBSERVED evidence snapshot for a completing step. Every field is
@@ -68,7 +69,10 @@ export function assembleEvidence(input: {
     repository_changed: before !== null && after !== null ? before !== after : null,
     changed_files,
     changed_files_hash: changed_files ? crypto.createHash('sha256').update(JSON.stringify([...changed_files].sort())).digest('hex') : null,
-    tests_passed: testsEvidenceFromRefs(input.result?.evidence_refs),
+    // tests_passed is derived ONLY from the Harness-owned structured verification
+    // record (system-run test command exit code) — NEVER from evidence_refs prose,
+    // the agent's JSON, or `tests_run`. Absent verification ⇒ null (not observed).
+    tests_passed: verificationTestsResult(input.result?.verification),
   }
 }
 

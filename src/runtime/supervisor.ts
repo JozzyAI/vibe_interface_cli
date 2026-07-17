@@ -36,6 +36,8 @@ import {
 } from '../repo-policy.js'
 import type { AgentAdapter, AgentAdapterContext, AgentOutcome, FailureReason } from './types.js'
 import { buildTaskResult, MAX_FINAL_OUTPUT_BYTES, type AgentTaskResultV1, type TaskResultStatus } from '../lib/agent-task-result.js'
+import type { TaskVerificationV1 } from '../lib/task-verification.js'
+import { runVerifier, verifierPreflight } from './verifier.js'
 import { mockAdapter } from './adapters/mock.js'
 import { claudeAdapter } from './adapters/claude.js'
 import { codexAdapter } from './adapters/codex.js'
@@ -123,11 +125,13 @@ function buildFallbackPrompt(record: RunRecord, handoffFile: string): string {
 }
 
 /** Build the durable AgentTaskResult from an adapter's authoritative final output.
- *  Absent or oversized final output → `missing` (never a guess from event history). */
-function finalizeResult(outcome: AgentOutcome): { result_status: TaskResultStatus; task_result?: AgentTaskResultV1 } {
+ *  Absent or oversized final output → `missing` (never a guess from event history).
+ *  `verification` (when a verifier ran) is embedded as the ONLY authoritative test
+ *  evidence. */
+function finalizeResult(outcome: AgentOutcome, verification?: TaskVerificationV1): { result_status: TaskResultStatus; task_result?: AgentTaskResultV1 } {
   const fo = outcome.finalOutput
   if (typeof fo === 'string' && Buffer.byteLength(fo, 'utf8') <= MAX_FINAL_OUTPUT_BYTES) {
-    return { result_status: 'available', task_result: buildTaskResult({ text: fo, processExitCode: outcome.exitCode }) }
+    return { result_status: 'available', task_result: buildTaskResult({ text: fo, processExitCode: outcome.exitCode, ...(verification ? { verification } : {}) }) }
   }
   return { result_status: 'missing' }
 }
@@ -185,6 +189,26 @@ export async function runSupervisor(run_id: string): Promise<void> {
     }
   }
 
+  // ── Fail-closed test-verifier capability check ──────────────────────────────
+  // If the step declared a Harness verifier, confirm THIS node can run it BEFORE any
+  // agent launches. A missing/misconfigured verifier is terminal (not recoverable):
+  // running the agent anyway would yield a "completed" result that could never carry
+  // trusted test evidence, silently defeating the completion policy.
+  if (initial.verify) {
+    const pf = verifierPreflight(initial.verify)
+    if (!pf.ok) {
+      const message = `test verifier unavailable: ${pf.message}`
+      appendEvent({ type: 'error', run_id, session_id, message, code: 'verifier_unavailable', ts: ts() })
+      updateRun(run_id, {
+        status: 'failed', started_agent: startedAgent, final_agent: startedAgent,
+        switched: false, failure_reason: 'verifier_unavailable', recoverable: false,
+        child_pid: undefined,
+      })
+      appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+      return
+    }
+  }
+
   let ctx: AgentAdapterContext = {}
   let switched = false
   let switchReason: FailureReason | undefined
@@ -225,10 +249,39 @@ export async function runSupervisor(run_id: string): Promise<void> {
     if (readRun(run_id).status === 'stopped') return
 
     if (outcome.result === 'completed') {
+      // ── Harness-owned test verification (runs AFTER the agent exits, BEFORE the
+      // result is finalized). The verifier is a TRUSTED spec-declared command run in
+      // the leased workspace; its exit code is the sole source of tests_passed/
+      // tests_failed evidence. Agent-reported test claims are never consulted. The
+      // record it produces is embedded in the durable AgentTaskResult so the
+      // completion policy sees only this system-observed evidence.
+      let verification: TaskVerificationV1 | undefined
+      if (record.verify) {
+        // Re-check the capability (profile + sandbox) now; if it regressed since the
+        // pre-agent preflight, FAIL the run closed rather than complete unverified.
+        const pf = verifierPreflight(record.verify)
+        if (!pf.ok) {
+          const message = `test verifier unavailable after agent run: ${pf.message}`
+          appendEvent({ type: 'error', run_id, session_id, message, code: 'verifier_unavailable', ts: ts() })
+          updateRun(run_id, { status: 'failed', final_agent: agent, switched, failure_reason: 'verifier_unavailable', recoverable: false, ...(switchReason && { switch_reason: switchReason }), ...(handoffStr && { handoff_path: handoffStr }), child_pid: undefined })
+          appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+          return
+        }
+        try {
+          verification = await runVerifier(record.verify, record.workspace_path)
+          appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: `verification: ${verification.kind} via profile "${verification.profile}" (exit ${verification.exit_code})`, ts: ts() })
+        } catch (err) {
+          // The sandboxed verifier could not run — fail closed (never complete unverified).
+          appendEvent({ type: 'error', run_id, session_id, message: `test verifier error: ${(err as Error).message}`, code: 'verifier_error', ts: ts() })
+          updateRun(run_id, { status: 'failed', final_agent: agent, switched, failure_reason: 'verifier_unavailable', recoverable: false, ...(switchReason && { switch_reason: switchReason }), ...(handoffStr && { handoff_path: handoffStr }), child_pid: undefined })
+          appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+          return
+        }
+      }
       // Finalize the authoritative AgentTaskResult from the adapter's OWN completion
       // path (never by scanning the event log). No authoritative/bounded final
       // output → result_status = 'missing' (we never guess from events).
-      const { result_status, task_result } = finalizeResult(outcome)
+      const { result_status, task_result } = finalizeResult(outcome, verification)
       updateRun(run_id, {
         status: 'completed', final_agent: agent, switched,
         ...(switchReason && { switch_reason: switchReason }),
