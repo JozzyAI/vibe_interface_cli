@@ -10,6 +10,7 @@
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import { withVerifierSandboxCapability } from './runtime/sandbox.js'
 import { resolveConfig } from './config.js'
 import {
   getDaemonStatePath,
@@ -69,7 +70,9 @@ async function runFileModeDaemon(nodeIdOverride?: string): Promise<void> {
     name: 'Local Machine',
     status: 'online',
     transport: 'local',
-    capabilities: ['run', 'stream', 'stop', 'workspace'],
+    // Evaluated ONCE at daemon startup (the verifier-sandbox probe is cached per
+    // process). Installing/removing bubblewrap requires a Node restart to re-advertise.
+    capabilities: withVerifierSandboxCapability(['run', 'stream', 'stop', 'workspace']),
     agents: resolveAgents(),
     active_runs: countActiveRuns(),
     max_runs: 4,
