@@ -613,6 +613,18 @@ export function startRelayServer(opts: RelayServerOpts): Promise<RelayServer> {
             if (requester) { sendMsg(requester, msg); pendingLeases.delete(msg.req_id) }
             break
           }
+          default: {
+            // Never silently drop a REQUEST. Any message carrying a `req_id` that no
+            // case forwarded or answered gets a structured `relay_error` back to the
+            // sender — so a client whose request type this relay does not recognize
+            // (e.g. a workspace-lease RPC against a relay build predating it) fails fast
+            // with a bounded reason instead of hanging until timeout.
+            const reqId = (msg as { req_id?: unknown }).req_id
+            if (typeof reqId === 'string' && reqId.length > 0) {
+              sendMsg(ws, { version: 1, kind: 'plaintext', from: 'relay', to: (msg as { from?: string }).from ?? 'cli', ts: now(), type: 'relay_error', req_id: reqId, ok: false, error: `unsupported request type: ${String((msg as { type?: unknown }).type ?? 'unknown')}`, code: 'unsupported_request' } as never)
+            }
+            break
+          }
         }
       })
 
