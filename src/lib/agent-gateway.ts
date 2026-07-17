@@ -30,6 +30,7 @@ import { startRun, stopRun } from './run-actions.js'
 import { readRun } from '../store.js'
 import { readEvents } from '../events.js'
 import { isLoopbackHost } from './terminal-web.js'
+import { workflowUiHtml } from './workflow-ui.js'
 import { remoteRunStart, remoteStream, remoteRunStatus, remoteStop, remoteRunResult, fetchRemoteNodes } from '../relay/client.js'
 import { classifyRunError } from './run-error.js'
 import {
@@ -174,12 +175,24 @@ export interface AgentGatewayOptions {
 
 // ── auth ─────────────────────────────────────────────────────────────────────
 
+function constEq(a: string, b: string): boolean {
+  const pa = Buffer.from(a), pb = Buffer.from(b)
+  return pa.length === pb.length && crypto.timingSafeEqual(pa, pb)
+}
+/** The browser UI authenticates same-origin fetches via an HttpOnly cookie (JS never
+ *  holds the token). Non-UI clients use the Authorization: Bearer header. */
+const GW_COOKIE = 'vibe_gw'
+function cookieToken(req: http.IncomingMessage): string | undefined {
+  const raw = req.headers.cookie
+  if (typeof raw !== 'string') return undefined
+  for (const part of raw.split(';')) { const [k, ...v] = part.trim().split('='); if (k === GW_COOKIE) return decodeURIComponent(v.join('=')) }
+  return undefined
+}
 function bearerMatches(req: http.IncomingMessage, apiToken: string): boolean {
   const header = req.headers.authorization
-  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false
-  const provided = Buffer.from(header.slice('Bearer '.length))
-  const expected = Buffer.from(apiToken)
-  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected)
+  if (typeof header === 'string' && header.startsWith('Bearer ') && constEq(header.slice('Bearer '.length), apiToken)) return true
+  const ck = cookieToken(req)
+  return ck !== undefined && constEq(ck, apiToken)
 }
 
 // ── JSON helpers (structured errors only; never leak stacks or the token) ─────
@@ -1237,11 +1250,31 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     void (async () => {
       try {
         if (shuttingDown) return sendError(res, apiError('service_unavailable', 'gateway is shutting down'), 503)
-        if (!bearerMatches(req, apiToken)) return sendError(res, apiError('unauthorized', 'missing or invalid bearer token'), 401)
 
         const url = new URL(req.url ?? '/', 'http://localhost')
         const parts = url.pathname.split('/').filter(Boolean) // ['v1','tasks',':id',...]
         const method = req.method ?? 'GET'
+
+        // Workflow UI shell: a PUBLIC, secret-free HTML page (the JSON API stays gated).
+        // A correct `?token=` sets an HttpOnly cookie + redirects to a clean URL, so the
+        // page's same-origin fetches authenticate without JS ever holding the token.
+        if (parts[0] === 'ui') {
+          if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+          const tok = url.searchParams.get('token')
+          if (tok !== null && constEq(tok, apiToken)) {
+            // Bootstrap: strip the token from the URL immediately (redirect to a clean
+            // path) and never cache the token-bearing request/redirect or the Set-Cookie.
+            res.writeHead(302, { location: '/ui' + (url.searchParams.get('draft') ? '?draft=' + encodeURIComponent(url.searchParams.get('draft')!) : ''), 'set-cookie': `${GW_COOKIE}=${encodeURIComponent(apiToken)}; HttpOnly; SameSite=Strict; Path=/`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
+            return res.end()
+          }
+          // A missing/malformed/wrong token is never echoed — just serve the shell.
+          const nonce = crypto.randomBytes(16).toString('base64')
+          const html = workflowUiHtml(nonce)
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html), 'cache-control': 'no-store', 'content-security-policy': `default-src 'none'; connect-src 'self'; img-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'self'`, 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' })
+          return res.end(html)
+        }
+
+        if (!bearerMatches(req, apiToken)) return sendError(res, apiError('unauthorized', 'missing or invalid bearer token'), 401)
 
         // /v1/agents
         if (parts.length === 2 && parts[0] === 'v1' && parts[1] === 'agents') {
