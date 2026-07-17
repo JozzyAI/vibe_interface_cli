@@ -123,6 +123,20 @@ export function _resetSandboxDetectionCache(): void { cached = null }
 /** True when this Node can enforce the verifier sandbox profile. */
 export function sandboxCapabilityAvailable(): boolean { return detectEnforcingSandbox().enforces }
 
+/**
+ * Append the verifier-sandbox capability to a Node's base capabilities IFF this Node
+ * can enforce the verifier sandbox (the live probe passed). The base capabilities are
+ * preserved unchanged. `available` defaults to the REAL probe result — callers pass it
+ * only in unit tests; the default never weakens the probe.
+ *
+ * Callers evaluate this at Node STARTUP (register/heartbeat), and the probe result is
+ * cached per process, so installing or removing bubblewrap requires a Node restart to
+ * re-evaluate the advertised capability.
+ */
+export function withVerifierSandboxCapability(base: readonly string[], available: boolean = sandboxCapabilityAvailable()): string[] {
+  return available && !base.includes(VERIFY_SANDBOX_CAPABILITY) ? [...base, VERIFY_SANDBOX_CAPABILITY] : [...base]
+}
+
 export type SandboxWrap =
   | { ok: true; argv: string[]; backend: SandboxBackend }
   | { ok: false; code: 'sandbox_unavailable'; message: string }

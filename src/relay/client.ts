@@ -19,6 +19,7 @@ import { isTerminal } from '../types.js'
 import type { AgentBackend, PermissionMode, RunEvent, RunRecord, VibeNode } from '../types.js'
 import { openNodeJournal } from '../node-journal/sqlite-journal.js'
 import { RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY } from '../node-journal/contract.js'
+import { withVerifierSandboxCapability } from '../runtime/sandbox.js'
 import { validateTaskResult, type AgentTaskResultV1 } from '../lib/agent-task-result.js'
 import { WorkspaceLeaseError, observeWorkspaceRevision, type WorkspaceLeaseV1 } from '../lib/workspace-lease.js'
 import { isIsoUtc as journalIsoOk, nowIso as journalNowIso } from '../node-journal/serialization.js'
@@ -460,7 +461,10 @@ export async function relayNodeDaemon(
     transport: 'relay',
     // Advertise journaled replay only when the journal actually opened, so a
     // client can detect replay support (absence ⇒ live-only, older behavior).
-    capabilities: nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY] : ['run', 'stream', 'stop', 'workspace'],
+    // `verify-sandbox` is appended only when the enforcing verifier-sandbox probe
+    // passes; evaluated once at register time (probe cached per process) → a
+    // bubblewrap install/removal needs a Node restart to change the advertisement.
+    capabilities: withVerifierSandboxCapability(nodeJournal ? ['run', 'stream', 'stop', 'workspace', RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY, WORKSPACE_LEASE_CAPABILITY] : ['run', 'stream', 'stop', 'workspace']),
     agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
