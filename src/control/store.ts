@@ -198,6 +198,13 @@ export interface ControlStore {
   recordCompletionEvidence(input: { step_execution_id: string; workflow_id: string; evidence: unknown; decision: string }): Promise<void>
   getCompletionEvidence(stepExecutionId: string): Promise<{ step_execution_id: string; workflow_id: string; evidence: unknown; decision: string; created_at: string } | null>
 
+  // ── no-progress (stall) signal fingerprints (workflow_stall_rounds) ──────────
+  /** Persist a loop round's stall fingerprint. First-write-wins per (workflow, round)
+   *  so a restart never double-counts a round. */
+  recordStallRound(workflowId: string, round: number, fingerprint: string, signals: unknown): Promise<void>
+  /** All recorded stall fingerprints for a workflow, ordered by round ascending. */
+  listStallRounds(workflowId: string): Promise<Array<{ round: number; fingerprint: string }>>
+
   // ── human pause / approval gates (workflow_human_requests) ───────────────────
   // Durable input/approval pauses. No Agent Task runs while a workflow waits; the
   // request survives restart; a response is idempotent and a conflicting second

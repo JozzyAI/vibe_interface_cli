@@ -8,9 +8,9 @@
  */
 import {
   KNOWN_SPEC_FIELDS, LIMIT_MAXIMA, SAFE_ID_RE, NODE_ID_RE, TERMINAL_TARGETS,
-  MAX_ENUM_VALUES, MAX_ENUM_VALUE_LENGTH, CONTEXT_FIELDS, CONTEXT_GROUPS, EVIDENCE_TYPES,
+  MAX_ENUM_VALUES, MAX_ENUM_VALUE_LENGTH, CONTEXT_FIELDS, CONTEXT_GROUPS, EVIDENCE_TYPES, STALL_SIGNALS,
   isTerminalTarget,
-  type ContextGroup, type WorkflowInputType, type SchemaFieldType, type EvidenceType,
+  type ContextGroup, type WorkflowInputType, type SchemaFieldType, type EvidenceType, type StallSignal,
 } from './contract.js'
 import { checkConditionShape, parseConditionPath } from './conditions.js'
 
@@ -135,6 +135,7 @@ export function validateWorkflowSpec(input: unknown): ValidationResult {
   const hasLoopEdge = Array.isArray(spec.edges) && spec.edges.some((e) => isObj(e) && e.kind === 'loop')
   validateLimits(spec.limits, hasLoopEdge, err)
   if (spec.completion_policy !== undefined) validateCompletionPolicy(spec.completion_policy, err)
+  if (spec.stall_policy !== undefined) validateStallPolicy(spec.stall_policy, hasLoopEdge, err)
 
   const graph = validateEdges(spec, stepIds, stepOutputSchema, schemaFields, err)
   const entry = isStr(spec.entry_step) && stepIds.has(spec.entry_step) ? spec.entry_step : undefined
@@ -162,6 +163,17 @@ function validateCompletionPolicy(cp: unknown, err: Err): void {
     if (cp[k] !== undefined && typeof cp[k] !== 'boolean') err('bad_completion_flag', `completion_policy.${k} must be a boolean`, `${p}/${k}`)
   }
   for (const k of Object.keys(cp)) if (!['required_evidence', 'require_repository_change', 'require_no_remaining_work', 'require_tests_passed'].includes(k)) err('completion_policy_unknown_field', `unknown completion_policy field: ${k}`, `${p}/${k}`)
+}
+
+const MAX_STALLED_ROUNDS = 100
+function validateStallPolicy(sp: unknown, hasLoopEdge: boolean, err: Err): void {
+  const p = '/stall_policy'
+  if (!isObj(sp)) { err('bad_stall_policy', 'stall_policy must be an object', p); return }
+  if (!hasLoopEdge) err('stall_policy_without_loop', 'stall_policy is only meaningful with a loop edge', p)
+  if (!isPosInt(sp.max_stalled_rounds) || (sp.max_stalled_rounds as number) > MAX_STALLED_ROUNDS) err('bad_max_stalled_rounds', `max_stalled_rounds must be a positive integer ≤ ${MAX_STALLED_ROUNDS}`, `${p}/max_stalled_rounds`)
+  if (!Array.isArray(sp.signals) || sp.signals.length === 0 || sp.signals.length > STALL_SIGNALS.length) err('bad_stall_signals', 'signals must be a non-empty array of stall signals', `${p}/signals`)
+  else for (const s of sp.signals) if (!STALL_SIGNALS.includes(s as StallSignal)) err('bad_stall_signal', `unknown stall signal: ${String(s)} (allowed: ${STALL_SIGNALS.join(', ')})`, `${p}/signals`)
+  for (const k of Object.keys(sp)) if (!['max_stalled_rounds', 'signals'].includes(k)) err('stall_policy_unknown_field', `unknown stall_policy field: ${k}`, `${p}/${k}`)
 }
 
 // ── agents / inputs / schemas ─────────────────────────────────────────────────

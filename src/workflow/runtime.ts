@@ -37,6 +37,7 @@ import { TransientAgentTaskError, type AgentTaskClient, type AgentTaskTerminalRe
 import { resolveWorkspaceTargets, TransientWorkspaceLeaseError, type WorkspaceLeaseClient, type WorkspaceTarget } from './workspace-lease-client.js'
 import { workspaceLeaseId, revisionsMatch, WorkspaceLeaseError, type WorkspaceRevision } from '../lib/workspace-lease.js'
 import { assembleEvidence, evaluateCompletion, isCompletableSpec } from './completion-policy.js'
+import { computeStallFingerprint, isStalled, type StallSignalValues } from './stall-policy.js'
 
 const CV = WORKFLOW_EVENT_CONTRACT_VERSION
 const MAX_CTX_LIST = 50
@@ -412,6 +413,10 @@ export class WorkflowRuntime {
     const target = decision.decision.target
     const loop = decision.decision.edgeKind === 'loop'
     if (loop && !canTakeLoopEdge(step.round, spec.limits.max_rounds ?? 0)) { await this.failLimit(workflowId, 'max_rounds'); return true }
+    // No-progress detection: evaluated ONLY on a loop edge. If the configured signals
+    // stay unchanged for max_stalled_rounds consecutive rounds, block instead of
+    // looping (no next task starts; leases retained). Durable + restart-idempotent.
+    if (loop && spec.stall_policy && await this.checkStall(workflowId, spec, step)) return true
     const nextRound = loop ? step.round + 1 : step.round
     const nextSecId = stepExecutionId(workflowId, target, nextRound, 1)
     await this.store.advanceWorkflow(
@@ -460,6 +465,50 @@ export class WorkflowRuntime {
     const revisionBefore = (step.revision_before ?? null) as WorkspaceRevision | null
     const revisionAfter = (step.revision_after ?? null) as WorkspaceRevision | null
     return assembleEvidence({ taskStatus, result, revisionBefore, revisionAfter })
+  }
+
+  // ── no-progress (stall) detection on loop edges ──────────────────────────────────
+
+  /** On a loop edge: derive the configured stall signals for THIS round, persist the
+   *  fingerprint (first-write-wins, so a restart never double-counts), and block with
+   *  `no_progress` if the signals have stayed unchanged for max_stalled_rounds
+   *  consecutive rounds. Returns true iff the workflow was blocked. */
+  private async checkStall(workflowId: string, spec: WorkflowSpec, step: StepExecutionRecord): Promise<boolean> {
+    const sp = spec.stall_policy!
+    const snap = await this.store.getWorkflowSnapshot(workflowId)
+    const ctx = (snap?.context ?? {}) as WorkflowContextBundle
+    const out = (step.output && typeof step.output === 'object' && !Array.isArray(step.output)) ? step.output as Record<string, unknown> : {}
+    // Workspace revision: the lease projection's current revision (system-observed), else 'none'.
+    let wsRev = 'none'
+    try { const leases = await this.store.listWorkspaceLeaseProjections(workflowId); const cur = leases.find((l) => l.status === 'active' || l.status === 'release_requested')?.current_revision as { state_hash?: string } | null | undefined; if (cur?.state_hash) wsRev = cur.state_hash } catch { /* */ }
+    // Verified evidence: the system digest (content_hash) of the latest completed
+    // task result — NOT an agent claim. Unchanged digest → no new verified work.
+    const verified = await this.latestResultContentHash(workflowId, step.step_id)
+    const values: StallSignalValues = {
+      planner_next_step: String(out.next_step ?? ''),
+      remaining_work: JSON.stringify((ctx.latest_executor_handoff as { remaining_work?: unknown } | undefined)?.remaining_work ?? null),
+      workspace_revision: wsRev,
+      verified_evidence: verified ?? 'none',
+    }
+    const fp = computeStallFingerprint(sp.signals, values)
+    await this.store.recordStallRound(workflowId, step.round, fp, values) // first-write-wins
+    const history = (await this.store.listStallRounds(workflowId)).map((r) => r.fingerprint)
+    if (isStalled(history, sp.max_stalled_rounds)) {
+      await this.blockWorkflow(workflowId, 'no_progress', { round: step.round, signals: sp.signals, stalled_rounds: sp.max_stalled_rounds })
+      return true
+    }
+    return false
+  }
+
+  /** The system-owned content hash of the most recent COMPLETED step's task result
+   *  (excluding the current looping step), or null. Used as the verified-evidence
+   *  stall signal — never an agent claim. */
+  private async latestResultContentHash(workflowId: string, excludeStepId: string): Promise<string | null> {
+    const steps = await this.store.listStepExecutions(workflowId)
+    const candidates = steps.filter((s) => s.status === 'completed' && s.task_id && s.step_id !== excludeStepId)
+    const latest = candidates[candidates.length - 1]
+    if (!latest?.task_id) return null
+    try { return (await this.store.getTaskResult(latest.task_id))?.result?.content_hash ?? null } catch { return null }
   }
 
   /** The completing step's AGENT-DECLARED remaining work (a claim, used only for
