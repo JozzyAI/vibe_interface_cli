@@ -213,9 +213,18 @@ export async function execAgent(record: RunRecord, ctx: AgentAdapterContext, opt
         return resolve(diagnosticError(`run timed out after ${timeoutMs}ms`))
       }
       if (code === 0) {
-        return resolve({ result: 'completed', tailOutput: tail, finalOutput: selectFinal() })
+        // Authoritative clean exit — record the real 0 so downstream evidence
+        // (AgentTaskResult.process_exit_code → completion policy) sees it. Never
+        // synthesized from a parsed provider status; this is the child's own code.
+        return resolve({ result: 'completed', tailOutput: tail, finalOutput: selectFinal(), exitCode: 0 })
       }
-      return resolve(diagnosticError(signal ? `${label} exited with signal ${signal}` : `${label} exited with code ${code}`))
+      if (signal !== null) {
+        // Killed by a signal (code === null): preserve signal/error semantics and do
+        // NOT report a numeric exit code (never a false 0).
+        return resolve(diagnosticError(`${label} exited with signal ${signal}`))
+      }
+      // Real non-zero exit — preserve the actual code on the failed outcome.
+      return resolve({ ...diagnosticError(`${label} exited with code ${code}`), ...(code !== null ? { exitCode: code } : {}) })
     })
   })
 }
