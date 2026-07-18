@@ -46,6 +46,7 @@ import { ControlStoreError, type CreateTaskInput, type TaskEventInput, type Task
 import { validateTaskResult, type AgentTaskResultV1, type TaskResultStatus } from './agent-task-result.js'
 import { listWorkflowsController, createWorkflowController, startWorkflowController, getWorkflowController, cancelWorkflowController, getPendingRequestController, answerInputController, decideApprovalController, resumeWorkflowController } from '../workflow/api.js'
 import { compileWorkflowController, getWorkflowDraftController, approveWorkflowDraftController } from '../workflow/compiler/api.js'
+import { createBuilderSessionController, getBuilderSessionController, listBuilderSessionsController, sendBuilderMessageController, archiveBuilderSessionController } from '../workflow/builder/api.js'
 import { streamWorkflowEvents } from '../workflow/event-stream.js'
 import { workflowApiError } from '../workflow/api-contract.js'
 
@@ -171,6 +172,10 @@ export interface AgentGatewayOptions {
   /** Lazy accessor for the WorkflowCompiler (constructed after listen, like the
    *  runtime). Returns undefined until wired (draft routes then answer 503). */
   getWorkflowCompiler?: () => import('../workflow/compiler/compiler.js').WorkflowCompiler | undefined
+  /** Lazy accessor for the Conversational WorkflowBuilderService (constructed after
+   *  listen, over the same compiler + control store). Undefined until wired (builder
+   *  routes then answer 503). */
+  getWorkflowBuilder?: () => import('../workflow/builder/service.js').WorkflowBuilderService | undefined
 }
 
 // ── auth ─────────────────────────────────────────────────────────────────────
@@ -1144,6 +1149,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   const controlStore: ControlStore | undefined = opts.controlStore
   const getWorkflowRuntime = opts.getWorkflowRuntime
   const getWorkflowCompiler = opts.getWorkflowCompiler
+  const getWorkflowBuilder = opts.getWorkflowBuilder
   const workflowStreams = new Set<http.ServerResponse>() // open workflow SSE responses (ended on shutdown)
   function wfUnavailable(res: http.ServerResponse): void { sendJson(res, 503, workflowApiError('workflow_runtime_unavailable', 'the workflow runtime is not available yet')) }
 
@@ -1248,6 +1254,45 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     return sendError(res, apiError('task_not_found', 'not found'), 404)
   }
 
+  // ── conversational workflow-builder routes (/v1/workflow-builder/sessions*) ──
+  async function handleWorkflowBuilder(req: http.IncomingMessage, res: http.ServerResponse, parts: string[], method: string, url: URL): Promise<void> {
+    if (!controlStore) return sendError(res, apiError('task_not_found', 'the workflow builder is not enabled on this gateway'), 404)
+    const builder = getWorkflowBuilder?.()
+    const unavailable = (): void => sendJson(res, 503, { error: true, code: 'builder_unavailable', message: 'the workflow builder is not available yet' })
+    const readJson = async (): Promise<{ ok: true; value: unknown } | { ok: false }> => {
+      const body = await readBody(req, MAX_BODY_BYTES)
+      if (!body.ok) { sendError(res, apiError('invalid_request', `request body exceeds ${MAX_BODY_BYTES} bytes`), 413); return { ok: false } }
+      try { return { ok: true, value: JSON.parse(body.text) } } catch { sendJson(res, 400, { error: true, code: 'invalid_request', message: 'malformed JSON body' }); return { ok: false } }
+    }
+    // /v1/workflow-builder/sessions
+    if (parts.length === 3 && parts[2] === 'sessions') {
+      if (method === 'GET') { if (!builder) return unavailable(); const r = await listBuilderSessionsController(builder, { limit: numParam(url, 'limit'), offset: numParam(url, 'offset') }); return sendJson(res, r.status, r.body) }
+      if (method === 'POST') { if (!builder) return unavailable(); const p = await readJson(); if (!p.ok) return; const r = await createBuilderSessionController(builder, p.value); return sendJson(res, r.status, r.body, r.headers) }
+      return methodNotAllowed(res, ['GET', 'POST'])
+    }
+    if (parts.length >= 4 && parts[2] === 'sessions') {
+      const sessionId = decodeURIComponent(parts[3])
+      if (!sessionId) return sendError(res, apiError('invalid_request', 'missing builder session id'), 400)
+      if (parts.length === 4) {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+        if (!builder) return unavailable()
+        const r = await getBuilderSessionController(builder, sessionId); return sendJson(res, r.status, r.body)
+      }
+      if (parts.length === 5 && parts[4] === 'messages') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+        if (!builder) return unavailable()
+        const p = await readJson(); if (!p.ok) return
+        const r = await sendBuilderMessageController(builder, sessionId, p.value); return sendJson(res, r.status, r.body, r.headers)
+      }
+      if (parts.length === 5 && parts[4] === 'archive') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST'])
+        if (!builder) return unavailable()
+        const r = await archiveBuilderSessionController(builder, sessionId); return sendJson(res, r.status, r.body)
+      }
+    }
+    return sendError(res, apiError('task_not_found', 'not found'), 404)
+  }
+
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
@@ -1295,6 +1340,9 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         if (parts.length >= 2 && parts[0] === 'v1' && parts[1] === 'workflow-drafts') {
           return await handleWorkflowDrafts(req, res, parts, method)
         }
+        if (parts.length >= 2 && parts[0] === 'v1' && parts[1] === 'workflow-builder') {
+          return await handleWorkflowBuilder(req, res, parts, method, url)
+        }
         // /v1/tasks/:id  and sub-resources
         if (parts.length >= 3 && parts[0] === 'v1' && parts[1] === 'tasks') {
           const taskId = decodeURIComponent(parts[2])
@@ -1325,6 +1373,10 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   function methodNotAllowed(res: http.ServerResponse, allow: string[]): void {
     res.writeHead(405, { 'content-type': 'application/json; charset=utf-8', allow: allow.join(', ') })
     res.end(JSON.stringify(apiError('invalid_request', 'method not allowed')))
+  }
+  function numParam(url: URL, name: string): number | undefined {
+    const v = url.searchParams.get(name); if (v === null) return undefined
+    const n = Number(v); return Number.isFinite(n) ? n : undefined
   }
 
   // Server-level SSE heartbeat keeps connections alive and surfaces dead sockets.

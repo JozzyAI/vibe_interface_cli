@@ -151,9 +151,10 @@ export function registerApiCommand(program: Command): void {
       // is built AFTER listen and injected via a lazy accessor (undefined until then).
       let workflowRuntime: import('../workflow/runtime.js').WorkflowRuntime | undefined
       let workflowCompiler: import('../workflow/compiler/compiler.js').WorkflowCompiler | undefined
+      let workflowBuilder: import('../workflow/builder/service.js').WorkflowBuilderService | undefined
       let server
       try {
-        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store, controlStore: store, getWorkflowRuntime: () => workflowRuntime, getWorkflowCompiler: () => workflowCompiler })
+        server = await startAgentGateway({ host, port, apiToken: tf.token, relay: relayUrl, relayToken, taskStore: store, controlStore: store, getWorkflowRuntime: () => workflowRuntime, getWorkflowCompiler: () => workflowCompiler, getWorkflowBuilder: () => workflowBuilder })
       } catch (err) {
         try { store.closeSync() } catch { /* ignore */ }
         fail('serve_failed', `could not start the gateway: ${(err as Error).message}`)
@@ -194,6 +195,10 @@ export function registerApiCommand(program: Command): void {
           ...(relayUrl && relayToken ? { fetchNodes: async () => { const { fetchRemoteNodes } = await import('../relay/client.js'); return (await fetchRemoteNodes(relayUrl!, relayToken!)).map((n) => ({ node_id: n.node_id, status: n.status, agents: n.agents, capabilities: n.capabilities })) } } : {}),
         })
         workflowCompiler = new WorkflowCompiler({ store, model: new AgentTaskCompilerModelClient(taskClient), inventory })
+        // The Conversational Workflow Builder persists sessions/messages and drives the
+        // SAME compiler over the SAME control store (no second spec format, no bypass).
+        const { WorkflowBuilderService } = await import('../workflow/builder/service.js')
+        workflowBuilder = new WorkflowBuilderService(store, workflowCompiler)
       } catch (err) {
         if (!opts.quiet) process.stderr.write(`warning: workflow runtime/compiler init hit an error (workflow routes remain available): ${(err as Error).message}\n`)
       }

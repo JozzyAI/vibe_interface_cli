@@ -11,6 +11,7 @@ import fs from 'fs'
 import path from 'path'
 import Database from 'better-sqlite3'
 import type BetterSqlite3 from 'better-sqlite3'
+import crypto from 'crypto'
 import { vibeDir } from '../config.js'
 import { runMigrations, LATEST_SCHEMA_VERSION } from './migrations.js'
 import {
@@ -22,6 +23,8 @@ import {
   type CreateStepExecutionInput, type StepExecutionPatch, type WorkflowEventInput, type WorkflowEventRecord,
   type WorkflowSnapshot, type TaskResultRecord, type WorkflowWorkspaceLeaseRecord,
   type WorkflowHumanRequestRecord, type CreateHumanRequestInput, type WorkflowDraftRecord,
+  type WorkflowBuilderSessionRecord, type WorkflowBuilderMessageRecord, type WorkflowBuilderSessionSummary,
+  BUILDER_MESSAGE_ROLES,
 } from './records.js'
 import { isValidRevision } from '../lib/workspace-lease.js'
 import {
@@ -842,6 +845,98 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     })()
   }
 
+  // ── Conversational Workflow Builder ──────────────────────────────────────────
+  private builderSessionRow(id: string): BuilderSessionRow | undefined { return this.db.prepare('SELECT * FROM workflow_builder_sessions WHERE builder_session_id = ?').get(id) as BuilderSessionRow | undefined }
+  private toBuilderSession(r: BuilderSessionRow): WorkflowBuilderSessionRecord {
+    return { builder_session_id: r.builder_session_id, title: r.title, status: r.status as WorkflowBuilderSessionRecord['status'], created_at: r.created_at, updated_at: r.updated_at, current_draft_id: r.current_draft_id, current_spec_hash: r.current_spec_hash, revision: r.revision, source_workflow_id: r.source_workflow_id, compiler_agent: r.compiler_agent, compiler_node_id: r.compiler_node_id, pending_turn_key: r.pending_turn_key, pending_turn_started_at: r.pending_turn_started_at }
+  }
+  private toBuilderMessage(r: BuilderMessageRow): WorkflowBuilderMessageRecord {
+    return { message_id: r.message_id, builder_session_id: r.builder_session_id, role: r.role as WorkflowBuilderMessageRecord['role'], content: r.content, created_at: r.created_at, sequence: r.sequence, draft_id: r.draft_id, spec_hash: r.spec_hash, metadata: decodeJson(r.metadata_json, SIZE_LIMITS.metadata_json, 'builder.message.metadata', true) as Record<string, unknown> | null, turn_key: r.turn_key }
+  }
+  private nextBuilderSeq(sessionId: string): number { const r = this.db.prepare('SELECT MAX(sequence) AS m FROM workflow_builder_messages WHERE builder_session_id = ?').get(sessionId) as { m: number | null }; return (r.m ?? -1) + 1 }
+  private builderTurnRow(sessionId: string, turnKey: string, role: string): BuilderMessageRow | undefined { return this.db.prepare('SELECT * FROM workflow_builder_messages WHERE builder_session_id = ? AND turn_key = ? AND role = ? ORDER BY sequence ASC LIMIT 1').get(sessionId, turnKey, role) as BuilderMessageRow | undefined }
+
+  async createBuilderSession(input: { builder_session_id: string; title: string; source_workflow_id?: string | null; compiler_agent?: string | null; compiler_node_id?: string | null }): Promise<WorkflowBuilderSessionRecord> {
+    this.open()
+    if (!isSafeId(input.builder_session_id)) throw new ControlStoreError('invalid_record', 'builder_session_id is not a safe identifier')
+    return this.db.transaction(() => {
+      const existing = this.builderSessionRow(input.builder_session_id)
+      if (existing) return this.toBuilderSession(existing) // create-or-return by stable id (idempotent)
+      const now = nowIso()
+      this.db.prepare(`INSERT INTO workflow_builder_sessions (builder_session_id,title,status,current_draft_id,current_spec_hash,revision,source_workflow_id,compiler_agent,compiler_node_id,created_at,updated_at)
+        VALUES (@id,@title,'active',NULL,NULL,1,@swf,@ca,@cn,@now,@now)`)
+        .run({ id: input.builder_session_id, title: boundString(input.title, 512, 'builder.title'), swf: input.source_workflow_id ?? null, ca: input.compiler_agent ?? null, cn: input.compiler_node_id ?? null, now })
+      return this.toBuilderSession(this.builderSessionRow(input.builder_session_id)!)
+    })()
+  }
+  async getBuilderSession(id: string): Promise<WorkflowBuilderSessionRecord | null> { this.open(); const r = this.builderSessionRow(id); return r ? this.toBuilderSession(r) : null }
+  async listBuilderMessages(id: string): Promise<WorkflowBuilderMessageRecord[]> { this.open(); return (this.db.prepare('SELECT * FROM workflow_builder_messages WHERE builder_session_id = ? ORDER BY sequence ASC').all(id) as BuilderMessageRow[]).map((r) => this.toBuilderMessage(r)) }
+  async listBuilderSessions(page?: { limit?: number; offset?: number }): Promise<WorkflowBuilderSessionSummary[]> {
+    this.open()
+    const limit = Math.max(1, Math.min(page?.limit ?? 50, 200)); const offset = Math.max(0, page?.offset ?? 0)
+    const rows = this.db.prepare('SELECT * FROM workflow_builder_sessions ORDER BY updated_at DESC, builder_session_id DESC LIMIT ? OFFSET ?').all(limit, offset) as BuilderSessionRow[]
+    return rows.map((r) => {
+      const last = this.db.prepare('SELECT content FROM workflow_builder_messages WHERE builder_session_id = ? ORDER BY sequence DESC LIMIT 1').get(r.builder_session_id) as { content: string } | undefined
+      return { builder_session_id: r.builder_session_id, title: r.title, status: r.status as WorkflowBuilderSessionSummary['status'], updated_at: r.updated_at, revision: r.revision, draft_ready: r.current_spec_hash !== null, processing: r.pending_turn_key !== null, last_message_preview: last ? last.content.slice(0, 140) : null }
+    })
+  }
+  async findBuilderTurn(id: string, turnKey: string): Promise<{ user: WorkflowBuilderMessageRecord | null; assistant: WorkflowBuilderMessageRecord | null }> {
+    this.open()
+    const u = this.builderTurnRow(id, turnKey, 'user'); const a = this.builderTurnRow(id, turnKey, 'assistant')
+    return { user: u ? this.toBuilderMessage(u) : null, assistant: a ? this.toBuilderMessage(a) : null }
+  }
+  async appendBuilderUserMessage(id: string, input: { content: string; turn_key?: string | null }): Promise<{ message: WorkflowBuilderMessageRecord; replay: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const s = this.builderSessionRow(id); if (!s) throw new ControlStoreError('not_found', `builder session not found: ${id}`)
+      if (s.status !== 'active') throw new ControlStoreError('invalid_transition', `builder session is ${s.status}; it cannot accept new messages`)
+      // Idempotent resume: the same turn_key's user message already exists → reuse it.
+      if (input.turn_key != null) { const ex = this.builderTurnRow(id, input.turn_key, 'user'); if (ex) return { message: this.toBuilderMessage(ex), replay: true } }
+      // In-flight guard (RACE-SAFE, atomic): while ANOTHER turn is pending, no new turn
+      // may start — it would overtake the incomplete earlier turn.
+      if (s.pending_turn_key != null && s.pending_turn_key !== input.turn_key) throw new ControlStoreError('builder_turn_in_progress', `a turn is already in progress on this session`)
+      const message = this.insertBuilderMessageSync(id, 'user', input.content, { turn_key: input.turn_key ?? null })
+      // Mark a KEYED turn as pending (recoverable), atomically WITH the user message.
+      if (input.turn_key != null) this.db.prepare('UPDATE workflow_builder_sessions SET pending_turn_key=@tk, pending_turn_started_at=@now, updated_at=@now WHERE builder_session_id=@id').run({ id, tk: input.turn_key, now: nowIso() })
+      return { message, replay: false }
+    })()
+  }
+  async completeBuilderTurn(id: string, expectedRevision: number, input: { assistant: { content: string; draft_id?: string | null; spec_hash?: string | null; metadata?: Record<string, unknown> | null; turn_key?: string | null }; current_draft_id: string | null; current_spec_hash: string | null }): Promise<{ session: WorkflowBuilderSessionRecord; message: WorkflowBuilderMessageRecord; replay: boolean }> {
+    this.open()
+    return this.db.transaction(() => {
+      const s = this.builderSessionRow(id); if (!s) throw new ControlStoreError('not_found', `builder session not found: ${id}`)
+      const tk = input.assistant.turn_key ?? null
+      if (tk != null) { const ex = this.builderTurnRow(id, tk, 'assistant'); if (ex) return { session: this.toBuilderSession(s), message: this.toBuilderMessage(ex), replay: true } } // idempotent turn replay (no writes, no revision bump)
+      if (s.status !== 'active') throw new ControlStoreError('invalid_transition', `builder session is ${s.status}; it cannot accept new messages`)
+      if (s.revision !== expectedRevision) throw new ControlStoreError('builder_revision_conflict', `session revision is ${s.revision}, not the expected ${expectedRevision}`)
+      // ONE atomic completion: assistant message + current-draft pointer + revision +
+      // updated_at + CLEAR the pending-turn marker. The referenced draft was finalized
+      // (immutably) by the compiler beforehand; the FK guarantees this pointer can never
+      // reference a missing/partial draft, and it is only ever set inside this boundary.
+      const message = this.insertBuilderMessageSync(id, 'assistant', input.assistant.content, { draft_id: input.assistant.draft_id ?? null, spec_hash: input.assistant.spec_hash ?? null, metadata: input.assistant.metadata ?? null, turn_key: tk })
+      this.db.prepare('UPDATE workflow_builder_sessions SET current_draft_id=@cd, current_spec_hash=@cs, revision=revision+1, pending_turn_key=NULL, pending_turn_started_at=NULL, updated_at=@now WHERE builder_session_id=@id')
+        .run({ id, cd: input.current_draft_id, cs: input.current_spec_hash, now: nowIso() })
+      return { session: this.toBuilderSession(this.builderSessionRow(id)!), message, replay: false }
+    })()
+  }
+  private insertBuilderMessageSync(sessionId: string, role: string, content: string, extra: { draft_id?: string | null; spec_hash?: string | null; metadata?: Record<string, unknown> | null; turn_key?: string | null }): WorkflowBuilderMessageRecord {
+    if (!BUILDER_MESSAGE_ROLES.includes(role as never)) throw new ControlStoreError('invalid_record', `invalid builder message role: ${role}`)
+    const seq = this.nextBuilderSeq(sessionId); const now = nowIso(); const messageId = 'bm_' + crypto.randomBytes(12).toString('hex')
+    this.db.prepare(`INSERT INTO workflow_builder_messages (message_id,builder_session_id,role,content,sequence,draft_id,spec_hash,metadata_json,turn_key,created_at)
+      VALUES (@mid,@sid,@role,@content,@seq,@did,@sh,@meta,@tk,@now)`)
+      .run({ mid: messageId, sid: sessionId, role, content: boundString(content, SIZE_LIMITS.input_text, 'builder.message.content'), seq, did: extra.draft_id ?? null, sh: extra.spec_hash ?? null, meta: extra.metadata != null ? encodeJson(extra.metadata, SIZE_LIMITS.metadata_json, 'builder.message.metadata') : null, tk: extra.turn_key ?? null, now })
+    return this.toBuilderMessage(this.db.prepare('SELECT * FROM workflow_builder_messages WHERE message_id = ?').get(messageId) as BuilderMessageRow)
+  }
+  async archiveBuilderSession(id: string): Promise<WorkflowBuilderSessionRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const s = this.builderSessionRow(id); if (!s) throw new ControlStoreError('not_found', `builder session not found: ${id}`)
+      if (s.status === 'archived') return this.toBuilderSession(s) // idempotent
+      this.db.prepare("UPDATE workflow_builder_sessions SET status='archived', updated_at=@now WHERE builder_session_id=@id").run({ id, now: nowIso() })
+      return this.toBuilderSession(this.builderSessionRow(id)!)
+    })()
+  }
+
   // ── retention (bounded; never touches active records; no scheduler) ──────────
   async pruneTerminalTasks(olderThanIso: string): Promise<CleanupResult> {
     this.open()
@@ -1070,6 +1165,8 @@ interface StepRow { step_execution_id: string; workflow_id: string; step_id: str
 interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; acquire_reason: string | null; created_at: string; updated_at: string }
 interface HumanRequestRow { request_id: string; workflow_id: string; step_execution_id: string; kind: string; prompt: string; choices_json: string | null; status: string; response_value: string | null; created_at: string; responded_at: string | null; updated_at: string; revision: number }
 interface DraftRow { draft_id: string; idempotency_key: string | null; request_fingerprint: string | null; compiler_task_id: string | null; compiler_capability_json: string | null; constraints_json: string | null; inventory_snapshot_json: string | null; inventory_hash: string | null; spec_json: string | null; input_values_json: string | null; spec_hash: string | null; policy_summary_json: string | null; policy_summary_hash: string | null; preview_json: string | null; rationale_json: string | null; warnings_json: string | null; questions_json: string | null; compiler_status: string; validation_status: string; approval_status: string; materialized_workflow_id: string | null; created_at: string; updated_at: string }
+interface BuilderSessionRow { builder_session_id: string; title: string; status: string; current_draft_id: string | null; current_spec_hash: string | null; revision: number; source_workflow_id: string | null; compiler_agent: string | null; compiler_node_id: string | null; pending_turn_key: string | null; pending_turn_started_at: string | null; created_at: string; updated_at: string }
+interface BuilderMessageRow { message_id: string; builder_session_id: string; role: string; content: string; sequence: number; draft_id: string | null; spec_hash: string | null; metadata_json: string | null; turn_key: string | null; created_at: string }
 interface WorkflowEventRow { workflow_id: string; sequence: number; event_type: string; ts: string; step_execution_id: string | null; payload_json: string; created_at: string }
 
 /** A better-sqlite3 UNIQUE/PRIMARYKEY constraint violation (the idempotency-key
