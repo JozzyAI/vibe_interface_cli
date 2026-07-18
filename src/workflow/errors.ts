@@ -30,7 +30,8 @@ export type WorkflowErrorCode =
 
 /** Stable reasons for a non-terminal `blocked` workflow. */
 export type WorkflowBlockReason =
-  | 'task_result_missing'      // task terminal but no authoritative AgentTaskResult was available
+  | 'task_result_missing'      // task terminal and its result is DEFINITIVELY absent (never produced)
+  | 'task_result_timeout'      // task terminal but its durable result stayed un-ingested past the bounded deadline
   | 'task_history_incomplete'  // (legacy diagnostic) canonical history not complete
   | 'agent_blocked'            // an agent output declared status blocked
   | 'routed_blocked'           // routing selected the reserved $blocked target

@@ -59,6 +59,9 @@ export interface WorkflowRuntimeOptions {
   backoffMaxMs?: number
   /** Max release attempts per lease before deferring to a later recovery. Default 8. */
   maxReleaseAttempts?: number
+  /** Bounded, durable deadline (ms) to reconcile a terminal task's not-yet-ingested
+   *  AgentTaskResult before blocking `task_result_timeout`. Default 30000. */
+  resultIngestionDeadlineMs?: number
   /** Injectable clock (for runtime-deadline tests). Default Date.now. */
   now?: () => number
 }
@@ -73,6 +76,7 @@ export class WorkflowRuntime {
   private readonly backoffBaseMs: number
   private readonly backoffMaxMs: number
   private readonly maxReleaseAttempts: number
+  private readonly resultIngestionDeadlineMs: number
   private readonly now: () => number
   private stopped = false
   private readonly pumps = new Map<string, Promise<void>>()
@@ -92,6 +96,7 @@ export class WorkflowRuntime {
     this.backoffBaseMs = opts.backoffBaseMs ?? 500
     this.backoffMaxMs = opts.backoffMaxMs ?? 5000
     this.maxReleaseAttempts = opts.maxReleaseAttempts ?? 8
+    this.resultIngestionDeadlineMs = opts.resultIngestionDeadlineMs ?? 30_000
     this.now = opts.now ?? Date.now
   }
 
@@ -271,7 +276,7 @@ export class WorkflowRuntime {
       if (outcome === 'shutdown') return
       if (outcome === 'deadline') { await this.failLimit(workflowId, 'max_runtime_seconds'); return }
       if (outcome === 'cancel') { await this.performCancellation(workflowId); return }
-      if (await this.handleTaskTerminal(workflowId, spec, step, outcome)) return
+      if (await this.handleTaskTerminal(workflowId, spec, step, outcome, ac.signal)) return
     }
   }
 
@@ -369,7 +374,7 @@ export class WorkflowRuntime {
     return 'shutdown'
   }
 
-  private async handleTaskTerminal(workflowId: string, spec: WorkflowSpec, step: StepExecutionRecord, read: AgentTaskTerminalRead): Promise<boolean> {
+  private async handleTaskTerminal(workflowId: string, spec: WorkflowSpec, step: StepExecutionRecord, read: AgentTaskTerminalRead, signal: AbortSignal): Promise<boolean> {
     const wf = (await this.store.getWorkflow(workflowId))!
     // After EVERY terminal task on a lease-managed step: observe revision_after,
     // persist it, and advance the lease's expected current revision — BEFORE we parse
@@ -384,15 +389,13 @@ export class WorkflowRuntime {
       await this.failStep(workflowId, step, { reason: 'task_cancelled_external', task_id: read.task_id }); return true
     }
     // completed — route on the FIRST-CLASS AgentTaskResult, never on event history.
-    //   available → parse final_output into the step schema and route
-    //   missing   → block (task_result_missing); never guess from events
-    //   invalid   → fail (task_result_invalid); the result envelope was corrupt
-    const rs = read.result_status
-    if (rs === 'invalid') { await this.failStep(workflowId, step, { reason: 'task_result_invalid', task_id: read.task_id }); return true }
-    if (rs !== 'available' || read.result_text === undefined) {
-      await this.blockWorkflow(workflowId, 'task_result_missing', { task_id: read.task_id, step_id: step.step_id, round: step.round }); return true
-    }
-    const parsed = this.parseResultOutput(read.result_text, spec, step)
+    // Resolve the result, RECONCILING a not-yet-ingested (pending) result over a
+    // bounded, durable window — a terminal task can beat its own durable result by a
+    // moment (esp. remote). Never blocks solely on that propagation race.
+    const resolved = await this.resolveTerminalResult(workflowId, step, read, signal)
+    if (resolved.kind !== 'available') return true // failed / blocked / stopped — already handled
+    read = resolved.read
+    const parsed = this.parseResultOutput(read.result_text!, spec, step)
     if (!parsed.ok) { await this.failStep(workflowId, step, { reason: 'invalid_output', code: parsed.code, ...(parsed.field ? { field: parsed.field } : {}) }); return true }
 
     // Persist the validated output + update the bound context slot atomically.
@@ -400,6 +403,46 @@ export class WorkflowRuntime {
     const { context, revision } = await this.buildUpdatedContext(workflowId, specStep.context_binding, parsed.value, read.task_id, read.history_complete)
     await this.store.completeStepAndCheckpoint(step.step_execution_id, parsed.value, workflowId, revision, context, { event_type: 'step.completed', ts: new Date().toISOString(), step_execution_id: step.step_execution_id, payload: { step_id: step.step_id, round: step.round }, contract_version: CV } as WorkflowEventDraft)
     return false // loop re-reads and routes from the now-completed step
+  }
+
+  /**
+   * Resolve a terminal task's authoritative AgentTaskResult, RECONCILING a not-yet-
+   * ingested (pending) result over a bounded, durable window instead of failing on the
+   * race. Definitive outcomes still terminate immediately: `invalid` → fail
+   * (task_result_invalid); `missing` (result truly absent) → block task_result_missing.
+   * A result that never ingests past `resultIngestionDeadlineMs` → block
+   * task_result_timeout. Returns the available read to route, else a handled terminal.
+   *
+   * Coalesced by the single per-workflow pump; the durable `result_awaited_since` marker
+   * makes the deadline survive a Gateway restart (recovery re-enters here and continues).
+   * Re-reading + completing the step are idempotent, so duplicate terminal/result
+   * deliveries never duplicate routing, tasks, or events.
+   */
+  private async resolveTerminalResult(workflowId: string, step: StepExecutionRecord, read: AgentTaskTerminalRead, signal: AbortSignal): Promise<{ kind: 'available'; read: AgentTaskTerminalRead } | { kind: 'handled' }> {
+    let cur = read
+    let cursor = read.next_event_id
+    let attempt = 0
+    while (true) {
+      const rs = cur.result_status
+      if (rs === 'available' && cur.result_text !== undefined) return { kind: 'available', read: cur } // ready to route
+      if (rs === 'invalid') { await this.failStep(workflowId, step, { reason: 'task_result_invalid', task_id: cur.task_id }); return { kind: 'handled' } }
+      if (rs === 'missing') { await this.blockWorkflow(workflowId, 'task_result_missing', { task_id: cur.task_id, step_id: step.step_id, round: step.round }); return { kind: 'handled' } } // DEFINITIVE absence — preserved
+      // rs is 'pending' / undefined (or 'available' without text): the durable result is
+      // not yet ingested — a propagation race, esp. remote. Wait bounded + durable; never
+      // block solely on this.
+      if (this.stopped || signal.aborted) return { kind: 'handled' } // stop; the pump resumes reconciliation on restart
+      const proj = await this.store.getStepExecution(step.step_execution_id)
+      let since = proj?.result_awaited_since ?? null
+      if (!since) since = (await this.store.markStepAwaitingResult(step.step_execution_id, new Date().toISOString())).result_awaited_since
+      if (this.now() - new Date(since!).getTime() > this.resultIngestionDeadlineMs) {
+        await this.blockWorkflow(workflowId, 'task_result_timeout', { task_id: cur.task_id, step_id: step.step_id, round: step.round }); return { kind: 'handled' }
+      }
+      await this.backoff(attempt++, signal) // bounded backoff between re-reads
+      try {
+        cur = await this.taskClient.waitForTerminal(cur.task_id, { afterId: cursor, budgetMs: this.waitWindowMs, signal })
+        cursor = cur.next_event_id
+      } catch (err) { if (err instanceof TransientAgentTaskError) continue; throw err }
+    }
   }
 
   /** Parse the AgentTaskResult's authoritative final output into the step's output

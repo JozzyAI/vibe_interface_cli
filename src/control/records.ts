@@ -214,6 +214,9 @@ export interface StepExecutionRecord {
    *  created, and AFTER that task terminalized (a bounded WorkspaceRevision, or null). */
   revision_before: unknown
   revision_after: unknown
+  /** ISO ts the runtime began awaiting this step's (terminal) task's durable result
+   *  ingestion; NULL unless in that reconciliation window. Bounds a durable timeout. */
+  result_awaited_since: string | null
 }
 
 export interface CreateStepExecutionInput {

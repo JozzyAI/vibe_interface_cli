@@ -156,6 +156,9 @@ export interface ControlStore extends WorkflowDraftStore {
   listWorkflows(filters?: WorkflowFilters, page?: Pagination): Promise<WorkflowRecord[]>
   createStepExecution(input: CreateStepExecutionInput): Promise<StepExecutionRecord>
   getStepExecution(stepExecutionId: string): Promise<StepExecutionRecord | null>
+  /** Record (idempotently, once) when the runtime began awaiting a terminal step task's
+   *  durable result ingestion — a restart-safe deadline for `task_result_timeout`. */
+  markStepAwaitingResult(stepExecutionId: string, ts: string): Promise<StepExecutionRecord>
   updateStepExecution(stepExecutionId: string, expectedRevision: number, patch: StepExecutionPatch): Promise<StepExecutionRecord>
   listStepExecutions(workflowId: string): Promise<StepExecutionRecord[]>
   appendWorkflowEvent(workflowId: string, event: WorkflowEventInput): Promise<void>
