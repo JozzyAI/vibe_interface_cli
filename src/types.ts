@@ -41,6 +41,8 @@ export interface RunRecord {
   result_status?: import('./lib/agent-task-result.js').TaskResultStatus // 'available' when task_result is set; 'missing' when the backend produced no authoritative final result
   task_result?: import('./lib/agent-task-result.js').AgentTaskResultV1   // the durable final result envelope (present iff result_status === 'available')
   workspace_lease_id?: string  // workspace_lease_v1: the lease that authorized this run (Node-local; never forwarded to the provider)
+  workspace_key?: string   // the contained workspace key this run resolved to (Node-local; used to match the authorizing lease). Never a path.
+  workspace_write?: boolean // task/workflow policy: may this task MODIFY the workspace? Authorization ALSO requires a valid active lease (Node-enforced); never grants write on its own. Node-local; never forwarded to the provider.
   verify?: import('./lib/task-verification.js').TaskVerifyConfig  // Harness-owned post-task test verifier (argv only; never forwarded to the provider prompt/env)
   event_aes_key?: string   // base64 AES-256 key for run_event decryption (HKDF 'vibe-run-event-v1'); stored locally
   stop_aes_key?: string     // base64 AES-256 key for run_stop encryption (HKDF 'vibe-run-stop-v1'); stored locally

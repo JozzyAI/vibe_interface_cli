@@ -198,6 +198,10 @@ export interface CreateTaskRequest {
   }
   execution?: {
     permission_mode?: PermissionMode
+    /** OPTIONAL. Task/workflow policy: may this task MODIFY the leased workspace?
+     *  Reaches the Node for authorization only (write is STILL gated by a valid
+     *  active lease) and is NEVER forwarded to the provider (prompt/env). */
+    workspace_write?: boolean
   }
   metadata?: Record<string, unknown>
   /** OPTIONAL client-supplied idempotency key. Retrying the SAME creation request
@@ -275,6 +279,9 @@ export function validateCreateTaskRequest(
     if (exec.permission_mode !== undefined && exec.permission_mode !== 'default' && exec.permission_mode !== 'unsafe-skip') {
       return fail('`execution.permission_mode` must be "default" or "unsafe-skip"')
     }
+    if (exec.workspace_write !== undefined && typeof exec.workspace_write !== 'boolean') {
+      return fail('`execution.workspace_write` must be a boolean')
+    }
   }
 
   let workspace: Record<string, unknown> | undefined
@@ -327,7 +334,12 @@ export function validateCreateTaskRequest(
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }
   if (typeof b.node_id === 'string') value.node_id = b.node_id
   if (workspace && typeof workspace.workspace_key === 'string') value.workspace = { workspace_key: workspace.workspace_key }
-  if (exec && exec.permission_mode) value.execution = { permission_mode: exec.permission_mode as PermissionMode }
+  if (exec && (exec.permission_mode || exec.workspace_write !== undefined)) {
+    value.execution = {
+      ...(exec.permission_mode ? { permission_mode: exec.permission_mode as PermissionMode } : {}),
+      ...(exec.workspace_write !== undefined ? { workspace_write: exec.workspace_write as boolean } : {}),
+    }
+  }
   if (isPlainObject(b.metadata)) value.metadata = b.metadata
   if (typeof b.idempotency_key === 'string') value.idempotency_key = b.idempotency_key
   if (typeof b.workspace_lease_id === 'string') value.workspace_lease_id = b.workspace_lease_id

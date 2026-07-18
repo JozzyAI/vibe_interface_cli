@@ -168,6 +168,8 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     ...(stopAesKey && { stop_aes_key: stopAesKey }),        // MVP 4D: stored for handleRunStop
     ...(approvalAesKey && { approval_aes_key: approvalAesKey }), // MVP 4F: stored for handleEncryptedApprovalResponse
     ...(presentedLeaseId && { workspace_lease_id: presentedLeaseId }), // Node-local; never forwarded to the provider
+    workspace_key: workspaceKey, // the contained key; used to match the authorizing lease (Node-local)
+    ...(msg.workspace_write ? { workspace_write: true } : {}), // policy: may modify the workspace (write STILL gated by a valid lease at the supervisor)
     created_at: now,
     updated_at: now,
   }
@@ -257,6 +259,7 @@ async function handleEncryptedRunStart(
     ...(payload.permission_mode && { permission_mode: payload.permission_mode }),
     ...(payload.metadata && { metadata: payload.metadata }),
     ...(payload.workspace_lease_id && { workspace_lease_id: payload.workspace_lease_id }), // from the ENCRYPTED payload (relay never saw it)
+    ...(payload.workspace_write && { workspace_write: true }), // from the ENCRYPTED payload (relay never saw it)
     ...(payload.verify && { verify: payload.verify }), // from the ENCRYPTED payload (relay never saw it)
   }
 
@@ -1076,6 +1079,10 @@ export interface RemoteRunStartOpts {
   /** workspace_lease_v1: authorize the run against the node's active workspace lease.
    *  Carried INSIDE the encrypted payload; never forwarded to the provider/prompt. */
   workspaceLeaseId?: string
+  /** Task/workflow policy: may this task MODIFY the workspace? Carried INSIDE the
+   *  encrypted payload; never forwarded to the provider/prompt. Write is STILL
+   *  gated by a valid active lease at the Node — this flag alone never grants it. */
+  workspaceWrite?: boolean
   /** Harness-owned post-task verifier config (argv only). Carried INSIDE the
    *  encrypted payload; never forwarded to the provider/prompt. */
   verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
@@ -1129,6 +1136,7 @@ export async function remoteRunStart(
           ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
           ...(opts.metadata && { metadata: opts.metadata }),
           ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
+          ...(opts.workspaceWrite && { workspace_write: true }),
           ...(opts.verify && { verify: opts.verify }),
         }
         const enc = encryptPayload(opts.encryptionPublicKey, payload)
@@ -1161,6 +1169,7 @@ export async function remoteRunStart(
           ...(opts.permissionMode && { permission_mode: opts.permissionMode }),
           ...(opts.metadata && { metadata: opts.metadata }),
           ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
+          ...(opts.workspaceWrite && { workspace_write: true }),
           ...(opts.verify && { verify: opts.verify }),
         })
       }

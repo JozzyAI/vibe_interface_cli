@@ -113,6 +113,11 @@ export interface AgentTaskStep {
   permission_mode?: 'default' | 'unsafe-skip'
   /** A safe opaque workspace key, OR a single `{{ inputs.<name> }}` reference. */
   workspace_key_template?: string
+  /** Task/workflow policy: may this step MODIFY its (leased) workspace? Default
+   *  false = read-only. When true, the Node grants Codex `workspace-write` ONLY if
+   *  an active lease authorizes it (write is NEVER inferred from this flag alone).
+   *  Requires a bound workspace (`workspace_key_template`). */
+  workspace_write?: boolean
   /** Optional Harness-owned test verifier: a TRUSTED argv (never shell text) run by
    *  the Node after the Agent exits and before the result is finalized, inside the
    *  leased workspace. Its exit code is the sole source of tests_passed/tests_failed

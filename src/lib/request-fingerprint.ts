@@ -38,6 +38,7 @@ export function computeRequestFingerprint(req: CreateTaskRequest): string {
     input_text: req.input.text,
     workspace_key: req.workspace?.workspace_key ?? null,
     permission_mode: req.execution?.permission_mode ?? null,
+    workspace_write: req.execution?.workspace_write ?? null,
     workspace_lease_id: req.workspace_lease_id ?? null,
     metadata: req.metadata ?? null,
   }
