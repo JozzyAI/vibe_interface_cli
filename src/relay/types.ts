@@ -59,6 +59,7 @@ export interface RunStartPayload {
   repo_url?: string
   branch?: string
   workspace_lease_id?: string // carried INSIDE the encrypted run_start payload (relay never reads it)
+  workspace_write?: boolean   // policy: may modify the workspace (write STILL gated by a valid lease at the Node); carried INSIDE the encrypted payload
   verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
 }
 
@@ -276,6 +277,7 @@ export interface RunStartMsg extends RelayMsgBase {
   permission_mode?: PermissionMode
   metadata?: Record<string, unknown>
   workspace_lease_id?: string // workspace_lease_v1: authorize the run against the Node's active workspace lease (never forwarded to the provider)
+  workspace_write?: boolean   // policy: may modify the workspace (write STILL gated by a valid lease at the Node); never forwarded to the provider
   verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
 }
 

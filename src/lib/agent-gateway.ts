@@ -863,7 +863,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
       let rrec: RunRecord
       try {
-        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id, verify: reqv.verify })
+        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, workspaceWrite: reqv.execution?.workspace_write, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id, verify: reqv.verify })
       } catch (err) {
         release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
         // Start DEFINITELY failed → record the canonical failure terminally, once.

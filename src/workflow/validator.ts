@@ -310,6 +310,11 @@ function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set
     if (step.permission_mode !== undefined && step.permission_mode !== 'default' && step.permission_mode !== 'unsafe-skip') err('bad_permission_mode', 'permission_mode must be "default" or "unsafe-skip"', `${p}/permission_mode`)
     if (!isStr(step.prompt_template)) err('bad_prompt_template', 'prompt_template must be a string', `${p}/prompt_template`)
     if (step.workspace_key_template !== undefined && !isStr(step.workspace_key_template)) err('bad_workspace_key_template', 'workspace_key_template must be a string', `${p}/workspace_key_template`)
+    if (step.workspace_write !== undefined) {
+      if (typeof step.workspace_write !== 'boolean') err('bad_workspace_write', 'workspace_write must be a boolean', `${p}/workspace_write`)
+      // A write grant is scoped to the leased workspace, so a writable step MUST bind one.
+      else if (step.workspace_write === true && step.workspace_key_template === undefined) err('workspace_write_requires_workspace', 'a step with workspace_write must declare workspace_key_template (writes are scoped to the leased workspace)', `${p}/workspace_write`)
+    }
     if (step.verify !== undefined) {
       const v = validateTaskVerifyConfig(step.verify)
       if (!v.ok) err('bad_verify', `verify is invalid: ${v.message}`, `${p}/verify`)
@@ -323,7 +328,7 @@ function validateSteps(steps: unknown, agentRoles: Set<string>, schemaNames: Set
     if (step.label !== undefined && !isStr(step.label)) err('bad_field_type', 'step.label must be a string', `${p}/label`)
     if (step.description !== undefined && !isStr(step.description)) err('bad_field_type', 'step.description must be a string', `${p}/description`)
     if (step.pause_before !== undefined) validatePauseGate(step.pause_before, `${p}/pause_before`, err)
-    for (const k of Object.keys(step)) if (!['id', 'type', 'agent_role', 'prompt_template', 'output_schema', 'permission_mode', 'workspace_key_template', 'context_binding', 'pause_before', 'label', 'description', 'verify'].includes(k)) err('step_unknown_field', `unknown step field: ${k}`, `${p}/${k}`)
+    for (const k of Object.keys(step)) if (!['id', 'type', 'agent_role', 'prompt_template', 'output_schema', 'permission_mode', 'workspace_key_template', 'workspace_write', 'context_binding', 'pause_before', 'label', 'description', 'verify'].includes(k)) err('step_unknown_field', `unknown step field: ${k}`, `${p}/${k}`)
   })
   return { stepIds, stepOutputSchema }
 }

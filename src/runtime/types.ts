@@ -109,6 +109,11 @@ export interface AgentOutcome {
 export interface AgentAdapterContext {
   /** When set, the adapter reads this prompt file instead of record.prompt_file (used to inject handoff). */
   promptOverridePath?: string
+  /** Supervisor-resolved Codex sandbox (from the codex-sandbox gate: permission
+   *  mode + write policy + the Node-validated workspace lease). Consumed ONLY by
+   *  the codex adapter. Absent → read-only (the safe default). `unsafe-skip`
+   *  bypasses this and is handled by the adapter directly. */
+  codexSandbox?: import('./codex-sandbox.js').CodexSandboxMode
 }
 
 export interface AgentAdapter {

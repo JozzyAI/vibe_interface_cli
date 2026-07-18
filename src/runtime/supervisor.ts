@@ -35,6 +35,9 @@ import {
   RepoNotAllowedError,
 } from '../repo-policy.js'
 import type { AgentAdapter, AgentAdapterContext, AgentOutcome, FailureReason } from './types.js'
+import { resolveCodexSandbox, type LeaseDecisionState } from './codex-sandbox.js'
+import { openNodeJournal } from '../node-journal/sqlite-journal.js'
+import type { WorkspaceLeaseV1 } from '../lib/workspace-lease.js'
 import { buildTaskResult, MAX_FINAL_OUTPUT_BYTES, type AgentTaskResultV1, type TaskResultStatus } from '../lib/agent-task-result.js'
 import type { TaskVerificationV1 } from '../lib/task-verification.js'
 import { runVerifier, verifierPreflight } from './verifier.js'
@@ -47,6 +50,32 @@ const ADAPTERS: Record<AgentBackend, AgentAdapter | undefined> = {
   'claude-code': claudeAdapter,
   codex: codexAdapter,
   opencode: undefined,
+}
+
+/** Injectable IO for the supervisor (test seam). The default reads the
+ *  Node-authoritative workspace lease from the local node journal. */
+export interface SupervisorDeps {
+  /** Look up the Node's durable workspace lease by id (null when absent). Only
+   *  consulted for a write-permitted Codex task. */
+  resolveWorkspaceLease?: (leaseId: string) => WorkspaceLeaseV1 | null
+}
+
+/** Default lease resolver — the Node journal is the lease authority. Opened
+ *  lazily and ONLY when a write-permitted Codex task actually needs it, so a
+ *  read-only or non-lease run never touches it. */
+function defaultResolveWorkspaceLease(leaseId: string): WorkspaceLeaseV1 | null {
+  try { return openNodeJournal().getWorkspaceLease(leaseId) } catch { return null }
+}
+
+/** Classify a Codex task's bound lease against the run for the sandbox decision.
+ *  Any divergence (absent binding, no record, not active, wrong node/workspace)
+ *  is a distinct fail-closed state — never a silent read-only downgrade. */
+function deriveLeaseState(record: RunRecord, lease: WorkspaceLeaseV1 | null): LeaseDecisionState {
+  if (!record.workspace_lease_id) return 'none'      // write permitted but no lease bound
+  if (!lease) return 'invalid'                        // presented id resolves to nothing
+  if (lease.status !== 'active') return 'inactive'
+  if (lease.node_id !== record.node_id || lease.workspace_key !== record.workspace_key) return 'mismatch'
+  return 'active_match'
 }
 
 /** Whether to run the github.com auth preflight: only when enabled, the run
@@ -136,7 +165,8 @@ function finalizeResult(outcome: AgentOutcome, verification?: TaskVerificationV1
   return { result_status: 'missing' }
 }
 
-export async function runSupervisor(run_id: string): Promise<void> {
+export async function runSupervisor(run_id: string, deps: SupervisorDeps = {}): Promise<void> {
+  const resolveWorkspaceLease = deps.resolveWorkspaceLease ?? defaultResolveWorkspaceLease
   const initial = readRun(run_id)
   const policy = resolveAgentPolicy(initial)
   const session_id = initial.session_id
@@ -229,6 +259,36 @@ export async function runSupervisor(run_id: string): Promise<void> {
       })
       appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
       return
+    }
+
+    // ── Fail-closed Codex workspace-write gate (BEFORE Codex launches) ─────────
+    // Map this Codex task's permission mode + write policy + the Node-validated
+    // workspace lease to the narrowest sandbox. A write-permitted task with a
+    // missing / inactive / mismatched / invalid lease fails closed here — Codex
+    // never starts. `unsafe-skip` keeps its explicit bypass (handled in the
+    // adapter). Read-only tasks stay read-only. The resolved sandbox is threaded
+    // to the adapter via ctx; the decision is logged as a sanitized diagnostic.
+    if (agent === 'codex' && record.permission_mode !== 'unsafe-skip') {
+      const writeRequested = record.workspace_write === true
+      let lease: LeaseDecisionState = 'none'
+      if (writeRequested) {
+        const rec = record.workspace_lease_id ? resolveWorkspaceLease(record.workspace_lease_id) : null
+        lease = deriveLeaseState(record, rec)
+      }
+      const decision = resolveCodexSandbox({ permissionMode: record.permission_mode, writeRequested, lease, workspacePath: record.workspace_path })
+      const d = decision.diagnostics
+      appendEvent({ type: 'log', run_id, session_id, stream: 'stdout', message: `codex sandbox: ${d.sandbox} (permission=${d.permission_mode}, write_requested=${d.write_requested}, lease=${d.lease_state}, network=${d.network}, approvals=${d.approvals})`, ts: ts() })
+      if (!decision.ok) {
+        appendEvent({ type: 'error', run_id, session_id, message: `codex workspace-write denied: ${decision.code}`, code: decision.code, ts: ts() })
+        updateRun(run_id, {
+          status: 'failed', final_agent: agent, switched, failure_reason: 'permission_denied', recoverable: false,
+          ...(switchReason && { switch_reason: switchReason }), ...(handoffStr && { handoff_path: handoffStr }),
+          child_pid: undefined,
+        })
+        appendEvent({ type: 'status', run_id, session_id, status: 'failed', ts: ts() })
+        return
+      }
+      ctx = { ...ctx, codexSandbox: decision.mode }
     }
 
     // An adapter that throws (rather than returning a failed outcome) must not

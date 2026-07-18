@@ -328,6 +328,9 @@ export class WorkflowRuntime {
       input: { text: rendered.text },
       ...(ws.workspaceKey ? { workspace_key: ws.workspaceKey } : {}),
       ...(specStep.permission_mode ? { permission_mode: specStep.permission_mode } : {}),
+      // Write policy reaches the Node only WITH the authorizing lease; the flag alone
+      // never grants write (the Node still requires an active matching lease).
+      ...(specStep.workspace_write && leaseId ? { workspace_write: true } : {}),
       // Deterministic, bounded observability metadata (same on every idempotent retry).
       metadata: { workflow_id: workflowId, step_execution_id: step.step_execution_id, step_id: step.step_id, round: step.round, attempt: step.attempt },
       idempotency_key: step.step_execution_id,

@@ -17,6 +17,10 @@ export interface AgentTaskCreateRequest {
   input: { text: string }
   workspace_key?: string
   permission_mode?: 'default' | 'unsafe-skip'
+  /** OPTIONAL. Task/workflow policy: may this step MODIFY the leased workspace?
+   *  Forwarded to the Node for authorization (write STILL requires a valid active
+   *  lease); NEVER reaches the provider prompt/env. */
+  workspace_write?: boolean
   metadata?: Record<string, unknown>
   idempotency_key: string
   /** OPTIONAL workspace_lease_v1 authorization id for a lease-managed step. Passed to
@@ -118,7 +122,7 @@ export class GatewayAgentTaskClient implements AgentTaskClient {
         ...(req.node_id ? { node_id: req.node_id } : {}),
         input: req.input,
         ...(req.workspace_key ? { workspace: { workspace_key: req.workspace_key } } : {}),
-        ...(req.permission_mode ? { execution: { permission_mode: req.permission_mode } } : {}),
+        ...((req.permission_mode || req.workspace_write !== undefined) ? { execution: { ...(req.permission_mode ? { permission_mode: req.permission_mode } : {}), ...(req.workspace_write !== undefined ? { workspace_write: req.workspace_write } : {}) } } : {}),
         ...(req.metadata ? { metadata: req.metadata } : {}),
         idempotency_key: req.idempotency_key,
         ...(req.workspace_lease_id ? { workspace_lease_id: req.workspace_lease_id } : {}),
