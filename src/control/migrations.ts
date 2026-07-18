@@ -305,7 +305,14 @@ const V13 = `ALTER TABLE task_results ADD COLUMN verification_json TEXT;`
  *  after Gateway reload and drives background reconciliation. */
 const V14 = `ALTER TABLE workflow_workspace_leases ADD COLUMN acquire_reason TEXT;`
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }, { version: 13, sql: V13 }, { version: 14, sql: V14 }]
+/** Schema v15 — durable marker for the RESULT-INGESTION reconciliation window. When a
+ *  step's Agent Task is terminal but its authoritative AgentTaskResult has not yet been
+ *  ingested (a propagation race, esp. remote), the runtime records when it began waiting
+ *  so a bounded deadline survives a Gateway restart (→ `task_result_timeout`). Additive
+ *  nullable; NULL unless a step is awaiting result ingestion. */
+const V15 = `ALTER TABLE workflow_step_executions ADD COLUMN result_awaited_since TEXT;`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }, { version: 13, sql: V13 }, { version: 14, sql: V14 }, { version: 15, sql: V15 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

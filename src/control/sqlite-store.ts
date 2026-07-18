@@ -313,6 +313,18 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
   }
   async createStepExecution(input: CreateStepExecutionInput): Promise<StepExecutionRecord> { this.open(); return this.createStepSync(input) }
   async getStepExecution(id: string): Promise<StepExecutionRecord | null> { this.open(); const r = this.stepRow(id); return r ? this.toStep(r) : null }
+  /** Record (once) when the runtime began awaiting this step's terminal task's durable
+   *  result. Idempotent via COALESCE — the FIRST timestamp is preserved so the bounded
+   *  deadline survives a Gateway restart. Does not touch status/revision routing. */
+  async markStepAwaitingResult(id: string, ts: string): Promise<StepExecutionRecord> {
+    this.open()
+    return this.db.transaction(() => {
+      const r = this.stepRow(id); if (!r) throw new ControlStoreError('not_found', `step execution not found: ${id}`)
+      this.db.prepare(`UPDATE workflow_step_executions SET result_awaited_since = COALESCE(result_awaited_since, @ts), updated_at=@now WHERE step_execution_id=@id`)
+        .run({ id, ts: isIsoUtc(ts) ? ts : nowIso(), now: nowIso() })
+      return this.toStep(this.stepRow(id)!)
+    })()
+  }
   async updateStepExecution(id: string, expectedRevision: number, patch: StepExecutionPatch): Promise<StepExecutionRecord> { this.open(); return this.updateStepSync(id, expectedRevision, patch) }
   async listStepExecutions(workflowId: string): Promise<StepExecutionRecord[]> {
     this.open()
@@ -1045,7 +1057,7 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     return { workflow_id: r.workflow_id, revision: r.revision, spec_version: r.spec_version, workflow_name: r.workflow_name, spec: decodeJson(r.spec_json, SIZE_LIMITS.spec_json, 'workflow.spec'), status: r.status, current_step_id: r.current_step_id, current_round: r.current_round, total_tasks: r.total_tasks, total_failures: r.total_failures, started_at: r.started_at, created_at: r.created_at, updated_at: r.updated_at, terminal_at: r.terminal_at, last_event_sequence: r.last_event_sequence, context_revision: r.context_revision, earliest_retained_sequence: r.earliest_retained_sequence, input_values: decodeJson(r.input_values_json, SIZE_LIMITS.metadata_json, 'workflow.input_values', true) as Record<string, unknown> | null, cancel_requested: r.cancel_requested === 1 }
   }
   private toStep(r: StepRow): StepExecutionRecord {
-    return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, step_id: r.step_id, round: r.round, attempt: r.attempt, task_id: r.task_id, revision: r.revision, status: r.status, output: decodeJson(r.output_json, SIZE_LIMITS.step_output_json, 'step.output'), error: decodeJson(r.error_json, SIZE_LIMITS.step_error_json, 'step.error'), created_at: r.created_at, started_at: r.started_at, updated_at: r.updated_at, terminal_at: r.terminal_at, revision_before: this.decodeRevision(r.revision_before_json, 'step.revision_before'), revision_after: this.decodeRevision(r.revision_after_json, 'step.revision_after') }
+    return { step_execution_id: r.step_execution_id, workflow_id: r.workflow_id, step_id: r.step_id, round: r.round, attempt: r.attempt, task_id: r.task_id, revision: r.revision, status: r.status, output: decodeJson(r.output_json, SIZE_LIMITS.step_output_json, 'step.output'), error: decodeJson(r.error_json, SIZE_LIMITS.step_error_json, 'step.error'), created_at: r.created_at, started_at: r.started_at, updated_at: r.updated_at, terminal_at: r.terminal_at, revision_before: this.decodeRevision(r.revision_before_json, 'step.revision_before'), revision_after: this.decodeRevision(r.revision_after_json, 'step.revision_after'), result_awaited_since: r.result_awaited_since ?? null }
   }
 }
 
@@ -1054,7 +1066,7 @@ interface TaskRow { task_id: string; revision: number; node_id: string | null; a
 interface TaskResultRow { task_id: string; schema_version: string; result_status: string; final_output_text: string | null; process_exit_code: number | null; finalized_at: string | null; content_hash: string | null; evidence_refs_json: string; artifact_refs_json: string; verification_json: string | null; created_at: string }
 interface TaskEventRow { task_id: string; sequence: number; event_type: string; ts: string; payload_json: string; created_at: string; source_sequence: number | null }
 interface WorkflowRow { workflow_id: string; revision: number; spec_version: string; workflow_name: string; spec_json: string; status: string; current_step_id: string | null; current_round: number; total_tasks: number; total_failures: number; started_at: string | null; created_at: string; updated_at: string; terminal_at: string | null; last_event_sequence: number; context_revision: number; context_json: string | null; earliest_retained_sequence: number; input_values_json: string | null; cancel_requested: number }
-interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null }
+interface StepRow { step_execution_id: string; workflow_id: string; step_id: string; round: number; attempt: number; task_id: string | null; revision: number; status: string; output_json: string | null; error_json: string | null; created_at: string; started_at: string | null; updated_at: string; terminal_at: string | null; revision_before_json: string | null; revision_after_json: string | null; result_awaited_since: string | null }
 interface WorkspaceLeaseRow { workspace_lease_id: string; workflow_id: string; node_id: string; workspace_key: string; mode: string; status: string; revision: number; base_revision_json: string | null; current_revision_json: string | null; acquired_at: string | null; release_requested_at: string | null; released_at: string | null; acquire_reason: string | null; created_at: string; updated_at: string }
 interface HumanRequestRow { request_id: string; workflow_id: string; step_execution_id: string; kind: string; prompt: string; choices_json: string | null; status: string; response_value: string | null; created_at: string; responded_at: string | null; updated_at: string; revision: number }
 interface DraftRow { draft_id: string; idempotency_key: string | null; request_fingerprint: string | null; compiler_task_id: string | null; compiler_capability_json: string | null; constraints_json: string | null; inventory_snapshot_json: string | null; inventory_hash: string | null; spec_json: string | null; input_values_json: string | null; spec_hash: string | null; policy_summary_json: string | null; policy_summary_hash: string | null; preview_json: string | null; rationale_json: string | null; warnings_json: string | null; questions_json: string | null; compiler_status: string; validation_status: string; approval_status: string; materialized_workflow_id: string | null; created_at: string; updated_at: string }
