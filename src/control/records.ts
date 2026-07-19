@@ -415,5 +415,9 @@ export interface WorkflowBuilderSessionSummary {
   revision: number
   draft_ready: boolean
   processing: boolean
+  /** The last assistant turn's outcome kind (ready_for_review | clarification_required |
+   *  draft_updated | compile_failed) — so a list view can distinguish sessions without
+   *  loading full histories. Null when no assistant turn has run. */
+  last_outcome: string | null
   last_message_preview: string | null
 }

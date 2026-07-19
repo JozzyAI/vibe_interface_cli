@@ -31,6 +31,7 @@ import { readRun } from '../store.js'
 import { readEvents } from '../events.js'
 import { isLoopbackHost } from './terminal-web.js'
 import { workflowUiHtml } from './workflow-ui.js'
+import { workflowBuilderUiHtml } from './workflow-builder-ui.js'
 import { remoteRunStart, remoteStream, remoteRunStatus, remoteStop, remoteRunResult, fetchRemoteNodes } from '../relay/client.js'
 import { classifyRunError } from './run-error.js'
 import {
@@ -1307,16 +1308,21 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         // page's same-origin fetches authenticate without JS ever holding the token.
         if (parts[0] === 'ui') {
           if (method !== 'GET') return methodNotAllowed(res, ['GET'])
+          // The conversational builder workspace is a SIBLING page at /ui/builder; the
+          // original compile/preview/approval page stays at /ui (backward-compatible).
+          const isBuilder = parts[1] === 'builder'
+          const cleanPath = isBuilder ? '/ui/builder' : '/ui'
           const tok = url.searchParams.get('token')
           if (tok !== null && constEq(tok, apiToken)) {
             // Bootstrap: strip the token from the URL immediately (redirect to a clean
             // path) and never cache the token-bearing request/redirect or the Set-Cookie.
-            res.writeHead(302, { location: '/ui' + (url.searchParams.get('draft') ? '?draft=' + encodeURIComponent(url.searchParams.get('draft')!) : ''), 'set-cookie': `${GW_COOKIE}=${encodeURIComponent(apiToken)}; HttpOnly; SameSite=Strict; Path=/`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
+            const q = isBuilder ? (url.searchParams.get('session') ? '?session=' + encodeURIComponent(url.searchParams.get('session')!) : '') : (url.searchParams.get('draft') ? '?draft=' + encodeURIComponent(url.searchParams.get('draft')!) : '')
+            res.writeHead(302, { location: cleanPath + q, 'set-cookie': `${GW_COOKIE}=${encodeURIComponent(apiToken)}; HttpOnly; SameSite=Strict; Path=/`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
             return res.end()
           }
           // A missing/malformed/wrong token is never echoed — just serve the shell.
           const nonce = crypto.randomBytes(16).toString('base64')
-          const html = workflowUiHtml(nonce)
+          const html = isBuilder ? workflowBuilderUiHtml(nonce) : workflowUiHtml(nonce)
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html), 'cache-control': 'no-store', 'content-security-policy': `default-src 'none'; connect-src 'self'; img-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'self'`, 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' })
           return res.end(html)
         }
