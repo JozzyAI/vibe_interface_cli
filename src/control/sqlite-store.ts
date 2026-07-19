@@ -877,7 +877,9 @@ export class SqliteControlStore implements ControlStore, GatewayTaskStore {
     const rows = this.db.prepare('SELECT * FROM workflow_builder_sessions ORDER BY updated_at DESC, builder_session_id DESC LIMIT ? OFFSET ?').all(limit, offset) as BuilderSessionRow[]
     return rows.map((r) => {
       const last = this.db.prepare('SELECT content FROM workflow_builder_messages WHERE builder_session_id = ? ORDER BY sequence DESC LIMIT 1').get(r.builder_session_id) as { content: string } | undefined
-      return { builder_session_id: r.builder_session_id, title: r.title, status: r.status as WorkflowBuilderSessionSummary['status'], updated_at: r.updated_at, revision: r.revision, draft_ready: r.current_spec_hash !== null, processing: r.pending_turn_key !== null, last_message_preview: last ? last.content.slice(0, 140) : null }
+      const lastA = this.db.prepare("SELECT metadata_json FROM workflow_builder_messages WHERE builder_session_id = ? AND role = 'assistant' ORDER BY sequence DESC LIMIT 1").get(r.builder_session_id) as { metadata_json: string | null } | undefined
+      const lastOutcome = lastA?.metadata_json ? ((decodeJson(lastA.metadata_json, SIZE_LIMITS.metadata_json, 'builder.message.metadata', true) as { kind?: string } | null)?.kind ?? null) : null
+      return { builder_session_id: r.builder_session_id, title: r.title, status: r.status as WorkflowBuilderSessionSummary['status'], updated_at: r.updated_at, revision: r.revision, draft_ready: r.current_spec_hash !== null, processing: r.pending_turn_key !== null, last_outcome: lastOutcome, last_message_preview: last ? last.content.slice(0, 140) : null }
     })
   }
   async findBuilderTurn(id: string, turnKey: string): Promise<{ user: WorkflowBuilderMessageRecord | null; assistant: WorkflowBuilderMessageRecord | null }> {
