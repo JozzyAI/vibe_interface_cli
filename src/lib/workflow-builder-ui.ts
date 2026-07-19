@@ -9,7 +9,11 @@
  * idempotency_key preserved across retries/timeouts; ambiguous sends reconcile from
  * the server; a builder_revision_conflict refreshes state without dropping the
  * composer text. Rendering is textContent-only (XSS-safe); no innerHTML.
+ *
+ * The right panel offers a live MAP (default) and DETAILS view of the current durable
+ * draft — the map is the reusable framework-free SVG DAG from ./workflow-map.
  */
+import { WORKFLOW_MAP_CSS, WORKFLOW_MAP_SCRIPT } from './workflow-map.js'
 
 /** Render the conversational builder workspace. `nonce` locks the single inline script. */
 export function workflowBuilderUiHtml(nonce: string): string {
@@ -78,6 +82,11 @@ pre.raw{margin:0 .6rem .6rem;padding:.6rem;background:#0b0e12;border:1px solid v
   .conversation{display:flex}
   .msg{max-width:92%}
 }
+.dtabs{display:flex;gap:.3rem;padding:.5rem .6rem;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+.dtabs button{padding:.3rem .7rem} .dtabs button.on{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
+.selnode{margin:.6rem;padding:.5rem .6rem;background:var(--panel2);border:1px solid var(--accent);border-radius:8px;font-size:12.5px}
+.selnode .issue{color:var(--bad);margin-top:.3rem}
+${WORKFLOW_MAP_CSS}
 </style></head>
 <body>
 <div class="hdr"><h1>Workflow Builder</h1>
@@ -87,6 +96,7 @@ pre.raw{margin:0 .6rem .6rem;padding:.6rem;background:#0b0e12;border:1px solid v
 <div id="app" class="builder" role="application" aria-label="Conversational workflow builder"></div>
 <p id="status" role="status" aria-live="polite" class="hidden"></p>
 <script nonce="${nonce}">
+${WORKFLOW_MAP_SCRIPT}
 ${BUILDER_SCRIPT}
 </script>
 </body></html>`
@@ -119,6 +129,11 @@ var pendingKey=null;    // the ONE stable idempotency key for the in-flight/unfi
 var composerText='';    // preserved across re-renders + conflicts
 var notice=null;        // {kind,text}
 var pollTimer=null, disposed=false;
+// ── draft/map view state ──
+var draftTab=null;          // null=auto (map when structure present), 'map', 'details'
+var selectedNodeId=null;    // selected map node (preserved while the same draft is active)
+var selectedIssue=null;     // its validation issue text, when any
+var mapLastDraftId=null, mapLastStepIds=[]; // for added-node highlighting on a real draft change
 
 function go(url){history.pushState(null,'',url);route();}
 window.addEventListener('popstate',route);
@@ -185,7 +200,8 @@ function retryTurn(){ if(!pendingKey)return; submitTurn(); } // reuses the prese
 // ── rendering ──
 function render(){
   if(disposed)return;
-  var wrap=el('div',{id:'sidebar-wrap'}); // placeholder; we mount directly
+  // reset a stale selection safely when a newer draft no longer contains that node
+  if(selectedNodeId&&model&&model.draft){ if(draftNodeIds(model.draft).indexOf(selectedNodeId)<0){selectedNodeId=null;selectedIssue=null;} }
   app.replaceChildren(renderSidebar(), renderConversation(), renderDraft());
 }
 function statusBadge(s){var m={active:'',completed:'b-ready',archived:'b-arch'};return el('span',{class:'badge '+(m[s]||''),text:s});}
@@ -270,51 +286,101 @@ function renderComposer(){
   c.append(row);
   return c;
 }
-function renderDraft(){
-  var p=el('div',{id:'draftpanel',class:'col draftpanel'});
-  if(!sid||!model){p.append(el('div',{class:'empty',text:'The current draft and readiness will appear here.'}));return p;}
-  var d=model.draft;var kind=currentKind();
-  var head=el('div',{class:'card'});
-  head.append(el('h3',{text:'Draft'}));
+// Node ids the current draft's map contains (start + steps + verifier + terminals).
+function draftNodeIds(d){
+  if(!d||!d.preview)return [];
+  var pv=d.preview; var ids=['__start']; (pv.steps||[]).forEach(function(s){ids.push(s.id);});
+  if(pv.policy_summary&&pv.policy_summary.requires_verified_tests)ids.push('__verifier');
+  (pv.terminal_routes||[]).forEach(function(t){ids.push(t);});
+  return ids;
+}
+function stepIdsOf(d){return (d&&d.preview&&d.preview.steps||[]).map(function(s){return s.id;});}
+function draftHasStructure(d){return !!(d&&d.preview&&(d.preview.steps||[]).length);}
+function activeDraftTab(d){ if(draftTab)return draftTab; return draftHasStructure(d)?'map':'details'; }
+
+// Re-render ONLY the draft panel (tab switch / node select) — never rebuilds conversation.
+function rerenderDraft(){var dp=document.getElementById('draftpanel');if(dp)dp.replaceChildren.apply(dp,draftChildren());}
+
+function renderDraft(){var p=el('div',{id:'draftpanel',class:'col draftpanel'});p.append.apply(p,draftChildren());return p;}
+
+function draftChildren(){
+  if(!sid||!model)return [el('div',{class:'empty',text:'The current draft and readiness will appear here.'})];
+  var out=[]; var d=model.draft;var kind=currentKind();
+  var head=el('div',{class:'card'}); head.append(el('h3',{text:'Draft'}));
   var name=(d&&d.preview&&d.preview.name)||(model.session.title)||'—';
   head.append(el('div',{class:'kv'},el('span',{class:'k',text:'Name'}),el('span',{text:name}),el('span',{class:'k',text:'Readiness'}),readiness(kind,d)));
-  p.append(head);
-  if(!d){p.append(el('div',{class:'card'},el('div',{class:'empty',text:'No draft yet — send a message to compile one.'})));return p;}
-  // review action when ready for review — routes to the EXISTING draft/approval view
-  if((kind==='ready_for_review')||(d.validation_status==='valid'&&d.spec_hash)){
+  out.push(head);
+  // Review action (ready_for_review) — SAME current_draft_id/spec_hash as the map; routes
+  // to the EXISTING draft/approval page. Never approves/materializes/starts.
+  if(d&&((kind==='ready_for_review')||(d.validation_status==='valid'&&d.spec_hash))){
     var rc=el('div',{class:'card'});
     rc.append(el('button',{id:'review-workflow',class:'primary',onclick:function(){go('/ui?draft='+encodeURIComponent(d.draft_id));},text:'Review workflow'}));
     rc.append(el('div',{class:'kv'},el('span',{class:'k',text:'spec hash'}),el('span',{class:'mono',text:d.spec_hash||'—'})));
-    p.append(rc);
+    out.push(rc);
   }
+  // Map | Details tabs
+  var tab=activeDraftTab(d);
+  var tabbar=el('div',{class:'dtabs'});
+  tabbar.append(el('button',{id:'dtab-map',class:tab==='map'?'on':'',onclick:function(){draftTab='map';rerenderDraft();},text:'Map'}));
+  tabbar.append(el('button',{id:'dtab-details',class:tab==='details'?'on':'',onclick:function(){draftTab='details';rerenderDraft();},text:'Details'}));
+  out.push(tabbar);
+  if(tab==='map'){ mapView(d,kind).forEach(function(x){out.push(x);}); }
+  else { detailsCards(d,kind).forEach(function(x){out.push(x);}); }
+  return out;
+}
+
+function mapView(d,kind){
+  var out=[];
+  var missing=[]; var la=lastAssistant(); if(la&&la.metadata&&la.metadata.missing)missing=la.metadata.missing;
+  // added-node highlighting only on a REAL draft change (not on tab switches)
+  var curStepIds=stepIdsOf(d); var prevIds=(d&&d.draft_id!==mapLastDraftId)?mapLastStepIds:null;
+  var m=buildWorkflowMap({preview:d?d.preview:null,validation_status:d?d.validation_status:'pending',warnings:d?(d.warnings||[]):[],kind:kind,missing:missing,selectedId:selectedNodeId,prevIds:prevIds,onSelect:onMapSelect});
+  if(d&&d.draft_id!==mapLastDraftId){mapLastDraftId=d.draft_id;mapLastStepIds=curStepIds;}
+  out.push(m.root);
+  // selected-node inspector (reveals the node's validation issue in the panel)
+  if(selectedNodeId){
+    var box=el('div',{class:'selnode',id:'selnode'});
+    box.append(el('div',{text:'Selected: '+selectedNodeId}));
+    var st=(d&&d.preview&&d.preview.steps||[]).filter(function(s){return s.id===selectedNodeId;})[0];
+    if(st)box.append(el('div',{class:'muted',text:(st.agent||'agent not selected')+(st.node_id?(' @ '+st.node_id):'')+(st.workspace_write?' · writes workspace':'')+(st.verify?(' · verifier '+st.verify):'')+' · '+(st.permission_mode||'default')}));
+    if(selectedIssue){box.append(el('div',{class:'issue',text:'Validation: '+selectedIssue}));box.append(el('button',{class:'ghost',onclick:function(){draftTab='details';rerenderDraft();},text:'View in Details'}));}
+    out.push(box);
+  }
+  return out;
+}
+
+function detailsCards(d,kind){
+  var out=[];
+  if(!d){out.push(el('div',{class:'card'},el('div',{class:'empty',text:'No draft yet — send a message to compile one.'})));return out;}
   var pv=d.preview||{};var ps=pv.policy_summary||{};
   // roles / agents / nodes
   var roles=ps.roles||[];
   if(roles.length){var rcard=el('div',{class:'card'});rcard.append(el('h3',{text:'Roles · agents · nodes'}));
-    roles.forEach(function(r){rcard.append(el('div',{class:'kv'},el('span',{class:'k',text:r.role||'role'}),el('span',{text:(r.agent||'—')+(r.node_id?(' @ '+r.node_id):'')})));});p.append(rcard);}
+    roles.forEach(function(r){rcard.append(el('div',{class:'kv'},el('span',{class:'k',text:r.role||'role'}),el('span',{text:(r.agent||'—')+(r.node_id?(' @ '+r.node_id):'')})));});out.push(rcard);}
   // verifier + completion policy
   var meta=el('div',{class:'card'});meta.append(el('h3',{text:'Policy'}));
   meta.append(el('div',{class:'kv'},
     el('span',{class:'k',text:'verifier'}),el('span',{text:ps.requires_verified_tests?'required (system-verified tests)':'none'}),
     el('span',{class:'k',text:'network'}),el('span',{text:ps.network_capable?'enabled':'disabled'}),
     el('span',{class:'k',text:'completion'}),el('span',{class:'mono scroll',text:ps.completion_policy?JSON.stringify(ps.completion_policy):'—'})));
-  p.append(meta);
+  out.push(meta);
   // steps in execution order
   var steps=pv.steps||[];
   if(steps.length){var sc=el('div',{class:'card'});sc.append(el('h3',{text:'Steps (execution order)'}));var ol=el('ol',{class:'steps'});
-    steps.forEach(function(s){ol.append(el('li',{class:'step',text:(s.id||'step')+' — '+(s.agent||'?')+(s.node_id?(' @ '+s.node_id):'')+(s.workspace?' · workspace':'')+' · '+(s.permission_mode||'default')}));});
-    sc.append(ol);p.append(sc);}
-  // validation issues (warnings when invalid)
-  if(d.validation_status!=='valid'&&(d.warnings||[]).length){var vc=el('div',{class:'card'});vc.append(el('h3',{text:'Validation issues'}));(d.warnings||[]).slice(0,20).forEach(function(w){vc.append(el('div',{class:'step',text:String(w)}));});p.append(vc);}
+    steps.forEach(function(s){ol.append(el('li',{class:'step',text:(s.id||'step')+' — '+(s.agent||'?')+(s.node_id?(' @ '+s.node_id):'')+(s.workspace_write?' · writes':s.workspace?' · workspace':'')+(s.verify?(' · ✓'+s.verify):'')+' · '+(s.permission_mode||'default')}));});
+    sc.append(ol);out.push(sc);}
+  // validation issues (warnings when invalid) — also targeted by map-node selection
+  if(d.validation_status!=='valid'&&(d.warnings||[]).length){var vc=el('div',{class:'card',id:'validation-issues'});vc.append(el('h3',{text:'Validation issues'}));(d.warnings||[]).slice(0,20).forEach(function(w){vc.append(el('div',{class:'step',text:String(w)}));});out.push(vc);}
   // identity
-  p.append(el('div',{class:'card'},el('h3',{text:'Identity'}),el('div',{class:'kv'},
+  out.push(el('div',{class:'card'},el('h3',{text:'Identity'}),el('div',{class:'kv'},
     el('span',{class:'k',text:'draft id'}),el('span',{class:'mono',text:d.draft_id||'—'}),
     el('span',{class:'k',text:'spec hash'}),el('span',{class:'mono scroll',text:d.spec_hash||'—'}),
     el('span',{class:'k',text:'revision'}),el('span',{text:String(model.session.revision)}))));
   // advanced: raw JSON (collapsed, NOT the default)
-  var det=el('details',{class:'raw'});det.append(el('summary',{text:'Raw draft JSON (advanced)'}));det.append(el('pre',{class:'raw',text:JSON.stringify(d,null,2)}));p.append(det);
-  return p;
+  var det=el('details',{class:'raw'});det.append(el('summary',{text:'Raw draft JSON (advanced)'}));det.append(el('pre',{class:'raw',text:JSON.stringify(d,null,2)}));out.push(det);
+  return out;
 }
+function onMapSelect(id,info){ selectedNodeId=id; selectedIssue=(info&&info.issue)||null; rerenderDraft(); }
 function readiness(kind,d){
   var map={ready_for_review:['b-ready','ready for review'],clarification_required:['b-warn','clarification required'],draft_updated:['b-info','draft updated'],compile_failed:['b-bad','compile failed']};
   var m=map[kind]||(d&&d.validation_status==='valid'?['b-ready','ready for review']:['','pending']);
@@ -329,7 +395,7 @@ function createSession(){
     else{notice={kind:'bad',text:(r.body&&r.body.message)||'Could not create a session'};render();}
   });
 }
-function openSession(id){ pendingKey=null; composerText=''; notice=null; go('/ui/builder?session='+encodeURIComponent(id)); }
+function openSession(id){ pendingKey=null; composerText=''; notice=null; selectedNodeId=null; selectedIssue=null; draftTab=null; go('/ui/builder?session='+encodeURIComponent(id)); }
 function archiveSession(){
   if(!sid)return;
   api('POST','/v1/workflow-builder/sessions/'+encodeURIComponent(sid)+'/archive').then(function(r){if(disposed)return;if(r.status===200){loadList();loadSession(sid);}});
