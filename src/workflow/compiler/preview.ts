@@ -22,9 +22,11 @@ export interface PolicySummary {
 
 export interface WorkflowPreview {
   name: string
+  /** The declared entry step id — the authoritative start of the graph (additive). */
+  entry_step: string
   policy_summary: PolicySummary
-  steps: Array<{ id: string; role: string | null; agent: string | null; node_id: string | null; workspace: boolean; permission_mode: string | null; pause: string | null }>
-  edges: Array<{ from: string; to: string; kind: string; loop: boolean; terminal: boolean }>
+  steps: Array<{ id: string; role: string | null; agent: string | null; node_id: string | null; workspace: boolean; workspace_write: boolean; verify: string | null; permission_mode: string | null; pause: string | null }>
+  edges: Array<{ from: string; to: string; kind: string; loop: boolean; terminal: boolean; cond: string | null }>
   loop_edges: number
   terminal_routes: string[]
   graph_text: string
@@ -64,11 +66,16 @@ export function buildPolicySummary(spec: WorkflowSpec): PolicySummary {
 export function buildPreview(spec: WorkflowSpec): WorkflowPreview {
   const summary = buildPolicySummary(spec)
   const steps = spec.steps.map((step) => {
-    const s = step as { id: string; agent_role?: string; permission_mode?: string; workspace_key_template?: string; pause_before?: { kind?: string } }
+    const s = step as { id: string; agent_role?: string; permission_mode?: string; workspace_key_template?: string; workspace_write?: boolean; verify?: { profile?: string }; pause_before?: { kind?: string } }
     const role = s.agent_role ? (spec.agents as Record<string, WorkflowAgentRole>)[s.agent_role] : undefined
-    return { id: s.id, role: s.agent_role ?? null, agent: role?.agent ?? null, node_id: role?.node_id ?? null, workspace: s.workspace_key_template !== undefined, permission_mode: s.permission_mode ?? null, pause: s.pause_before?.kind ?? null }
+    return { id: s.id, role: s.agent_role ?? null, agent: role?.agent ?? null, node_id: role?.node_id ?? null, workspace: s.workspace_key_template !== undefined, workspace_write: s.workspace_write === true, verify: s.verify?.profile ?? null, permission_mode: s.permission_mode ?? null, pause: s.pause_before?.kind ?? null }
   })
-  const edges = spec.edges.map((e) => ({ from: e.from, to: e.to, kind: e.kind, loop: e.kind === 'loop', terminal: e.to.startsWith('$') }))
+  const edges = spec.edges.map((e) => {
+    const ce = e as { from: string; to: string; kind: string; condition?: { path?: string; op?: string; value?: unknown } }
+    const c = ce.condition
+    const cond = c && typeof c.path === 'string' ? `${c.path} ${c.op ?? ''} ${c.value !== undefined ? JSON.stringify(c.value) : ''}`.trim() : null
+    return { from: e.from, to: e.to, kind: e.kind, loop: e.kind === 'loop', terminal: e.to.startsWith('$'), cond }
+  })
   const terminal_routes = [...new Set(edges.filter((e) => e.terminal).map((e) => e.to))].sort()
   const lines: string[] = [`workflow ${spec.name} (entry: ${spec.entry_step})`]
   for (const st of steps) lines.push(`  step ${st.id}: ${st.agent ?? '—'}${st.node_id ? '@' + st.node_id : ''}${st.workspace ? ' [workspace]' : ''}${st.permission_mode ? ' perm=' + st.permission_mode : ''}${st.pause ? ' pause=' + st.pause : ''}`)
@@ -76,5 +83,5 @@ export function buildPreview(spec: WorkflowSpec): WorkflowPreview {
   lines.push(`  limits: tasks≤${summary.limits.max_tasks} runtime≤${summary.limits.max_runtime_seconds}s rounds≤${summary.limits.max_rounds ?? '—'}`)
   lines.push(`  completion_policy: ${summary.completion_policy ? JSON.stringify(summary.completion_policy) : 'none'}  stall_policy: ${summary.stall_policy ? JSON.stringify(summary.stall_policy) : 'none'}`)
   if (summary.external_side_effect_warnings.length) lines.push(`  warnings: ${summary.external_side_effect_warnings.join('; ')}`)
-  return { name: spec.name, policy_summary: summary, steps, edges, loop_edges: edges.filter((e) => e.loop).length, terminal_routes, graph_text: lines.join('\n') }
+  return { name: spec.name, entry_step: spec.entry_step, policy_summary: summary, steps, edges, loop_edges: edges.filter((e) => e.loop).length, terminal_routes, graph_text: lines.join('\n') }
 }

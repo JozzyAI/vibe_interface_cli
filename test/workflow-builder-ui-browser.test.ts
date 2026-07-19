@@ -75,6 +75,7 @@ const findText = (root: any, re: RegExp): any => {
   return null
 }
 const anyText = (root: any, re: RegExp): boolean => !!findText(root, re)
+const findAll = (root: any, pred: (n: any) => boolean, acc: any[] = []): any[] => { if (!root) return acc; if (pred(root)) acc.push(root); for (const c of root.children || []) findAll(c, pred, acc); return acc }
 const findTag = (root: any, tag: string): any => {
   if (!root) return null
   if (root.tagName === tag) return root
@@ -292,5 +293,69 @@ test('narrow layout: sidebar/draft drawer toggles exist and the composer remains
     // toggling the sessions drawer marks it open (no horizontal navigation away)
     b.dom.ids['tab-sessions'].click()
     assert.ok(String(b.dom.ids['sidebar'].className).includes('open'))
+  } finally { await b.close() }
+})
+
+// ── live workflow map (browser-level, real compiler → durable draft) ──────────
+const readyResultStep = (name: string, stepId: string) => ({ schema_version: '1', status: 'ready', workflow_spec: { ...readySpec(name), entry_step: stepId, steps: [{ id: stepId, type: 'agent_task', agent_role: 'only', prompt_template: 'Do {{ inputs.objective }}', output_schema: 'o' }], edges: [{ from: stepId, to: '$complete', kind: 'normal', condition: { path: 'output.status', op: 'eq', value: 'done' } }] }, input_values: { objective: 'x' }, rationale: {}, questions: [], warnings: [] })
+const draftPanel = (b: Boot) => b.dom.doc.getElementById('draftpanel')
+const svgIn = (b: Boot) => findTag(draftPanel(b), 'svg')
+
+test('map: ready draft shows the map by default and Review uses the same current_draft_id', async () => {
+  const b = await boot()
+  try {
+    b.dom.ids['new-session'].click()
+    const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    await send(b, 'build slugify')
+    await waitUntil(() => svgIn(b))                          // map is the default view
+    assert.ok(b.dom.doc.getElementById('wfn-go'), 'the step node is rendered from the durable draft')
+    const review = await waitUntil(() => b.dom.ids['review-workflow'])
+    const draftId = (await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.current_draft_id
+    review.click()
+    assert.ok(b.dom.location.href.includes('/ui?draft=' + draftId), 'map + Review use the same draft id')
+  } finally { await b.close() }
+})
+
+test('map: a durable draft update refreshes the map without duplicate SVG or speculative nodes', async () => {
+  const b = await boot()
+  try {
+    b.dom.ids['new-session'].click()
+    const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    b.model.result = readyResultStep('v1', 'go'); await send(b, 'first'); await waitUntil(() => svgIn(b))
+    const d1 = (await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.current_draft_id
+    b.model.result = readyResultStep('v2', 'go'); await send(b, 'again')
+    await waitUntil(async () => (await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.current_draft_id !== d1)
+    await sleep(60)
+    assert.equal(findAll(draftPanel(b), (n: any) => n.tagName === 'svg').length, 1, 'exactly one map (no duplicate DOM)')
+    assert.ok(b.dom.doc.getElementById('wfn-go'), 'map updated from the newly fetched draft')
+  } finally { await b.close() }
+})
+
+test('map: selection is preserved when the node identity is unchanged; resets when the node is removed', async () => {
+  const b = await boot()
+  try {
+    b.dom.ids['new-session'].click()
+    await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    b.model.result = readyResultStep('s1', 'go'); await send(b, 'first'); await waitUntil(() => b.dom.doc.getElementById('wfn-go'))
+    b.dom.doc.getElementById('wfn-go').dispatch('click', { type: 'click' })          // select 'go'
+    await waitUntil(() => b.dom.doc.getElementById('selnode'))
+    assert.match(b.dom.doc.getElementById('selnode').textContent, /go/)
+    b.model.result = readyResultStep('s2', 'go'); await send(b, 'same step id'); await sleep(60)
+    assert.ok(b.dom.doc.getElementById('selnode') && /go/.test(b.dom.doc.getElementById('selnode').textContent), 'selection preserved across a revision with the same node id')
+    b.model.result = readyResultStep('s3', 'renamed'); await send(b, 'new step id'); await sleep(60)
+    const sn = b.dom.doc.getElementById('selnode')
+    assert.ok(!sn || !/(^|[^a-z])go([^a-z]|$)/.test(sn.textContent), 'selection reset safely when the selected node was removed')
+  } finally { await b.close() }
+})
+
+test('map: lives inside the draft panel (drawer on narrow) and the draft toggle opens it', async () => {
+  const b = await boot()
+  try {
+    b.dom.ids['new-session'].click()
+    await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    await send(b, 'build it'); await waitUntil(() => svgIn(b))
+    assert.ok(svgIn(b), 'the map is contained within #draftpanel (the narrow-viewport drawer)')
+    b.dom.ids['tab-draft'].click()
+    assert.ok(String(b.dom.doc.getElementById('draftpanel').className).includes('open'), 'draft drawer opens')
   } finally { await b.close() }
 })
