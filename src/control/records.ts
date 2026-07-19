@@ -22,6 +22,8 @@ export type ControlStoreErrorCode =
   | 'unsupported_schema_version'
   | 'idempotency_conflict'
   | 'result_conflict'
+  | 'builder_revision_conflict'
+  | 'builder_turn_in_progress'
   | 'closed'
 
 /** Structured store error. `code` is stable; `message` never echoes payloads. */
@@ -354,4 +356,64 @@ export function validateCreateStepExecution(i: CreateStepExecutionInput): void {
   if (!isSafeId(i.step_id)) throw new ControlStoreError('invalid_record', 'step.step_id is not a safe id')
   if (!Number.isInteger(i.round) || i.round < 1) throw new ControlStoreError('invalid_record', 'step.round must be a positive integer')
   if (!Number.isInteger(i.attempt) || i.attempt < 1) throw new ControlStoreError('invalid_record', 'step.attempt must be a positive integer')
+}
+
+// ── Conversational Workflow Builder (persistent NL sessions over the compiler) ──
+
+export type BuilderSessionStatus = 'active' | 'completed' | 'archived'
+export const BUILDER_SESSION_STATUSES: readonly BuilderSessionStatus[] = ['active', 'completed', 'archived']
+export type BuilderMessageRole = 'user' | 'assistant' | 'system'
+export const BUILDER_MESSAGE_ROLES: readonly BuilderMessageRole[] = ['user', 'assistant', 'system']
+
+/** A durable conversational builder session. `revision` is optimistic-concurrency
+ *  state that increments once per completed conversational turn. `current_draft_id`
+ *  points at the LATEST compiler draft (immutable; never a missing draft — FK-guarded).
+ *  `compiler_agent`/`compiler_node_id` are caller-supplied ROUTING DATA captured at
+ *  create (never hardcoded provider logic). */
+export interface WorkflowBuilderSessionRecord {
+  builder_session_id: string
+  title: string
+  status: BuilderSessionStatus
+  created_at: string
+  updated_at: string
+  current_draft_id: string | null
+  current_spec_hash: string | null
+  revision: number
+  source_workflow_id: string | null
+  compiler_agent: string | null
+  compiler_node_id: string | null
+  /** The turn_key of an IN-FLIGHT turn (user message committed, assistant/draft/revision
+   *  not yet). Non-null ⇒ a recoverable pending turn: only the same turn_key may resume
+   *  it; any other message is rejected `builder_turn_in_progress`. Cleared atomically on
+   *  completion. Only keyed turns are recoverable. */
+  pending_turn_key: string | null
+  pending_turn_started_at: string | null
+}
+
+/** A durable, append-only builder message. `sequence` is per-session monotonic and
+ *  deterministic. `turn_key` is the (optional) idempotency key of the turn that
+ *  produced this message — used to dedup a resubmitted turn. */
+export interface WorkflowBuilderMessageRecord {
+  message_id: string
+  builder_session_id: string
+  role: BuilderMessageRole
+  content: string
+  created_at: string
+  sequence: number
+  draft_id: string | null
+  spec_hash: string | null
+  metadata: Record<string, unknown> | null
+  turn_key: string | null
+}
+
+/** A bounded list projection — never the full spec/history/secrets. */
+export interface WorkflowBuilderSessionSummary {
+  builder_session_id: string
+  title: string
+  status: BuilderSessionStatus
+  updated_at: string
+  revision: number
+  draft_ready: boolean
+  processing: boolean
+  last_message_preview: string | null
 }

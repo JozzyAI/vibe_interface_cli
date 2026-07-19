@@ -312,7 +312,52 @@ const V14 = `ALTER TABLE workflow_workspace_leases ADD COLUMN acquire_reason TEX
  *  nullable; NULL unless a step is awaiting result ingestion. */
 const V15 = `ALTER TABLE workflow_step_executions ADD COLUMN result_awaited_since TEXT;`
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }, { version: 13, sql: V13 }, { version: 14, sql: V14 }, { version: 15, sql: V15 }]
+/** Schema v16 — persistent Conversational Workflow Builder. Two additive tables: a
+ *  durable session (optimistic `revision`, current-draft pointer FK-guarded so it can
+ *  never reference a missing draft) and an append-only, per-session monotonic message
+ *  log (UNIQUE(session,sequence) enforces determinism). No existing table is touched;
+ *  the compiler/draft/runtime tables are unchanged. `pending_turn_key` marks an
+ *  in-flight turn (user message committed, assistant/draft/revision not yet) so a
+ *  crash mid-turn is a RECOVERABLE pending turn — set atomically with the user
+ *  message, cleared atomically on completion; only the same turn_key may resume it. */
+const V16 = `
+CREATE TABLE workflow_builder_sessions (
+  builder_session_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL,
+  current_draft_id TEXT,
+  current_spec_hash TEXT,
+  revision INTEGER NOT NULL,
+  source_workflow_id TEXT,
+  compiler_agent TEXT,
+  compiler_node_id TEXT,
+  pending_turn_key TEXT,
+  pending_turn_started_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (current_draft_id) REFERENCES workflow_drafts(draft_id) ON DELETE SET NULL,
+  FOREIGN KEY (source_workflow_id) REFERENCES workflows(workflow_id) ON DELETE SET NULL
+);
+CREATE TABLE workflow_builder_messages (
+  message_id TEXT PRIMARY KEY,
+  builder_session_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  draft_id TEXT,
+  spec_hash TEXT,
+  metadata_json TEXT,
+  turn_key TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (builder_session_id) REFERENCES workflow_builder_sessions(builder_session_id) ON DELETE CASCADE,
+  FOREIGN KEY (draft_id) REFERENCES workflow_drafts(draft_id) ON DELETE SET NULL,
+  UNIQUE (builder_session_id, sequence)
+);
+CREATE INDEX idx_builder_messages_turn ON workflow_builder_messages(builder_session_id, turn_key, role);
+CREATE INDEX idx_builder_sessions_list ON workflow_builder_sessions(status, updated_at);
+`
+
+export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1 }, { version: 2, sql: V2 }, { version: 3, sql: V3 }, { version: 4, sql: V4 }, { version: 5, sql: V5 }, { version: 6, sql: V6 }, { version: 7, sql: V7 }, { version: 8, sql: V8 }, { version: 9, sql: V9 }, { version: 10, sql: V10 }, { version: 11, sql: V11 }, { version: 12, sql: V12 }, { version: 13, sql: V13 }, { version: 14, sql: V14 }, { version: 15, sql: V15 }, { version: 16, sql: V16 }]
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version
 
 function readCurrentVersion(db: BetterSqlite3.Database): number {

@@ -12,7 +12,38 @@ import type {
   CreateStepExecutionInput, StepExecutionPatch, WorkflowEventInput, WorkflowEventRecord,
   WorkflowSnapshot, WorkflowWorkspaceLeaseRecord, WorkflowHumanRequestRecord, CreateHumanRequestInput,
   WorkflowDraftRecord,
+  WorkflowBuilderSessionRecord, WorkflowBuilderMessageRecord, WorkflowBuilderSessionSummary,
 } from './records.js'
+
+/** Durable persistence for the Conversational Workflow Builder. Sessions + an
+ *  append-only message log; every conversational turn's assistant message + current-
+ *  draft pointer + revision bump land ATOMICALLY (`completeBuilderTurn`), and a turn
+ *  resubmitted with the same `turn_key` is deduplicated (idempotent). The builder
+ *  NEVER reimplements the compiler — it only reads/writes these rows + drafts. */
+export interface WorkflowBuilderStore {
+  /** Create-or-return an ACTIVE session by its stable id (revision starts at 1). */
+  createBuilderSession(input: { builder_session_id: string; title: string; source_workflow_id?: string | null; compiler_agent?: string | null; compiler_node_id?: string | null }): Promise<WorkflowBuilderSessionRecord>
+  getBuilderSession(builderSessionId: string): Promise<WorkflowBuilderSessionRecord | null>
+  listBuilderSessions(page?: { limit?: number; offset?: number }): Promise<WorkflowBuilderSessionSummary[]>
+  /** Ordered (by sequence) full message history for a session. */
+  listBuilderMessages(builderSessionId: string): Promise<WorkflowBuilderMessageRecord[]>
+  /** Look up the messages a keyed turn already produced (for idempotent replay /
+   *  crash recovery). Returns nulls when the turn has not (yet) written that role. */
+  findBuilderTurn(builderSessionId: string, turnKey: string): Promise<{ user: WorkflowBuilderMessageRecord | null; assistant: WorkflowBuilderMessageRecord | null }>
+  /** Append the user message durably BEFORE the compiler runs. Append-only (next
+   *  sequence); does NOT change the session revision. Idempotent on a non-null turn_key
+   *  (a resubmit returns the existing user message). Rejects a non-active session. */
+  appendBuilderUserMessage(builderSessionId: string, input: { content: string; turn_key?: string | null }): Promise<{ message: WorkflowBuilderMessageRecord; replay: boolean }>
+  /** ATOMICALLY finish a turn: append the assistant message (next sequence) and advance
+   *  the session's current draft pointer + revision (+1) — one transaction, so there is
+   *  never an assistant message without its draft-pointer update. Optimistic: fails
+   *  `builder_revision_conflict` when `expectedRevision` != the session's current
+   *  revision. Idempotent on a non-null turn_key (a completed turn replays with no
+   *  writes and no second revision increment). Rejects a non-active session. */
+  completeBuilderTurn(builderSessionId: string, expectedRevision: number, input: { assistant: { content: string; draft_id?: string | null; spec_hash?: string | null; metadata?: Record<string, unknown> | null; turn_key?: string | null }; current_draft_id: string | null; current_spec_hash: string | null }): Promise<{ session: WorkflowBuilderSessionRecord; message: WorkflowBuilderMessageRecord; replay: boolean }>
+  /** Idempotently archive a session (already archived → returned unchanged). */
+  archiveBuilderSession(builderSessionId: string): Promise<WorkflowBuilderSessionRecord>
+}
 
 /** Durable IMMUTABLE compiler WorkflowDraft persistence — the ONLY store surface the
  *  Workflow Compiler depends on (it never touches the relay/Node/runtime). */
@@ -131,7 +162,7 @@ export interface WorkflowFilters { status?: string }
 export interface HealthCheck { ok: boolean; schema_version: number; foreign_keys: boolean; journal_mode: string; busy_timeout: number }
 export interface CleanupResult { removed: number }
 
-export interface ControlStore extends WorkflowDraftStore {
+export interface ControlStore extends WorkflowDraftStore, WorkflowBuilderStore {
   // lifecycle
   migrate(): Promise<number>
   healthCheck(): Promise<HealthCheck>
