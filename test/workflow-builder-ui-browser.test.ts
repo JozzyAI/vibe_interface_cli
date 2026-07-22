@@ -63,7 +63,12 @@ function makeDom(base: string) {
   }
   for (const id of ['app', 'status', 'tab-sessions', 'tab-draft']) { const n = new N(id === 'app' ? 'main' : 'button'); n.id = id }
   const winL: Record<string, Function[]> = {}
-  const win: any = { addEventListener(t: string, fn: Function) { (winL[t] = winL[t] || []).push(fn) }, dispatch(t: string, ev?: any) { (winL[t] || []).forEach((fn) => fn(ev || { type: t })) } }
+  const lsMap = new Map<string, string>()
+  const win: any = {
+    addEventListener(t: string, fn: Function) { (winL[t] = winL[t] || []).push(fn) },
+    dispatch(t: string, ev?: any) { (winL[t] || []).forEach((fn) => fn(ev || { type: t })) },
+    localStorage: { getItem: (k: string) => (lsMap.has(k) ? lsMap.get(k)! : null), setItem: (k: string, v: any) => { lsMap.set(k, String(v)) }, removeItem: (k: string) => { lsMap.delete(k) } },
+  }
   const location: any = { href: base + '/ui/builder' }
   const history: any = { pushState: (_a: any, _b: any, url: string) => { location.href = new URL(url, location.href).href } }
   return { doc, win, location, history, ids }
@@ -84,8 +89,8 @@ const findTag = (root: any, tag: string): any => {
 }
 function extractScript(html: string): string { const m = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html); if (!m) throw new Error('no script'); return m[1] }
 
-interface Boot { store: SqliteControlStore; base: string; dom: ReturnType<typeof makeDom>; model: { result: any }; posts: { count: number; lastBody: any }; ctl: { intercept: string | null }; gwGet: (p: string) => Promise<any>; close: () => Promise<void> }
-async function boot(startPath = '/ui/builder'): Promise<Boot> {
+interface Boot { store: SqliteControlStore; base: string; dom: ReturnType<typeof makeDom>; model: { result: any }; posts: { count: number; lastBody: any }; sess: { count: number; lastBody: any }; ctl: { intercept: string | null }; agentsCtl: { override: any[] | null }; gwGet: (p: string) => Promise<any>; close: () => Promise<void> }
+async function boot(startPath = '/ui/builder', opts: { agents?: any[]; ls?: Record<string, string> } = {}): Promise<Boot> {
   const store = openControlStore({ path: tmpDb() })
   const model = { result: readyResult('draft') as any }
   let n = 0
@@ -96,21 +101,26 @@ async function boot(startPath = '/ui/builder'): Promise<Boot> {
   const gw = await startAgentGateway({ host: '127.0.0.1', port: 0, apiToken: TOKEN, taskStore: store, controlStore: store, getWorkflowCompiler: () => compiler, getWorkflowBuilder: () => builder })
   const base = `http://127.0.0.1:${gw.port}`
   const posts = { count: 0, lastBody: null as any }
+  const sess = { count: 0, lastBody: null as any }
   const ctl = { intercept: null as string | null } // 'lose-response' | 'conflict'
+  const agentsCtl = { override: (opts.agents ?? null) as any[] | null } // scripted /v1/agents inventory (null = real gateway inventory)
   const auth = { authorization: `Bearer ${TOKEN}` }
-  const wfetch = async (p: string, opts: any = {}) => {
-    const isMsgPost = opts.method === 'POST' && /\/messages$/.test(p)
-    if (isMsgPost) { posts.count++; try { posts.lastBody = JSON.parse(opts.body) } catch { /* */ } }
+  const wfetch = async (p: string, fopts: any = {}) => {
+    if (agentsCtl.override && p === '/v1/agents' && (!fopts.method || fopts.method === 'GET')) return new Response(JSON.stringify({ agents: agentsCtl.override }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const isMsgPost = fopts.method === 'POST' && /\/messages$/.test(p)
+    if (fopts.method === 'POST' && /\/v1\/workflow-builder\/sessions$/.test(p)) { sess.count++; try { sess.lastBody = JSON.parse(fopts.body) } catch { /* */ } }
+    if (isMsgPost) { posts.count++; try { posts.lastBody = JSON.parse(fopts.body) } catch { /* */ } }
     if (isMsgPost && ctl.intercept === 'conflict') { ctl.intercept = null; return new Response(JSON.stringify({ error: true, code: 'builder_revision_conflict', message: 'stale' }), { status: 409, headers: { 'content-type': 'application/json' } }) }
-    if (isMsgPost && ctl.intercept === 'lose-response') { ctl.intercept = null; await fetch(base + p, { ...opts, headers: { ...(opts.headers || {}), ...auth } }); throw new Error('simulated lost response') }
-    return fetch(base + p, { ...opts, headers: { ...(opts.headers || {}), ...auth } })
+    if (isMsgPost && ctl.intercept === 'lose-response') { ctl.intercept = null; await fetch(base + p, { ...fopts, headers: { ...(fopts.headers || {}), ...auth } }); throw new Error('simulated lost response') }
+    return fetch(base + p, { ...fopts, headers: { ...(fopts.headers || {}), ...auth } })
   }
   const gwGet = async (p: string) => JSON.parse(await (await fetch(base + p, { headers: auth })).text())
   const dom = makeDom(base); dom.location.href = base + startPath
+  for (const [k, v] of Object.entries(opts.ls ?? {})) dom.win.localStorage.setItem(k, v)
   const script = extractScript(workflowBuilderUiHtml('nonce'))
   const run = new Function('document', 'window', 'location', 'history', 'crypto', 'fetch', 'EventSource', 'confirm', 'setTimeout', 'clearTimeout', 'URL', 'Response', script)
   run(dom.doc, dom.win, dom.location, dom.history, crypto, wfetch, undefined, () => true, setTimeout, clearTimeout, URL, Response)
-  return { store, base, dom, model, posts, ctl, gwGet, close: async () => { dom.win.dispatch('pagehide'); try { await gw.close() } catch { /* */ } try { store.closeSync() } catch { /* */ } } }
+  return { store, base, dom, model, posts, sess, ctl, agentsCtl, gwGet, close: async () => { dom.win.dispatch('pagehide'); try { await gw.close() } catch { /* */ } try { store.closeSync() } catch { /* */ } } }
 }
 const waitUntil = async (fn: () => any, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { const v = await fn(); if (v) return v; await sleep(30) } throw new Error('timeout') }
 const app = (b: Boot) => b.dom.ids['app']
@@ -345,6 +355,125 @@ test('map: selection is preserved when the node identity is unchanged; resets wh
     b.model.result = readyResultStep('s3', 'renamed'); await send(b, 'new step id'); await sleep(60)
     const sn = b.dom.doc.getElementById('selnode')
     assert.ok(!sn || !/(^|[^a-z])go([^a-z]|$)/.test(sn.textContent), 'selection reset safely when the selected node was removed')
+  } finally { await b.close() }
+})
+
+// ── compiler-agent selection (authoritative inventory → selector → session) ───
+const selectorOpts = (b: Boot) => findAll(b.dom.ids['compiler-select'], (n: any) => n.tagName === 'option')
+const optValues = (b: Boot) => selectorOpts(b).map((o: any) => o.getAttribute('value'))
+
+test('selector: real advertised agents appear; mock only when advertised; default prefers the first real agent', async () => {
+  const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n1' }] })
+  try {
+    await waitUntil(() => selectorOpts(b).length === 2)
+    assert.deepEqual(optValues(b), ['claude-code', 'codex'], 'exactly the advertised agents, in advertised order')
+    assert.ok(!optValues(b).includes('mock'), 'mock is NOT offered when it is not advertised')
+    assert.equal(b.dom.ids['compiler-select'].value, 'claude-code', 'default = first real advertised agent')
+    assert.ok(findTag(b.dom.ids['sidebar'], 'select'), 'selector lives in the sidebar (narrow-viewport drawer) — composer area untouched')
+    b.dom.ids['new-session'].click()
+    await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    assert.equal(b.sess.lastBody.compiler_agent, 'claude-code', 'POST carries the exact selected compiler_agent')
+    const badge = await waitUntil(() => b.dom.ids['session-compiler'])
+    assert.match(badge.textContent, /compiler: claude-code/, 'the created session displays its owning compiler agent')
+  } finally { await b.close() }
+})
+
+test('selector: default prefers a real available agent over an advertised mock (no silent mock fallback)', async () => {
+  const b = await boot('/ui/builder', { agents: [{ id: 'mock', available: true }, { id: 'claude-code', available: true, node_id: 'n1' }] })
+  try {
+    await waitUntil(() => selectorOpts(b).length === 2)
+    assert.deepEqual(optValues(b), ['claude-code', 'mock'], 'mock is offered (advertised) but sorted last')
+    assert.equal(b.dom.ids['compiler-select'].value, 'claude-code', 'real agent wins the default over mock')
+    b.dom.ids['new-session'].click()
+    const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    assert.equal(b.sess.lastBody.compiler_agent, 'claude-code')
+    const s = await b.gwGet('/v1/workflow-builder/sessions/' + sid)
+    assert.equal(s.session.compiler_agent, 'claude-code', 'durable session owned by the real agent — never silently mock')
+    assert.equal(b.dom.win.localStorage.getItem('vibe_builder_compiler_agent'), 'claude-code', 'used agent preserved for this browser')
+  } finally { await b.close() }
+})
+
+test('selector: a previously selected available agent is restored and used', async () => {
+  const b = await boot('/ui/builder', {
+    agents: [{ id: 'mock', available: true }, { id: 'claude-code', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n1' }],
+    ls: { vibe_builder_compiler_agent: 'codex' },
+  })
+  try {
+    await waitUntil(() => selectorOpts(b).length === 3)
+    assert.equal(b.dom.ids['compiler-select'].value, 'codex', 'previous per-browser selection restored (still available)')
+    b.dom.ids['new-session'].click()
+    const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    assert.equal((await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.compiler_agent, 'codex')
+  } finally { await b.close() }
+})
+
+test('selector: a stale selection blocks creation with a clear message (no silent substitution)', async () => {
+  const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n1' }] })
+  try {
+    await waitUntil(() => selectorOpts(b).length === 2)
+    const sel = b.dom.ids['compiler-select']; sel.value = 'codex'; sel.dispatch('change')     // explicit choice
+    b.agentsCtl.override = [{ id: 'claude-code', available: true, node_id: 'n1' }]           // codex disappears before create
+    b.dom.ids['new-session'].click()
+    const notice = await waitUntil(() => b.dom.ids['compiler-notice'])
+    assert.match(notice.textContent, /codex.*no longer available/i, 'clear message names the vanished agent')
+    assert.equal(new URL(b.dom.location.href).searchParams.get('session'), null, 'no session was created')
+    assert.equal(b.sess.count, 0, 'no create POST was sent — and nothing was substituted')
+    await waitUntil(() => selectorOpts(b).length === 1)                                       // inventory reloaded
+    assert.deepEqual(optValues(b), ['claude-code'], 'selector reflects the reloaded authoritative inventory')
+  } finally { await b.close() }
+})
+
+test('selector: mock-only inventory (real gateway) → mock clearly labeled, unavailability explained, explicit mock session works', async () => {
+  const b = await boot() // NO override: the real gateway /v1/agents (local mock only)
+  try {
+    await waitUntil(() => optValues(b)[0] === 'mock') // loaded (placeholder option has value '')
+    assert.deepEqual(optValues(b), ['mock'])
+    assert.equal(selectorOpts(b)[0].textContent, 'mock (deterministic)', 'mock is clearly distinguished from real agents')
+    assert.ok(b.dom.ids['mock-only-note'] && /real .*unavailable/i.test(b.dom.ids['mock-only-note'].textContent), 'explains that real compilation is unavailable')
+    b.dom.ids['new-session'].click()
+    const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    assert.equal(b.sess.lastBody.compiler_agent, 'mock', 'mock used only as the visible, advertised fallback')
+    const badge = await waitUntil(() => b.dom.ids['session-compiler'])
+    assert.match(badge.textContent, /compiler: mock/)
+    assert.equal((await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.compiler_agent, 'mock')
+  } finally { await b.close() }
+})
+
+test('selector: no agents advertised → creation blocked with a clear message', async () => {
+  const b = await boot('/ui/builder', { agents: [] })
+  try {
+    await waitUntil(() => b.dom.ids['no-agents-note'])
+    assert.equal(b.dom.ids['new-session'].disabled, true, 'New session disabled when nothing is advertised')
+    b.dom.ids['new-session'].click() // even a forced click must not create anything
+    await sleep(120)
+    assert.equal(b.sess.count, 0, 'no session POST')
+    assert.equal(new URL(b.dom.location.href).searchParams.get('session'), null)
+  } finally { await b.close() }
+})
+
+test('selector: unavailable agents are excluded; agent labels render safely (textContent only)', async () => {
+  const evil = '<img src=x onerror=alert(1)>'
+  const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: false, node_id: 'n1' }, { id: evil, available: true }, { id: 'mock', available: true }] })
+  try {
+    await waitUntil(() => selectorOpts(b).length === 2)
+    assert.ok(!optValues(b).includes('claude-code'), 'unavailable agents are not offered')
+    const evilOpt = selectorOpts(b).find((o: any) => o.getAttribute('value') === evil)
+    assert.ok(evilOpt, 'hostile id is listed as data')
+    assert.equal(evilOpt.textContent, evil, 'label is the literal string (textContent)')
+    assert.equal(findTag(b.dom.ids['sidebar'], 'img'), null, 'no element was created from the hostile label')
+  } finally { await b.close() }
+})
+
+test('selector: existing mock-backed sessions remain readable and show their compiler agent', async () => {
+  const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: true, node_id: 'n1' }] })
+  try {
+    // an EXISTING session created explicitly with mock (deterministic path) — unaffected by the selector
+    const cs = await (await fetch(b.base + '/v1/workflow-builder/sessions', { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: '{"compiler_agent":"mock","title":"Old mock session"}' })).json() as any
+    const b2 = await bootAt(b, '/ui/builder?session=' + cs.session.builder_session_id)
+    await waitUntil(() => anyText(app(b2.b), /Old mock session/))
+    const badge = await waitUntil(() => b2.b.dom.ids['session-compiler'])
+    assert.match(badge.textContent, /compiler: mock/, 'legacy mock session readable, ownership visible')
+    await b2.b.close()
   } finally { await b.close() }
 })
 
