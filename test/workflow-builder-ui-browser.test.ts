@@ -359,22 +359,28 @@ test('map: selection is preserved when the node identity is unchanged; resets wh
 })
 
 // ── compiler-agent selection (authoritative inventory → selector → session) ───
+// Choices are PLACEMENTS (agent id + node_id|null): the backend compiler routes by
+// exactly that pair, so option values are the JSON-encoded pair.
 const selectorOpts = (b: Boot) => findAll(b.dom.ids['compiler-select'], (n: any) => n.tagName === 'option')
-const optValues = (b: Boot) => selectorOpts(b).map((o: any) => o.getAttribute('value'))
+const optPairs = (b: Boot) => selectorOpts(b).map((o: any) => { try { return JSON.parse(o.getAttribute('value')) } catch { return o.getAttribute('value') } })
+const optIds = (b: Boot) => optPairs(b).map((p: any) => (Array.isArray(p) ? p[0] : p))
+const enc = (id: string, node: string | null) => JSON.stringify([id, node])
+const selValue = (b: Boot) => b.dom.ids['compiler-select'].value
 
 test('selector: real advertised agents appear; mock only when advertised; default prefers the first real agent', async () => {
   const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n1' }] })
   try {
     await waitUntil(() => selectorOpts(b).length === 2)
-    assert.deepEqual(optValues(b), ['claude-code', 'codex'], 'exactly the advertised agents, in advertised order')
-    assert.ok(!optValues(b).includes('mock'), 'mock is NOT offered when it is not advertised')
-    assert.equal(b.dom.ids['compiler-select'].value, 'claude-code', 'default = first real advertised agent')
+    assert.deepEqual(optPairs(b), [['claude-code', 'n1'], ['codex', 'n1']], 'exactly the advertised placements, in advertised order')
+    assert.ok(!optIds(b).includes('mock'), 'mock is NOT offered when it is not advertised')
+    assert.equal(selValue(b), enc('claude-code', 'n1'), 'default = first real advertised placement')
     assert.ok(findTag(b.dom.ids['sidebar'], 'select'), 'selector lives in the sidebar (narrow-viewport drawer) — composer area untouched')
     b.dom.ids['new-session'].click()
     await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
     assert.equal(b.sess.lastBody.compiler_agent, 'claude-code', 'POST carries the exact selected compiler_agent')
+    assert.equal(b.sess.lastBody.compiler_node_id, 'n1', 'POST carries the placement node — the compiler routes by the (agent, node) pair')
     const badge = await waitUntil(() => b.dom.ids['session-compiler'])
-    assert.match(badge.textContent, /compiler: claude-code/, 'the created session displays its owning compiler agent')
+    assert.match(badge.textContent, /compiler: claude-code @ n1/, 'the created session displays its owning compiler placement')
   } finally { await b.close() }
 })
 
@@ -382,28 +388,47 @@ test('selector: default prefers a real available agent over an advertised mock (
   const b = await boot('/ui/builder', { agents: [{ id: 'mock', available: true }, { id: 'claude-code', available: true, node_id: 'n1' }] })
   try {
     await waitUntil(() => selectorOpts(b).length === 2)
-    assert.deepEqual(optValues(b), ['claude-code', 'mock'], 'mock is offered (advertised) but sorted last')
-    assert.equal(b.dom.ids['compiler-select'].value, 'claude-code', 'real agent wins the default over mock')
+    assert.deepEqual(optIds(b), ['claude-code', 'mock'], 'mock is offered (advertised) but sorted last')
+    assert.equal(selValue(b), enc('claude-code', 'n1'), 'real agent wins the default over mock')
     b.dom.ids['new-session'].click()
     const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
     assert.equal(b.sess.lastBody.compiler_agent, 'claude-code')
     const s = await b.gwGet('/v1/workflow-builder/sessions/' + sid)
     assert.equal(s.session.compiler_agent, 'claude-code', 'durable session owned by the real agent — never silently mock')
-    assert.equal(b.dom.win.localStorage.getItem('vibe_builder_compiler_agent'), 'claude-code', 'used agent preserved for this browser')
+    assert.equal(s.session.compiler_node_id, 'n1', 'durable session routes to the advertised node')
+    assert.equal(b.dom.win.localStorage.getItem('vibe_builder_compiler_agent'), enc('claude-code', 'n1'), 'used placement preserved for this browser')
   } finally { await b.close() }
 })
 
-test('selector: a previously selected available agent is restored and used', async () => {
+test('selector: a previously selected available placement is restored and used', async () => {
   const b = await boot('/ui/builder', {
     agents: [{ id: 'mock', available: true }, { id: 'claude-code', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n1' }],
-    ls: { vibe_builder_compiler_agent: 'codex' },
+    ls: { vibe_builder_compiler_agent: enc('codex', 'n1') },
   })
   try {
     await waitUntil(() => selectorOpts(b).length === 3)
-    assert.equal(b.dom.ids['compiler-select'].value, 'codex', 'previous per-browser selection restored (still available)')
+    assert.equal(selValue(b), enc('codex', 'n1'), 'previous per-browser selection restored (still available)')
     b.dom.ids['new-session'].click()
     const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
-    assert.equal((await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.compiler_agent, 'codex')
+    const s = await b.gwGet('/v1/workflow-builder/sessions/' + sid)
+    assert.equal(s.session.compiler_agent, 'codex')
+    assert.equal(s.session.compiler_node_id, 'n1')
+  } finally { await b.close() }
+})
+
+test('selector: same agent id on two nodes → distinct disambiguated choices, exact node routed (regression)', async () => {
+  const b = await boot('/ui/builder', { agents: [{ id: 'codex', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n2' }, { id: 'mock', available: true }] })
+  try {
+    await waitUntil(() => selectorOpts(b).length === 3)
+    assert.deepEqual(optPairs(b), [['codex', 'n1'], ['codex', 'n2'], ['mock', null]], 'distinct executable targets are never collapsed')
+    const labels = selectorOpts(b).map((o: any) => o.textContent)
+    assert.ok(labels.includes('codex @ n1') && labels.includes('codex @ n2'), 'duplicate ids are disambiguated by node in the label')
+    const sel = b.dom.ids['compiler-select']; sel.value = enc('codex', 'n2'); sel.dispatch('change')
+    b.dom.ids['new-session'].click()
+    const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
+    assert.equal(b.sess.lastBody.compiler_agent, 'codex')
+    assert.equal(b.sess.lastBody.compiler_node_id, 'n2', 'the chosen node — not the first advertised one — is routed')
+    assert.equal((await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.compiler_node_id, 'n2')
   } finally { await b.close() }
 })
 
@@ -411,28 +436,29 @@ test('selector: a stale selection blocks creation with a clear message (no silen
   const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: true, node_id: 'n1' }, { id: 'codex', available: true, node_id: 'n1' }] })
   try {
     await waitUntil(() => selectorOpts(b).length === 2)
-    const sel = b.dom.ids['compiler-select']; sel.value = 'codex'; sel.dispatch('change')     // explicit choice
-    b.agentsCtl.override = [{ id: 'claude-code', available: true, node_id: 'n1' }]           // codex disappears before create
+    const sel = b.dom.ids['compiler-select']; sel.value = enc('codex', 'n1'); sel.dispatch('change') // explicit choice
+    b.agentsCtl.override = [{ id: 'claude-code', available: true, node_id: 'n1' }]                  // codex disappears before create
     b.dom.ids['new-session'].click()
     const notice = await waitUntil(() => b.dom.ids['compiler-notice'])
     assert.match(notice.textContent, /codex.*no longer available/i, 'clear message names the vanished agent')
     assert.equal(new URL(b.dom.location.href).searchParams.get('session'), null, 'no session was created')
     assert.equal(b.sess.count, 0, 'no create POST was sent — and nothing was substituted')
-    await waitUntil(() => selectorOpts(b).length === 1)                                       // inventory reloaded
-    assert.deepEqual(optValues(b), ['claude-code'], 'selector reflects the reloaded authoritative inventory')
+    await waitUntil(() => selectorOpts(b).length === 1)                                             // inventory reloaded
+    assert.deepEqual(optPairs(b), [['claude-code', 'n1']], 'selector reflects the reloaded authoritative inventory')
   } finally { await b.close() }
 })
 
 test('selector: mock-only inventory (real gateway) → mock clearly labeled, unavailability explained, explicit mock session works', async () => {
   const b = await boot() // NO override: the real gateway /v1/agents (local mock only)
   try {
-    await waitUntil(() => optValues(b)[0] === 'mock') // loaded (placeholder option has value '')
-    assert.deepEqual(optValues(b), ['mock'])
+    await waitUntil(() => optIds(b)[0] === 'mock') // loaded (placeholder option has value '')
+    assert.deepEqual(optPairs(b), [['mock', null]], 'local mock is a node-less placement')
     assert.equal(selectorOpts(b)[0].textContent, 'mock (deterministic)', 'mock is clearly distinguished from real agents')
     assert.ok(b.dom.ids['mock-only-note'] && /real .*unavailable/i.test(b.dom.ids['mock-only-note'].textContent), 'explains that real compilation is unavailable')
     b.dom.ids['new-session'].click()
     const sid = await waitUntil(() => new URL(b.dom.location.href).searchParams.get('session'))
     assert.equal(b.sess.lastBody.compiler_agent, 'mock', 'mock used only as the visible, advertised fallback')
+    assert.equal(b.sess.lastBody.compiler_node_id, undefined, 'a node-less local placement sends NO compiler_node_id')
     const badge = await waitUntil(() => b.dom.ids['session-compiler'])
     assert.match(badge.textContent, /compiler: mock/)
     assert.equal((await b.gwGet('/v1/workflow-builder/sessions/' + sid)).session.compiler_agent, 'mock')
@@ -456,11 +482,40 @@ test('selector: unavailable agents are excluded; agent labels render safely (tex
   const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: false, node_id: 'n1' }, { id: evil, available: true }, { id: 'mock', available: true }] })
   try {
     await waitUntil(() => selectorOpts(b).length === 2)
-    assert.ok(!optValues(b).includes('claude-code'), 'unavailable agents are not offered')
-    const evilOpt = selectorOpts(b).find((o: any) => o.getAttribute('value') === evil)
-    assert.ok(evilOpt, 'hostile id is listed as data')
+    assert.ok(!optIds(b).includes('claude-code'), 'unavailable agents are not offered')
+    const evilOpt = selectorOpts(b).find((o: any) => o.getAttribute('value') === enc(evil, null))
+    assert.ok(evilOpt, 'hostile id is listed as data (JSON-encoded value, no ambiguity)')
     assert.equal(evilOpt.textContent, evil, 'label is the literal string (textContent)')
     assert.equal(findTag(b.dom.ids['sidebar'], 'img'), null, 'no element was created from the hostile label')
+  } finally { await b.close() }
+})
+
+test('selector: malformed inventory → clear error, creation blocked, existing sessions still fully usable', async () => {
+  const b = await boot('/ui/builder', { agents: 'not-an-array' as any })
+  try {
+    await waitUntil(() => b.dom.ids['agents-error'])                       // no throw, no stuck state
+    assert.match(b.dom.ids['agents-error'].textContent, /could not load/i)
+    b.dom.ids['new-session'].click()                                       // creation is blocked with a message…
+    await waitUntil(() => b.dom.ids['compiler-notice'])
+    assert.equal(b.sess.count, 0, 'no session POST on malformed inventory')
+    assert.ok(!anyText(b.dom.ids['new-session'], /creating/i), 'create button is not stuck in Creating…')
+    // …but the Builder itself stays usable: an existing session opens normally
+    const cs = await (await fetch(b.base + '/v1/workflow-builder/sessions', { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: '{"compiler_agent":"mock","title":"Still opens"}' })).json() as any
+    b.dom.location.href = b.base + '/ui/builder?session=' + cs.session.builder_session_id
+    b.dom.win.dispatch('popstate')
+    await waitUntil(() => anyText(app(b), /Still opens/))
+    await waitUntil(() => b.dom.ids['composer-input'])
+    assert.ok(b.dom.ids['session-compiler'], 'session badge comes from persisted session data, not the (failed) inventory')
+  } finally { await b.close() }
+})
+
+test('selector: a legacy/corrupt stored selection is ignored silently (untrusted storage)', async () => {
+  const b = await boot('/ui/builder', { agents: [{ id: 'claude-code', available: true, node_id: 'n1' }], ls: { vibe_builder_compiler_agent: 'codex' } }) // pre-placement plain string
+  try {
+    await waitUntil(() => optIds(b)[0] === 'claude-code') // loaded (the loading placeholder also has one option)
+    assert.equal(selValue(b), enc('claude-code', 'n1'), 'default applies; corrupt value never blocks')
+    assert.equal(b.dom.doc.getElementById('compiler-notice'), null, 'no scary notice for malformed stored data')
+    assert.equal(b.dom.win.localStorage.getItem('vibe_builder_compiler_agent'), null, 'corrupt value cleaned up')
   } finally { await b.close() }
 })
 
