@@ -10,6 +10,15 @@
  * the server; a builder_revision_conflict refreshes state without dropping the
  * composer text. Rendering is textContent-only (XSS-safe); no innerHTML.
  *
+ * New sessions are created with a SELECTED compiler placement — an (agent, node)
+ * pair from the authoritative advertised inventory (`GET /v1/agents`) — never a
+ * hard-coded id. The pair matters: the backend compiler routes by exactly
+ * (compiler_agent, compiler_node_id), so node-advertised agents must carry their
+ * node_id or every compile fails closed. The default prefers a real advertised
+ * agent over the deterministic `mock`; a stale selection blocks creation with a
+ * clear message (no silent substitution). Each session's compiler placement is
+ * fixed at creation and shown in its header.
+ *
  * The right panel offers a live MAP (default) and DETAILS view of the current durable
  * draft — the map is the reusable framework-free SVG DAG from ./workflow-map.
  */
@@ -29,6 +38,8 @@ button:hover:not(:disabled){border-color:var(--accent)} button:disabled{opacity:
 button.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
 button.ghost{background:transparent}
 textarea{font:inherit;color:var(--ink);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:.55rem .65rem;width:100%;resize:vertical;min-height:44px}
+select{font:inherit;color:var(--ink);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:.35rem .45rem;flex:1;min-width:0}
+select:disabled{opacity:.5}
 a{color:var(--accent)} .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .hdr{display:flex;align-items:center;gap:.6rem;padding:.5rem .8rem;border-bottom:1px solid var(--line);background:var(--panel)}
 .hdr h1{font-size:15px;margin:0;flex:1} .hdr .tabs{display:none;gap:.4rem}
@@ -36,7 +47,8 @@ a{color:var(--accent)} .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monos
 .col{min-width:0;min-height:0;overflow:auto;border-right:1px solid var(--line)}
 .draftpanel{border-right:none;border-left:1px solid var(--line);background:var(--panel)}
 .sidebar{background:var(--panel)}
-.sbtop{display:flex;gap:.4rem;padding:.6rem;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+.sbtop{display:flex;gap:.4rem;padding:.6rem;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);flex-wrap:wrap;align-items:center}
+.sbnote{margin:.5rem .6rem 0}
 .slist{list-style:none;margin:0;padding:.3rem}
 .sitem{padding:.5rem .6rem;border-radius:8px;cursor:pointer;border:1px solid transparent}
 .sitem:hover{background:var(--panel2)} .sitem.sel{background:var(--panel2);border-color:var(--accent)}
@@ -119,6 +131,82 @@ function api(method,path,body){
     .catch(function(){return{status:0,body:null,net:true};});
 }
 
+// ── compiler-agent selection (authoritative inventory: GET /v1/agents) ──
+// A selectable choice is a PLACEMENT — an (agent id, node_id|null) pair — because the
+// backend compiler contract routes by exactly that pair: the builder session's
+// compiler_agent + compiler_node_id must match one inventory placement (findPlacement)
+// or every compile fails closed. Distinct nodes advertising the same agent id are
+// therefore distinct choices, never collapsed.
+var LS_KEY='vibe_builder_compiler_agent';
+function lsGet(k){try{return window.localStorage.getItem(k);}catch(e){return null;}}
+function lsSet(k,v){try{window.localStorage.setItem(k,v);}catch(e){}}
+function lsDel(k){try{window.localStorage.removeItem(k);}catch(e){}}
+function encChoice(id,node){return JSON.stringify([id,node||null]);}   // unambiguous for hostile ids
+function decChoice(v){try{var a=JSON.parse(v);if(Array.isArray(a)&&typeof a[0]==='string'&&a[0])return{id:a[0],node_id:(typeof a[1]==='string'&&a[1])?a[1]:null};}catch(e){}return null;}
+var agents=[];            // AVAILABLE advertised placements [{id,node_id,key}]
+var agentsLoaded=false, agentsError=null, agentsReqSeq=0;
+var selectedKey=lsGet(LS_KEY)||null;  // explicit choice key (restored per-browser); validated against inventory
+if(selectedKey&&!decChoice(selectedKey)){selectedKey=null;lsDel(LS_KEY);} // untrusted storage: drop malformed silently
+var creating=false;       // session-create in flight
+var sbNotice=null;        // {kind,text} shown in the sidebar (selector-related)
+
+// Available placements only, deduped by (id,node) pair. Advertised (server) order is
+// preserved (stable sort); mock placements sort last.
+function normalizeAgents(list){
+  var seen={},out=[];
+  (Array.isArray(list)?list:[]).forEach(function(a){
+    if(!a||typeof a.id!=='string'||!a.id||!a.available)return;
+    var node=(typeof a.node_id==='string'&&a.node_id)?a.node_id:null;
+    var k=encChoice(a.id,node);
+    if(seen[k])return;seen[k]=1;
+    out.push({id:a.id,node_id:node,key:k});
+  });
+  out.sort(function(x,y){return (x.id==='mock'?1:0)-(y.id==='mock'?1:0);});
+  return out;
+}
+function realAgents(){return agents.filter(function(a){return a.id!=='mock';});}
+function choiceName(c){return c.id+(c.node_id?(' @ '+c.node_id):'');}
+// Compact label: the node suffix appears only when the same agent id has multiple
+// placements (disambiguation); mock is always marked deterministic.
+function choiceLabel(c){
+  var dup=agents.filter(function(a){return a.id===c.id;}).length>1;
+  var base=dup?choiceName(c):c.id;
+  return c.id==='mock'?base+' (deterministic)':base;
+}
+// Default order: previously selected available placement → first real advertised
+// placement → mock only when no real agent is available. (No configured Builder
+// default exists; that rung is intentionally vacant.)
+function effectiveChoice(){
+  if(!agents.length)return null;
+  if(selectedKey){var m=agents.filter(function(a){return a.key===selectedKey;})[0];if(m)return m;}
+  var real=realAgents();
+  return real.length?real[0]:agents[0];
+}
+// A restored/explicit selection that is no longer advertised is DROPPED with a visible
+// message (never silently carried into a session; never silently substituted at create).
+function reconcileSelection(){
+  if(selectedKey&&agentsLoaded&&!agents.some(function(a){return a.key===selectedKey;})){
+    var c=decChoice(selectedKey);
+    sbNotice={kind:'warn',text:'Compiler agent "'+(c?choiceName(c):'?')+'" is no longer available. Pick an agent before creating a session.'};
+    selectedKey=null;lsDel(LS_KEY);
+    return false;
+  }
+  return true;
+}
+// Applies a fresh inventory; returns FALSE when the current selection vanished (the
+// reconcile notice is set and the selection cleared) — callers that are about to act
+// on the selection MUST stop on false rather than fall through to the default.
+function applyAgents(list){agents=normalizeAgents(list);agentsLoaded=true;agentsError=null;return reconcileSelection();}
+function loadAgents(){
+  var q=++agentsReqSeq; // ignore out-of-order responses (a stale reply never overwrites fresher inventory)
+  api('GET','/v1/agents').then(function(r){if(disposed||q!==agentsReqSeq)return;
+    if(r.status===200&&r.body&&Array.isArray(r.body.agents)){applyAgents(r.body.agents);}
+    else if(r.status===401){authError=true;}
+    else{agentsError='Could not load the compiler agent inventory.';}
+    render();
+  });
+}
+
 // ── durable state (server is the source of truth) ──
 var sid=null;           // active session id
 var sessions=[];        // list summaries
@@ -144,7 +232,7 @@ if(tabDraft)tabDraft.addEventListener('click',function(){var d=document.getEleme
 function stopPoll(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null;}}
 function schedulePoll(){stopPoll();if(disposed)return;pollTimer=setTimeout(function(){if(disposed||!sid)return;api('GET','/v1/workflow-builder/sessions/'+encodeURIComponent(sid)).then(function(r){if(disposed)return;if(r.status===200){setModel(r.body);render();if(isProcessing())schedulePoll();}});},1300);}
 
-function route(){stopPoll();var u=new URL(location.href);var s=u.searchParams.get('session');sid=s||null;notFound=false;authError=false;backendDown=false;loadList();if(sid)loadSession(sid);else{model=null;render();}}
+function route(){stopPoll();var u=new URL(location.href);var s=u.searchParams.get('session');sid=s||null;notFound=false;authError=false;backendDown=false;loadAgents();loadList();if(sid)loadSession(sid);else{model=null;render();}}
 
 function loadList(){api('GET','/v1/workflow-builder/sessions').then(function(r){if(disposed)return;if(r.status===0){backendDown=true;}else if(r.status===401){authError=true;}else if(r.status===200&&r.body){sessions=r.body.sessions||[];listError=null;}else{listError=(r.body&&r.body.message)||'Could not load sessions';}render();});}
 
@@ -216,8 +304,23 @@ function outcomeDot(sm){
 function renderSidebar(){
   var side=el('div',{id:'sidebar',class:'col sidebar'});
   var top=el('div',{class:'sbtop'});
-  top.append(el('button',{id:'new-session',class:'primary',onclick:createSession,text:'New session'}));
+  // compiler selector — options come ONLY from the advertised inventory (labels via textContent)
+  var sel=el('select',{id:'compiler-select','aria-label':'Compiler agent for new sessions',title:'Compiler agent for new sessions'});
+  if(!agentsLoaded){sel.append(el('option',{value:'',text:agentsError?'agents unavailable':'loading agents…'}));sel.disabled=true;}
+  else if(!agents.length){sel.append(el('option',{value:'',text:'no agents available'}));sel.disabled=true;}
+  else agents.forEach(function(a){sel.append(el('option',{value:a.key,text:choiceLabel(a),title:choiceName(a)}));});
+  var eff=effectiveChoice(); if(eff)sel.value=eff.key;
+  sel.addEventListener('change',function(){selectedKey=sel.value;lsSet(LS_KEY,sel.value);sbNotice=null;render();});
+  var nb=el('button',{id:'new-session',class:'primary',onclick:createSession,text:creating?'Creating…':'New session'});
+  nb.disabled=creating||(agentsLoaded&&!agents.length);
+  top.append(sel,nb);
   side.append(top);
+  if(sbNotice)side.append(el('div',{class:'notice sbnote '+(sbNotice.kind||'info'),id:'compiler-notice',text:sbNotice.text}));
+  if(agentsError)side.append(el('div',{class:'notice sbnote bad',id:'agents-error',text:agentsError}));
+  if(agentsLoaded&&agents.length&&!realAgents().length)
+    side.append(el('div',{class:'notice sbnote info',id:'mock-only-note',text:'Real conversational compilation is unavailable — no real compiler agent is advertised. New sessions use the deterministic mock compiler.'}));
+  if(agentsLoaded&&!agents.length)
+    side.append(el('div',{class:'notice sbnote warn',id:'no-agents-note',text:'No compiler agents are advertised — sessions cannot be created until an agent is available.'}));
   if(backendDown){side.append(el('div',{class:'empty',text:'Builder backend unavailable. Retrying…'}));return side;}
   if(listError){side.append(el('div',{class:'empty',text:listError}));return side;}
   var ul=el('ul',{class:'slist'});
@@ -247,6 +350,9 @@ function renderConversation(){
   if(loading||!model){msgs.append(el('div',{class:'empty',text:'Loading conversation…'}));conv.append(msgs);return conv;}
   var head=el('div',{class:'sbtop'});
   head.append(el('span',{class:'t',text:(model.session.title||'Untitled')}),statusBadge(model.session.status));
+  // the session's OWNING compiler placement — persisted session data only (never the
+  // current selector/inventory); fixed at creation (no mid-session switching)
+  if(model.session.compiler_agent)head.append(el('span',{class:'badge'+(model.session.compiler_agent==='mock'?' b-warn':''),id:'session-compiler',title:'Compiler agent for this session (fixed at creation)',text:'compiler: '+model.session.compiler_agent+(model.session.compiler_node_id?(' @ '+model.session.compiler_node_id):'')}));
   if(!isArchived())head.append(el('button',{id:'archive-session',class:'ghost',onclick:archiveSession,text:'Archive'}));
   conv.append(head);
   var kind=currentKind();
@@ -388,11 +494,32 @@ function readiness(kind,d){
 }
 
 // ── actions ──
+// Create with the SELECTED compiler placement, re-validated against a FRESH
+// authoritative inventory at click time. A selection that disappeared blocks creation
+// with a clear message — never silently substituted, never silently downgraded to mock.
+// The POST carries compiler_node_id when the placement is node-advertised: the backend
+// compiler routes by the exact (agent, node) pair, so dropping the node would make
+// every compile of a remote agent fail closed.
 function createSession(){
-  api('POST','/v1/workflow-builder/sessions',{compiler_agent:'mock'}).then(function(r){if(disposed)return;
-    if(r.status===201&&r.body&&r.body.session){ sessions.unshift({builder_session_id:r.body.session.builder_session_id,title:r.body.session.title,status:'active',updated_at:r.body.session.updated_at,revision:r.body.session.revision,draft_ready:false,processing:false,last_outcome:null,last_message_preview:null}); go('/ui/builder?session='+encodeURIComponent(r.body.session.builder_session_id)); }
-    else if(r.status===401){authError=true;render();}
-    else{notice={kind:'bad',text:(r.body&&r.body.message)||'Could not create a session'};render();}
+  if(creating)return;
+  creating=true;sbNotice=null;render();
+  ++agentsReqSeq; // this fresh fetch supersedes any in-flight background load
+  api('GET','/v1/agents').then(function(r){if(disposed)return;
+    if(r.status===401){creating=false;authError=true;render();return;}
+    if(r.status!==200||!r.body||!Array.isArray(r.body.agents)){creating=false;sbNotice={kind:'bad',text:'Could not load the compiler agent inventory — no session was created.'};render();return;}
+    // The create decision is anchored to THIS fresh response. A selection that
+    // vanished blocks creation HERE (sbNotice names it) — never falls through to
+    // the default, never substitutes.
+    if(!applyAgents(r.body.agents)){creating=false;render();return;}
+    var choice=effectiveChoice();
+    if(!choice){creating=false;sbNotice={kind:'bad',text:'No compiler agents are currently available — a session cannot be created.'};render();return;}
+    var body={compiler_agent:choice.id};
+    if(choice.node_id)body.compiler_node_id=choice.node_id;
+    api('POST','/v1/workflow-builder/sessions',body).then(function(r2){if(disposed)return;creating=false;
+      if(r2.status===201&&r2.body&&r2.body.session){ lsSet(LS_KEY,choice.key); sessions.unshift({builder_session_id:r2.body.session.builder_session_id,title:r2.body.session.title,status:'active',updated_at:r2.body.session.updated_at,revision:r2.body.session.revision,draft_ready:false,processing:false,last_outcome:null,last_message_preview:null}); go('/ui/builder?session='+encodeURIComponent(r2.body.session.builder_session_id)); }
+      else if(r2.status===401){authError=true;render();}
+      else{sbNotice={kind:'bad',text:(r2.body&&r2.body.message)||'Could not create a session'};render();}
+    });
   });
 }
 function openSession(id){ pendingKey=null; composerText=''; notice=null; selectedNodeId=null; selectedIssue=null; draftTab=null; go('/ui/builder?session='+encodeURIComponent(id)); }

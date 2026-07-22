@@ -57,6 +57,17 @@ test('workflowBuilderUiHtml: responsive layout (narrow media query, no horizonta
   assert.ok(html.includes('id="tab-sessions"') && html.includes('id="tab-draft"'), 'drawer toggles for narrow viewport')
 })
 
+test('workflowBuilderUiHtml: compiler selector consumes the authoritative inventory and stays compact/safe', () => {
+  const html = workflowBuilderUiHtml('n')
+  assert.ok(html.includes("'/v1/agents'"), 'options come from the advertised inventory endpoint (no hard-coded real agents)')
+  assert.ok(html.includes("id:'compiler-select'"), 'compact selector rendered near New session')
+  assert.ok(html.includes("' (deterministic)'"), 'mock is clearly distinguished from real agents')
+  assert.ok(!/compiler_agent:\s*'mock'/.test(html), 'session creation no longer hard-codes mock')
+  assert.ok(html.includes('compiler_node_id'), 'node-advertised placements route by the (agent, node) pair')
+  assert.ok(html.includes('flex-wrap:wrap'), 'selector row wraps on narrow screens instead of overflowing')
+  assert.ok(/lsGet|localStorage/.test(html) && html.includes('catch'), 'last selection preserved via guarded localStorage')
+})
+
 test('workflowBuilderUiHtml: retains a link back to the manual workflow builder (/ui)', () => {
   const html = workflowBuilderUiHtml('n')
   assert.ok(html.includes('href="/ui"'), 'manual builder remains reachable')
