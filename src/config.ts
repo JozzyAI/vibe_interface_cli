@@ -11,6 +11,11 @@ const CONFIG_PATH = path.join(resolveVibeDir(), 'config.json')
 interface VibeConfig {
   workspace_root: string
   node_id: string
+  /** Node-local roots under which an EXISTING directory may be used as a task cwd
+   *  (`workspace.path`). Default EMPTY: cwd-backed execution is disabled unless the
+   *  node operator explicitly configures roots (config.json or VIBE_ALLOWED_CWD_ROOTS,
+   *  comma-separated). Authorization is enforced per-run by resolveAllowedCwd(). */
+  allowed_cwd_roots: string[]
 }
 
 function ensureVibeDir(): string {
@@ -34,11 +39,19 @@ export function resolveConfig(): VibeConfig {
     }
   }
 
+  // allowed_cwd_roots: env (comma-separated) overrides config.json; anything
+  // malformed degrades to [] (feature OFF), never to a permissive default.
+  const envRoots = process.env.VIBE_ALLOWED_CWD_ROOTS
+  const allowedCwdRoots = envRoots !== undefined
+    ? envRoots.split(',').map((s) => s.trim()).filter((s) => s !== '')
+    : (Array.isArray(stored.allowed_cwd_roots) ? stored.allowed_cwd_roots.filter((r) => typeof r === 'string') : [])
+
   return {
     workspace_root: process.env.VIBE_WORKSPACE_ROOT
       ?? stored.workspace_root
       ?? path.join(dir, 'workspaces'),
     node_id: process.env.VIBE_NODE_ID ?? stored.node_id ?? 'local',
+    allowed_cwd_roots: allowedCwdRoots,
   }
 }
 

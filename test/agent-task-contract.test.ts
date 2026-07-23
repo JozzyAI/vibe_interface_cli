@@ -212,8 +212,11 @@ test('validateCreateTaskRequest rejects each malformed shape with invalid_reques
 })
 
 test('validateCreateTaskRequest fails CLOSED on deferred workspace/execution fields (no echo of values)', () => {
+  // NOTE: workspace.path is no longer deferred — it is the cwd-backed task field
+  // (opaque absolute path, authorized ONLY by the Node). Its shape/mutual-exclusion
+  // rules are covered in test/agent-task-cwd.test.ts.
   const cases: Array<[string, unknown, string]> = [
-    ['workspace.path', { agent: 'a', input: { text: 'x' }, workspace: { path: '/etc/passwd' } }, '/etc/passwd'],
+    ['workspace.path (relative)', { agent: 'a', input: { text: 'x' }, workspace: { path: 'etc/secret-rel' } }, 'secret-rel'],
     ['workspace.repo_url', { agent: 'a', input: { text: 'x' }, workspace: { repo_url: 'https://secret.example/r.git' } }, 'secret.example'],
     ['workspace.branch', { agent: 'a', input: { text: 'x' }, workspace: { branch: 'super-secret-branch' } }, 'super-secret-branch'],
     ['execution.timeout_seconds', { agent: 'a', input: { text: 'x' }, execution: { timeout_seconds: 999 } }, '999'],

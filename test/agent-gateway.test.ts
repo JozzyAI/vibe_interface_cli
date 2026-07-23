@@ -171,7 +171,7 @@ test('POST /v1/tasks validation: invalid body, arrays, unsupported agent, remote
 
 test('request semantics: deferred/unsafe fields fail CLOSED at the HTTP layer before any start', async () => {
   const bad: Record<string, unknown>[] = [
-    { agent: 'mock', input: { text: 'x' }, workspace: { path: '/etc/passwd' } },        // deferred
+    { agent: 'mock', input: { text: 'x' }, workspace: { path: 'etc/rel-secret' } },     // cwd field: relative → shape-rejected
     { agent: 'mock', input: { text: 'x' }, workspace: { repo_url: 'https://secret/r.git' } }, // deferred
     { agent: 'mock', input: { text: 'x' }, workspace: { branch: 'topsecret' } },         // deferred
     { agent: 'mock', input: { text: 'x' }, execution: { timeout_seconds: 30 } },         // deferred
@@ -189,6 +189,11 @@ test('request semantics: deferred/unsafe fields fail CLOSED at the HTTP layer be
   }
   // a safe opaque workspace_key is accepted
   assert.equal((await createTask({ workspace: { workspace_key: 'safe.key-1' } })).status, 202)
+  // a well-shaped ABSOLUTE workspace.path passes validation but LOCAL execution
+  // cannot authorize a cwd — structured 422, and it never echoes the path
+  const cwdLocal = await createTask({ workspace: { path: '/definitely/not/authorized' } })
+  assert.equal(cwdLocal.status, 422)
+  assert.ok(!JSON.stringify(cwdLocal.body).includes('/definitely/not/authorized'), 'no path echo')
 
   // no-start proof: a rejected request must NOT consume an active-cap slot
   const capped = await startAgentGateway({ host: '127.0.0.1', port: 0, apiToken: TOKEN, maxActiveTasks: 1 })
