@@ -11,7 +11,7 @@ API.
 Whether the caller is a human, a script, a CI pipeline, or a higher-level orchestrator,
 every task follows the same execution contract.
 
-Vibe Interface CLI focuses exclusively on remote execution. Agent orchestration,
+Vibe Interface CLI's core responsibility is remote execution. Agent orchestration,
 delegation, conversations, and workflows belong in higher-level systems built on top of
 this substrate.
 
