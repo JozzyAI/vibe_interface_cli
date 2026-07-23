@@ -306,14 +306,14 @@ test('buildAgentDescriptors: streaming only when known; node_id optional', () =>
 // ── error mapping ────────────────────────────────────────────────────────────
 
 test('apiError applies default retryability + http status per code', () => {
-  const codes: ApiErrorCode[] = ['invalid_request', 'unauthorized', 'agent_unavailable', 'node_offline', 'service_unavailable', 'task_not_found', 'invalid_state_transition', 'cancellation_conflict', 'idempotency_conflict', 'workspace_lease_unsupported', 'internal_error']
+  const codes: ApiErrorCode[] = ['invalid_request', 'unauthorized', 'agent_unavailable', 'node_offline', 'service_unavailable', 'task_not_found', 'invalid_state_transition', 'cancellation_conflict', 'idempotency_conflict', 'workspace_lease_unsupported', 'cwd_not_allowed', 'internal_error']
   const status: Record<ApiErrorCode, number> = {
     invalid_request: 400, unauthorized: 401, task_not_found: 404, cancellation_conflict: 409,
-    invalid_state_transition: 409, idempotency_conflict: 409, agent_unavailable: 422, workspace_lease_unsupported: 422, node_offline: 503, service_unavailable: 503, internal_error: 500,
+    invalid_state_transition: 409, idempotency_conflict: 409, agent_unavailable: 422, workspace_lease_unsupported: 422, cwd_not_allowed: 400, node_offline: 503, service_unavailable: 503, internal_error: 500,
   }
   const retryable: Record<ApiErrorCode, boolean> = {
     invalid_request: false, unauthorized: false, agent_unavailable: false, node_offline: true,
-    service_unavailable: true, task_not_found: false, invalid_state_transition: false, cancellation_conflict: false, idempotency_conflict: false, workspace_lease_unsupported: false, internal_error: true,
+    service_unavailable: true, task_not_found: false, invalid_state_transition: false, cancellation_conflict: false, idempotency_conflict: false, workspace_lease_unsupported: false, cwd_not_allowed: false, internal_error: true,
   }
   for (const c of codes) {
     const e = apiError(c, 'msg', { ts: 'T' })

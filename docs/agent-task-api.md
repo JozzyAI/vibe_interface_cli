@@ -231,7 +231,9 @@ through `taskIdForRun` and surfaced as `task_id`):
 
 Codes: `invalid_request`, `unauthorized`, `agent_unavailable`, `node_offline`,
 `service_unavailable`, `task_not_found`, `invalid_state_transition`,
-`cancellation_conflict`, `internal_error`. `node_offline` (a specific node is
+`cancellation_conflict`, `idempotency_conflict`, `workspace_lease_unsupported`,
+`cwd_not_allowed` (400, not retryable — the Node refused a `workspace.path`
+authorization; the message never echoes the path), `internal_error`. `node_offline` (a specific node is
 unreachable) and `service_unavailable` (the relay/gateway itself is unreachable —
 the public code never exposes "relay") are kept distinct; both are `503` and
 retryable. Legacy `VibeError` (`src/types.ts`) and remote `RunErrorCode`

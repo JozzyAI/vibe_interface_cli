@@ -730,10 +730,11 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     const code = classifyRunError(err)
     const message = err instanceof Error ? err.message : String(err)
     // The Node's cwd authorization refusal is a REQUEST problem, not an internal
-    // failure — surface it as a structured 400 (message is Node-sanitized: no path).
+    // failure — surface the FIRST-CLASS `cwd_not_allowed` API error code (400;
+    // message is Node-sanitized: it never contains the path or the roots).
     if (message.startsWith('cwd_not_allowed:')) {
-      const error = apiError('invalid_request', message, taskId ? { task_id: taskId } : {})
-      return { error, status: 400 }
+      const error = apiError('cwd_not_allowed', message, taskId ? { task_id: taskId } : {})
+      return { error, status: apiErrorHttpStatus(error.code) }
     }
     const error = runErrorToApiError(code, message, taskId ? { task_id: taskId } : {})
     return { error, status: apiErrorHttpStatus(error.code) }

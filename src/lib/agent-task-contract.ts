@@ -478,6 +478,7 @@ export type ApiErrorCode =
   | 'cancellation_conflict'
   | 'idempotency_conflict'
   | 'workspace_lease_unsupported'
+  | 'cwd_not_allowed'
   | 'internal_error'
 
 // Only the opaque `task_id` is exposed on the wire — the internal `run_id` is
@@ -505,6 +506,7 @@ const RETRYABLE: Record<ApiErrorCode, boolean> = {
   cancellation_conflict: false,
   idempotency_conflict: false,
   workspace_lease_unsupported: false,
+  cwd_not_allowed: false,
   internal_error: true,
 }
 
@@ -539,6 +541,7 @@ export function apiErrorHttpStatus(code: ApiErrorCode): number {
     case 'idempotency_conflict': return 409
     case 'agent_unavailable': return 422
     case 'workspace_lease_unsupported': return 422
+    case 'cwd_not_allowed': return 400
     case 'node_offline': return 503
     case 'service_unavailable': return 503
     case 'internal_error': return 500
