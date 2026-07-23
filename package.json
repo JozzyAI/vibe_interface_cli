@@ -1,7 +1,7 @@
 {
   "name": "vibe-interface-cli",
   "version": "0.2.0",
-  "description": "Universal worker-node runtime for coding-agent orchestrators",
+  "description": "Remote execution substrate for coding agents — one unified AgentTask API over Claude Code, Codex, and future providers",
   "type": "module",
   "bin": {
     "vibe": "./dist/src/index.js"
