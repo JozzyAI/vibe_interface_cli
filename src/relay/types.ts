@@ -61,6 +61,7 @@ export interface RunStartPayload {
   workspace_lease_id?: string // carried INSIDE the encrypted run_start payload (relay never reads it)
   workspace_write?: boolean   // policy: may modify the workspace (write STILL gated by a valid lease at the Node); carried INSIDE the encrypted payload
   verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
+  cwd?: string                // existing Node-local directory (authorized ONLY by the Node against allowed_cwd_roots); carried INSIDE the encrypted payload
 }
 
 // ── MVP 4C: encrypted run_event stream ─────────────────────────────────────
@@ -279,6 +280,12 @@ export interface RunStartMsg extends RelayMsgBase {
   workspace_lease_id?: string // workspace_lease_v1: authorize the run against the Node's active workspace lease (never forwarded to the provider)
   workspace_write?: boolean   // policy: may modify the workspace (write STILL gated by a valid lease at the Node); never forwarded to the provider
   verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
+  /** Run in an EXISTING Node-local directory instead of a scratch workspace.
+   *  Authorized ONLY by the Node against its configured allowed_cwd_roots
+   *  (resolveAllowedCwd; fail closed `cwd_not_allowed`). Mutually exclusive with
+   *  workspace_key / workspace_write / workspace_lease_id. Carried inside the
+   *  encrypted payload for encrypted runs. */
+  cwd?: string
 }
 
 // ── cli → relay → node daemon (bidirectional stop) ────────────────────────

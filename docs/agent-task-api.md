@@ -54,6 +54,9 @@ or any `*_aes_key`.
 - `workspace.workspace_key` (optional; an **opaque** key, matched against
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` — **not** a filesystem path; omit it and the
   runtime generates its own)
+- `workspace.path` (optional; run in an **existing Node-local directory** — see
+  **cwd-backed tasks** below). Mutually exclusive with `workspace.workspace_key`,
+  `execution.workspace_write`, and `workspace_lease_id`.
 - `execution.permission_mode` (`default` | `unsafe-skip`)
 - `metadata`
 - `idempotency_key` (optional; see **Idempotent creation** below)
@@ -67,14 +70,47 @@ or any `*_aes_key`.
   run. Distinct from `task_id` / `remote_run_id` / `idempotency_key` / `workflow_id`.
 
 **Reserved / deferred fields (rejected with `invalid_request` / 400):**
-`workspace.path`, `workspace.repo_url`, `workspace.branch`,
-`execution.timeout_seconds`. These have no runtime implementation in v1
-(`workspace.path` is unmapped; `timeout_seconds` has no structured runtime;
-local execution passes no repo, and the remote node records `repo_url`/`branch`
-but does not clone/prepare a repo before starting the backend). The API
-**fails closed** — it rejects these rather than silently ignoring them — and the
-error **never echoes** the submitted path/URL/branch/timeout or an unsafe
-`workspace_key`.
+`workspace.repo_url`, `workspace.branch`, `execution.timeout_seconds`. These
+have no runtime implementation in v1 (`timeout_seconds` has no structured
+runtime; local execution passes no repo, and the remote node records
+`repo_url`/`branch` but does not clone/prepare a repo before starting the
+backend). The API **fails closed** — it rejects these rather than silently
+ignoring them — and the error **never echoes** the submitted URL/branch/timeout
+or an unsafe `workspace_key`/`path`.
+
+### cwd-backed tasks (`workspace.path`)
+
+Run the agent **in an existing Node-local directory** (e.g. a checked-out
+repository) instead of a scratch workspace. The spawned agent process's
+`cwd` **is** the validated directory — nothing is copied, no repository
+abstraction is introduced, and the agent's own permission model is unchanged.
+
+- **Gateway boundary**: `workspace.path` is treated as an **opaque
+  absolute-path string** (bounded, no control characters). Gateway-side
+  validation is shape-only and **never trusted** for authorization.
+- **Node authorization (the only trust boundary)**: the Node validates the
+  request against its configured **`allowed_cwd_roots`** (`config.json`, or the
+  `VIBE_ALLOWED_CWD_ROOTS` env var, comma-separated). Default is **empty — the
+  feature is off** unless the node operator opts in. The requested path must be
+  absolute, must already exist, must be a directory, and its **fully resolved**
+  (`realpath`) form must equal or live under a resolved configured root —
+  sibling-prefix tricks (`/root-evil`), `..` traversal, and symlink escapes all
+  fail closed. The directory is **never created** by the Node.
+- **Capability gate**: a Node advertises the **`cwd`** capability only when at
+  least one configured root is a valid existing directory. The Gateway **rejects**
+  a `workspace.path` task whose target placement lacks the capability (422) —
+  an old or unconfigured Node can never silently run the task in a scratch
+  workspace. Local/in-process execution likewise rejects it (422).
+- **Failure**: an unauthorized path fails closed with a structured
+  **`cwd_not_allowed`** error (HTTP 400 via the Gateway). Public error messages
+  and logs never echo the requested path or the configured roots.
+- **Mutual exclusion**: `workspace.path` cannot be combined with
+  `workspace.workspace_key`, `execution.workspace_write`, or
+  `workspace_lease_id` — cwd-backed tasks never enter the managed
+  workspace-lease lifecycle. The scratch-workspace model is untouched when
+  `workspace.path` is absent.
+- **Transport**: the field travels **inside the encrypted `run_start` payload**
+  for remote runs — the relay never sees it.
 
 > The remote **node** independently enforces workspace-root containment for **all**
 > relay clients (`resolveContainedWorkspace` in `src/workspace.ts`): the same
@@ -195,7 +231,9 @@ through `taskIdForRun` and surfaced as `task_id`):
 
 Codes: `invalid_request`, `unauthorized`, `agent_unavailable`, `node_offline`,
 `service_unavailable`, `task_not_found`, `invalid_state_transition`,
-`cancellation_conflict`, `internal_error`. `node_offline` (a specific node is
+`cancellation_conflict`, `idempotency_conflict`, `workspace_lease_unsupported`,
+`cwd_not_allowed` (400, not retryable — the Node refused a `workspace.path`
+authorization; the message never echoes the path), `internal_error`. `node_offline` (a specific node is
 unreachable) and `service_unavailable` (the relay/gateway itself is unreachable —
 the public code never exposes "relay") are kept distinct; both are `503` and
 retryable. Legacy `VibeError` (`src/types.ts`) and remote `RunErrorCode`

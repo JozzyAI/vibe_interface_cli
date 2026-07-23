@@ -3,6 +3,65 @@ import fs from 'fs'
 import path from 'path'
 import { assertRepoAllowed, resolveRepoAllowlist, repoAllowlistEnabled } from './repo-policy.js'
 
+/** Capability id a Node advertises when it can authorize cwd-backed runs
+ *  (at least one valid `allowed_cwd_roots` entry). Gateways MUST fail closed on
+ *  a `workspace.path` task when the target placement lacks this capability —
+ *  an incapable Node would silently ignore the field and run in a scratch
+ *  workspace, which is exactly the outcome this gate prevents. */
+export const CWD_CAPABILITY = 'cwd'
+
+export type AllowedCwdResolution =
+  | { ok: true; path: string }
+  | { ok: false; code: 'cwd_not_allowed'; message: string }
+
+/**
+ * Node-side authorization of a requested EXISTING working directory against the
+ * Node's configured `allowed_cwd_roots`. The Node is the only trust boundary —
+ * Gateway-side validation is shape-only and never trusted. Fail closed on every
+ * branch; sanitized messages NEVER echo the requested path or the configured
+ * roots. This function never creates anything on disk.
+ */
+export function resolveAllowedCwd(cwd: unknown, allowedRoots: readonly string[]): AllowedCwdResolution {
+  const deny = (message: string): AllowedCwdResolution => ({ ok: false, code: 'cwd_not_allowed', message })
+  if (typeof cwd !== 'string' || cwd === '' || !path.isAbsolute(cwd)) return deny('cwd must be an absolute path')
+  if (!Array.isArray(allowedRoots) || allowedRoots.length === 0) return deny('this node does not allow cwd-backed runs (no allowed_cwd_roots configured)')
+  // The requested path must ALREADY exist and be a directory — a cwd run never
+  // creates its directory (that is the scratch-workspace_key model's job).
+  let realCwd: string
+  try { realCwd = fs.realpathSync(cwd) } catch { return deny('cwd does not exist on this node') }
+  let st: fs.Stats
+  try { st = fs.statSync(realCwd) } catch { return deny('cwd does not exist on this node') }
+  if (!st.isDirectory()) return deny('cwd is not a directory')
+  // Containment is judged on FULLY RESOLVED paths (both sides realpath'd), so a
+  // symlink inside an allowed root that points outside it fails closed, and a
+  // sibling prefix ("/root-evil" vs "/root") can never match.
+  for (const root of allowedRoots) {
+    if (typeof root !== 'string' || root === '' || !path.isAbsolute(root)) continue // invalid config entries never authorize
+    let realRoot: string
+    try { realRoot = fs.realpathSync(root) } catch { continue } // nonexistent root authorizes nothing
+    try { if (!fs.statSync(realRoot).isDirectory()) continue } catch { continue }
+    if (realCwd === realRoot || realCwd.startsWith(realRoot + path.sep)) return { ok: true, path: realCwd }
+  }
+  return deny('cwd is not under an allowed root on this node')
+}
+
+/** The configured roots that could actually authorize something right now
+ *  (absolute + existing directories). Drives the capability advertisement. */
+export function validAllowedCwdRoots(allowedRoots: readonly string[]): string[] {
+  const out: string[] = []
+  for (const root of Array.isArray(allowedRoots) ? allowedRoots : []) {
+    if (typeof root !== 'string' || root === '' || !path.isAbsolute(root)) continue
+    try { if (fs.statSync(fs.realpathSync(root)).isDirectory()) out.push(root) } catch { /* not a valid root */ }
+  }
+  return out
+}
+
+/** Append {@link CWD_CAPABILITY} to a capability list only when the Node has at
+ *  least one valid allowed cwd root. Evaluated at advertisement time. */
+export function withCwdCapability(base: string[], allowedRoots: readonly string[]): string[] {
+  return validAllowedCwdRoots(allowedRoots).length > 0 && !base.includes(CWD_CAPABILITY) ? [...base, CWD_CAPABILITY] : [...base]
+}
+
 export function resolveWorkspacePath(workspaceKey: string, workspaceRoot: string): string {
   fs.mkdirSync(workspaceRoot, { recursive: true })
   const realRoot = fs.realpathSync(workspaceRoot)

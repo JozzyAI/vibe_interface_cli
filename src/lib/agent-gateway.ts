@@ -42,6 +42,7 @@ import {
   type Task, type TaskEvent, type TaskEventType, type ApiError,
 } from './agent-task-contract.js'
 import { computeRequestFingerprint } from './request-fingerprint.js'
+import { CWD_CAPABILITY } from '../workspace.js'
 import type { GatewayTaskStore, ControlStore } from '../control/store.js'
 import { ControlStoreError, type CreateTaskInput, type TaskEventInput, type TaskRecord } from '../control/records.js'
 import { validateTaskResult, type AgentTaskResultV1, type TaskResultStatus } from './agent-task-result.js'
@@ -728,6 +729,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
   function remoteApiError(err: unknown, taskId?: string): { error: ApiError; status: number } {
     const code = classifyRunError(err)
     const message = err instanceof Error ? err.message : String(err)
+    // The Node's cwd authorization refusal is a REQUEST problem, not an internal
+    // failure — surface the FIRST-CLASS `cwd_not_allowed` API error code (400;
+    // message is Node-sanitized: it never contains the path or the roots).
+    if (message.startsWith('cwd_not_allowed:')) {
+      const error = apiError('cwd_not_allowed', message, taskId ? { task_id: taskId } : {})
+      return { error, status: apiErrorHttpStatus(error.code) }
+    }
     const error = runErrorToApiError(code, message, taskId ? { task_id: taskId } : {})
     return { error, status: apiErrorHttpStatus(error.code) }
   }
@@ -763,6 +771,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
     // safety with a Gateway-only row. Reject up front with a structured unsupported error.
     if (reqv.workspace_lease_id && !isRemote) {
       return sendError(res, apiError('workspace_lease_unsupported', 'workspace_lease_id requires an explicit lease-capable remote node_id; local/in-process execution cannot enforce a workspace lease'), 422)
+    }
+    // A cwd-backed task (`workspace.path`) can only be authorized by a cwd-capable
+    // Node (allowed_cwd_roots). Local/in-process execution has no such
+    // authorization surface — fail closed rather than silently running in a
+    // scratch workspace.
+    if (reqv.workspace?.path && !isRemote) {
+      return sendError(res, apiError('agent_unavailable', '`workspace.path` requires an explicit remote node_id advertising the "cwd" capability; local/in-process execution cannot authorize an existing directory'), 422)
     }
     // Remote agent validity is enforced by the target node (agent_not_supported).
 
@@ -827,6 +842,13 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
         const leaseCapable = Array.isArray(node.capabilities) && node.capabilities.includes(WORKSPACE_LEASE_CAPABILITY)
         if (!leaseCapable) { release(); return sendError(res, apiError('workspace_lease_unsupported', `node ${reqv.node_id} does not advertise workspace lease enforcement (${WORKSPACE_LEASE_CAPABILITY}); a lease-protected task cannot run there`, { details: { node_id: reqv.node_id } }), 422) }
       }
+      // A cwd-backed task fails closed against a Node that does not advertise cwd
+      // authorization — an old/incapable Node would silently ignore the field and
+      // run in a scratch workspace, which must never happen.
+      if (reqv.workspace?.path) {
+        const cwdCapable = Array.isArray(node.capabilities) && node.capabilities.includes(CWD_CAPABILITY)
+        if (!cwdCapable) { release(); return sendError(res, apiError('agent_unavailable', `node ${reqv.node_id} does not advertise cwd-backed execution (${CWD_CAPABILITY}); a \`workspace.path\` task cannot run there`, { details: { node_id: reqv.node_id } }), 422) }
+      }
     }
 
     // Prompt text -> a private temp file (both startRun and remoteRunStart take a
@@ -869,7 +891,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
 
       let rrec: RunRecord
       try {
-        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, permissionMode: reqv.execution?.permission_mode, workspaceWrite: reqv.execution?.workspace_write, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id, verify: reqv.verify })
+        rrec = await remoteRunStart(relay!, relayToken!, reqv.node_id!, { agent: reqv.agent as AgentBackend, promptFile, workspaceKey: reqv.workspace?.workspace_key, cwd: reqv.workspace?.path, permissionMode: reqv.execution?.permission_mode, workspaceWrite: reqv.execution?.workspace_write, metadata: reqv.metadata, encryptionPublicKey, workspaceLeaseId: reqv.workspace_lease_id, verify: reqv.verify })
       } catch (err) {
         release(); try { fs.unlinkSync(promptFile) } catch { /* */ }
         // Start DEFINITELY failed → record the canonical failure terminally, once.
@@ -901,6 +923,7 @@ export function startAgentGateway(opts: AgentGatewayOptions): Promise<GatewaySer
           agent: reqv.agent as AgentBackend,
           promptFile,
           workspaceKey: reqv.workspace?.workspace_key,
+          cwd: reqv.workspace?.path, // authorized ONLY by the Node (allowed_cwd_roots); fail closed
           // repo_url/branch are DEFERRED in Gateway v1 (rejected at validation) —
           // the node does not clone/prepare a repo before the backend starts.
           permissionMode: reqv.execution?.permission_mode,

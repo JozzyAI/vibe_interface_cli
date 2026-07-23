@@ -10,7 +10,7 @@ import { resolveConfig, vibeDir } from '../config.js'
 import { getHeartbeatMs } from '../node-state.js'
 import { generateRunId, tryReadRun, updateRun, writeRun } from '../store.js'
 import { appendEvent } from '../events.js'
-import { resolveContainedWorkspace } from '../workspace.js'
+import { resolveContainedWorkspace, resolveAllowedCwd, withCwdCapability } from '../workspace.js'
 import { mockBackend } from '../backends/mock.js'
 import { claudeCodeBackend } from '../backends/claude-code.js'
 import { codexBackend } from '../backends/codex.js'
@@ -104,22 +104,58 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
   // Remember the run's event key (encrypted runs) so journaled replay can be
   // re-encrypted per subscriber; cleared when the run's tailer finishes.
   if (eventAesKey) runEventKeys.set(runId, eventAesKey)
-  // The node is the filesystem trust boundary for every relay client. Contain the
-  // (untrusted) workspace_key within workspace_root BEFORE creating any directory,
-  // writing the run record, or starting a backend. Omitting the key uses the safe
-  // generated run_id. The error never echoes the submitted key.
-  const workspaceKey = msg.workspace_key ?? runId
-  const wsResolved = resolveContainedWorkspace(workspaceKey, config.workspace_root)
-  if (!wsResolved.ok) {
-    sendMsg(ws, {
-      version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
-      type: 'run_start_ack', req_id: msg.req_id, ok: false,
-      error: wsResolved.message, // never contains the submitted key
-      code: wsResolved.code,
-    })
-    return
+  // The node is the filesystem trust boundary for every relay client.
+  //
+  // TWO mutually exclusive workspace models:
+  //  - cwd-backed (msg.cwd): run in an EXISTING Node-local directory, authorized
+  //    against the operator-configured allowed_cwd_roots (resolveAllowedCwd; fail
+  //    closed `cwd_not_allowed`; NEVER created here). No workspace_key semantics,
+  //    no lease lifecycle, no workspace_write.
+  //  - scratch (default): contain the (untrusted) workspace_key within
+  //    workspace_root BEFORE creating any directory, writing the run record, or
+  //    starting a backend. Omitting the key uses the safe generated run_id.
+  // Errors never echo the submitted key/path.
+  const cwdBacked = msg.cwd !== undefined
+  let workspaceKey: string
+  let workspacePath: string
+  if (cwdBacked) {
+    // Node-side mutual exclusion — the Node never trusts the Gateway's validation.
+    if (msg.workspace_key !== undefined || msg.workspace_write || msg.workspace_lease_id) {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+        type: 'run_start_ack', req_id: msg.req_id, ok: false,
+        error: 'cwd is mutually exclusive with workspace_key, workspace_write, and workspace_lease_id',
+        code: 'cwd_not_allowed',
+      })
+      return
+    }
+    const cwdResolved = resolveAllowedCwd(msg.cwd, config.allowed_cwd_roots)
+    if (!cwdResolved.ok) {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+        type: 'run_start_ack', req_id: msg.req_id, ok: false,
+        error: cwdResolved.message, // sanitized — never contains the submitted path or the configured roots
+        code: cwdResolved.code,
+      })
+      return
+    }
+    workspaceKey = runId // placeholder identity only — a cwd run NEVER matches a workspace lease
+    workspacePath = cwdResolved.path
+  } else {
+    const key = msg.workspace_key ?? runId
+    const wsResolved = resolveContainedWorkspace(key, config.workspace_root)
+    if (!wsResolved.ok) {
+      sendMsg(ws, {
+        version: 1, kind: 'plaintext', from: nodeId, to: 'relay', ts: t(),
+        type: 'run_start_ack', req_id: msg.req_id, ok: false,
+        error: wsResolved.message, // never contains the submitted key
+        code: wsResolved.code,
+      })
+      return
+    }
+    workspaceKey = key
+    workspacePath = wsResolved.path
   }
-  const workspacePath = wsResolved.path
 
   // ── Workspace lease enforcement (workspace_lease_v1) ─────────────────────────
   // AFTER containment resolves the (untrusted) key, and BEFORE creating any
@@ -140,7 +176,9 @@ async function handleRunStart(ws: WebSocket, nodeId: string, config: ReturnType<
     }
   }
 
-  fs.mkdirSync(workspacePath, { recursive: true })
+  // Scratch workspaces are created on demand; a cwd-backed run NEVER creates (or
+  // re-creates) its directory — it was verified to exist at authorization time.
+  if (!cwdBacked) fs.mkdirSync(workspacePath, { recursive: true })
 
   // Write prompt content to a node-local temp file. The controller sends the
   // file's text content over the relay so the node never needs the controller's path.
@@ -261,6 +299,7 @@ async function handleEncryptedRunStart(
     ...(payload.workspace_lease_id && { workspace_lease_id: payload.workspace_lease_id }), // from the ENCRYPTED payload (relay never saw it)
     ...(payload.workspace_write && { workspace_write: true }), // from the ENCRYPTED payload (relay never saw it)
     ...(payload.verify && { verify: payload.verify }), // from the ENCRYPTED payload (relay never saw it)
+    ...(payload.cwd && { cwd: payload.cwd }), // from the ENCRYPTED payload (relay never saw it); authorized in handleRunStart
   }
 
   return handleRunStart(ws, nodeId, config, synthetic, eventAesKey, stopAesKey, approvalAesKey)
@@ -473,11 +512,14 @@ export async function relayNodeDaemon(
     // `verify-sandbox` is appended only when the enforcing verifier-sandbox probe
     // passes; evaluated once at register time (probe cached per process) → a
     // bubblewrap install/removal needs a Node restart to change the advertisement.
-    capabilities: withVerifierSandboxCapability([
+    // `cwd` is appended only when at least one configured allowed_cwd_root is a
+    // valid existing directory at register time — a node that cannot authorize a
+    // cwd run must never advertise the capability (the Gateway fails closed on it).
+    capabilities: withCwdCapability(withVerifierSandboxCapability([
       'run', 'stream', 'stop', 'workspace',
       ...(nodeJournal ? [RUN_EVENT_REPLAY_CAPABILITY, RUN_RESULT_CAPABILITY] : []),
       ...(workspaceLeaseCapability(nodeJournal) ? [workspaceLeaseCapability(nodeJournal)!] : []),
-    ]),
+    ]), config.allowed_cwd_roots),
     agents: advertisedAgents,
     active_runs: countActiveRuns(),
     max_runs: 4,
@@ -1086,6 +1128,10 @@ export interface RemoteRunStartOpts {
   /** Harness-owned post-task verifier config (argv only). Carried INSIDE the
    *  encrypted payload; never forwarded to the provider/prompt. */
   verify?: { profile: string } // Harness-owned verifier profile id (Node-policy-owned command; never forwarded to the provider)
+  /** Run in an EXISTING Node-local directory (absolute path). Authorized ONLY by
+   *  the Node against allowed_cwd_roots — fail closed. Mutually exclusive with
+   *  workspaceKey / workspaceWrite / workspaceLeaseId. */
+  cwd?: string
   /** When set, encrypt the run_start payload for the target node. */
   encryptionPublicKey?: string  // target node's X25519 encryption_public_key (base64)
 }
@@ -1138,6 +1184,7 @@ export async function remoteRunStart(
           ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
           ...(opts.workspaceWrite && { workspace_write: true }),
           ...(opts.verify && { verify: opts.verify }),
+          ...(opts.cwd && { cwd: opts.cwd }),
         }
         const enc = encryptPayload(opts.encryptionPublicKey, payload)
         capturedEphemeralPrivKey = enc.ephemeralPrivateKey
@@ -1171,6 +1218,7 @@ export async function remoteRunStart(
           ...(opts.workspaceLeaseId && { workspace_lease_id: opts.workspaceLeaseId }),
           ...(opts.workspaceWrite && { workspace_write: true }),
           ...(opts.verify && { verify: opts.verify }),
+          ...(opts.cwd && { cwd: opts.cwd }),
         })
       }
     })

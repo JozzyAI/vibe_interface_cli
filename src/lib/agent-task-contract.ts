@@ -189,12 +189,20 @@ export interface CreateTaskRequest {
   agent: string
   node_id?: string
   input: { text: string }
-  // Gateway v1 honours only `workspace.workspace_key` and
-  // `execution.permission_mode`. Other workspace/execution fields
-  // (path/repo_url/branch, timeout_seconds) are DEFERRED and FAIL CLOSED —
-  // validateCreateTaskRequest rejects them rather than silently dropping them.
+  // Gateway v1 honours `workspace.workspace_key` (scratch workspace),
+  // `workspace.path` (existing Node-local cwd) and `execution.permission_mode`.
+  // Other workspace/execution fields (repo_url/branch, timeout_seconds) are
+  // DEFERRED and FAIL CLOSED — validateCreateTaskRequest rejects them rather
+  // than silently dropping them.
   workspace?: {
     workspace_key?: string
+    /** OPTIONAL. Run in an EXISTING Node-local directory. Treated as an OPAQUE
+     *  absolute-path string at the Gateway boundary — authorization happens ONLY
+     *  on the Node against its configured `allowed_cwd_roots` (fail closed
+     *  `cwd_not_allowed`). Mutually exclusive with `workspace_key`,
+     *  `execution.workspace_write` and `workspace_lease_id`; requires a
+     *  placement advertising the `cwd` capability. */
+    path?: string
   }
   execution?: {
     permission_mode?: PermissionMode
@@ -238,7 +246,14 @@ export const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 export const WORKSPACE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 /** Workspace/execution fields recognised but DEFERRED in Gateway v1 (fail closed). */
-const DEFERRED_WORKSPACE_FIELDS = ['path', 'repo_url', 'branch'] as const
+const DEFERRED_WORKSPACE_FIELDS = ['repo_url', 'branch'] as const
+/** Bounded shape gate for `workspace.path` at the GATEWAY boundary only: an
+ *  absolute path string with no NUL/control characters. This is NOT
+ *  authorization — the Node alone decides whether the path is allowed
+ *  (allowed_cwd_roots), and Gateway-side validation is never trusted. */
+const CWD_PATH_MAX = 1024
+// eslint-disable-next-line no-control-regex
+const CWD_CONTROL_RE = /[\x00-\x1f\x7f]/
 const DEFERRED_EXECUTION_FIELDS = ['timeout_seconds'] as const
 
 /**
@@ -299,6 +314,20 @@ export function validateCreateTaskRequest(
         return fail('`workspace.workspace_key` must be an opaque key matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ (not a path)')
       }
     }
+    // workspace.path: SHAPE-ONLY gate (opaque absolute path string). This is not
+    // authorization — the Node alone authorizes against allowed_cwd_roots. The
+    // submitted value is never echoed back in the error. Mutually exclusive with
+    // every managed-workspace field: a cwd run has no scratch key, no write
+    // grant, and never enters the workspace-lease lifecycle.
+    if (workspace.path !== undefined) {
+      if (typeof workspace.path !== 'string' || workspace.path.length === 0 || workspace.path.length > CWD_PATH_MAX || CWD_CONTROL_RE.test(workspace.path)) {
+        return fail('`workspace.path` must be a non-empty absolute path string (max 1024 chars, no control characters)')
+      }
+      if (!workspace.path.startsWith('/')) return fail('`workspace.path` must be an absolute path')
+      if (workspace.workspace_key !== undefined) return fail('`workspace.path` is mutually exclusive with `workspace.workspace_key`')
+      if (exec && exec.workspace_write === true) return fail('`workspace.path` is mutually exclusive with `execution.workspace_write`')
+      if (b.workspace_lease_id !== undefined) return fail('`workspace.path` is mutually exclusive with `workspace_lease_id`')
+    }
   }
 
   if (b.metadata !== undefined && !isPlainObject(b.metadata)) return fail('`metadata` must be an object')
@@ -333,7 +362,12 @@ export function validateCreateTaskRequest(
 
   const value: CreateTaskRequest = { agent: b.agent, input: { text: input.text } }
   if (typeof b.node_id === 'string') value.node_id = b.node_id
-  if (workspace && typeof workspace.workspace_key === 'string') value.workspace = { workspace_key: workspace.workspace_key }
+  if (workspace && (typeof workspace.workspace_key === 'string' || typeof workspace.path === 'string')) {
+    value.workspace = {
+      ...(typeof workspace.workspace_key === 'string' ? { workspace_key: workspace.workspace_key } : {}),
+      ...(typeof workspace.path === 'string' ? { path: workspace.path } : {}),
+    }
+  }
   if (exec && (exec.permission_mode || exec.workspace_write !== undefined)) {
     value.execution = {
       ...(exec.permission_mode ? { permission_mode: exec.permission_mode as PermissionMode } : {}),
@@ -444,6 +478,7 @@ export type ApiErrorCode =
   | 'cancellation_conflict'
   | 'idempotency_conflict'
   | 'workspace_lease_unsupported'
+  | 'cwd_not_allowed'
   | 'internal_error'
 
 // Only the opaque `task_id` is exposed on the wire — the internal `run_id` is
@@ -471,6 +506,7 @@ const RETRYABLE: Record<ApiErrorCode, boolean> = {
   cancellation_conflict: false,
   idempotency_conflict: false,
   workspace_lease_unsupported: false,
+  cwd_not_allowed: false,
   internal_error: true,
 }
 
@@ -505,6 +541,7 @@ export function apiErrorHttpStatus(code: ApiErrorCode): number {
     case 'idempotency_conflict': return 409
     case 'agent_unavailable': return 422
     case 'workspace_lease_unsupported': return 422
+    case 'cwd_not_allowed': return 400
     case 'node_offline': return 503
     case 'service_unavailable': return 503
     case 'internal_error': return 500
