@@ -15,6 +15,7 @@
  * workflow objective is complete.
  */
 import crypto from 'crypto'
+import { redact } from '../redact.js'
 import { validateTaskVerification, verificationsEquivalent, type TaskVerificationV1 } from './task-verification.js'
 
 export const AGENT_TASK_RESULT_SCHEMA_VERSION = '1'
@@ -71,15 +72,29 @@ export interface BuildResultInput {
   verification?: TaskVerificationV1
 }
 
-/** Build a well-formed AgentTaskResultV1 (computes the content hash). The caller
- *  is responsible for bounding `text` before persistence (validate enforces it). */
+/** Build a well-formed AgentTaskResultV1 (computes the content hash).
+ *
+ *  ORDERING INVARIANT (redaction × content integrity):
+ *  `final_output.text` is REDACTED HERE, before `content_hash` is computed, so
+ *  the hash always describes the EXACT canonical text that is persisted and
+ *  later validated: `content_hash === sha256(final_output.text)` at every layer
+ *  (run record, node journal, gateway store). The persistence choke points
+ *  (`writeRun → redactDeep`, event log) still redact defensively — that second
+ *  pass is a NO-OP on this text because `redact()` is idempotent (guaranteed by
+ *  test). A `content_hash_mismatch` from `validateTaskResult` therefore always
+ *  means genuine stored-data corruption, never a redaction artifact. The built
+ *  result never carries unredacted secret-like content, even in memory.
+ *
+ *  The caller is responsible for bounding `text` before persistence (validate
+ *  enforces it). */
 export function buildTaskResult(input: BuildResultInput): AgentTaskResultV1 {
+  const text = redact(input.text)
   return {
     schema_version: '1',
-    final_output: { kind: 'text', text: input.text },
+    final_output: { kind: 'text', text },
     process_exit_code: input.processExitCode ?? null,
     finalized_at: input.finalizedAt ?? new Date().toISOString(),
-    content_hash: computeResultContentHash(input.text),
+    content_hash: computeResultContentHash(text),
     evidence_refs: input.evidenceRefs ?? [],
     artifact_refs: input.artifactRefs ?? [],
     ...(input.verification ? { verification: input.verification } : {}),
