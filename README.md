@@ -1,26 +1,48 @@
 # Vibe Interface CLI
 
-Vibe Interface CLI turns any paired machine into an orchestrator-ready worker node.
+**Turn your coding subscriptions into programmable remote agents.**
 
-Most coding-agent orchestrators are tightly coupled to one execution model:
+Vibe Interface CLI is a remote execution substrate for coding agents.
+
+It turns any machine into a programmable node and exposes subscription-backed coding
+agents—such as Claude Code, Codex, and future providers—through one unified AgentTask
+API.
+
+Whether the caller is a human, a script, a CI pipeline, or a higher-level orchestrator,
+every task follows the same execution contract.
+
+Vibe Interface CLI focuses exclusively on remote execution. Agent orchestration,
+delegation, conversations, and workflows belong in higher-level systems built on top of
+this substrate.
+
+## Core Capabilities
+
+- **Remote nodes** — pair any machine over an E2E-encrypted relay (`vibe connect`, `vibe node daemon`); the node owns its identity, agents, and workspace roots
+- **Agent discovery** — authoritative advertised (agent, node) placements via `GET /v1/agents`
+- **AgentTask lifecycle** — create / status / SSE stream / cancel over one agent-neutral contract, with idempotent creation and durable, authoritative results
+- **Workspace management** — opaque workspace keys, node-side containment, and exclusive workspace leases (the node is the authority)
+- **Verification** — node-owned test verification, embedded in the AgentTaskResult; never inferred from agent prose
+- **Remote terminals** — tmux-backed web terminals and dashboards for any paired node
+- **Unified Gateway API** — `vibe api serve`: REST + SSE, dedicated Bearer auth, loopback-first
+- **MCP task tools** — the same task surface exposed as MCP tools for local hosts (Claude Desktop, Cursor)
+
+## Design Philosophy
+
+Vibe Interface CLI intentionally stays small.
+
+It provides a stable execution layer for coding agents without making assumptions about
+how they should be orchestrated:
 
 ```
-orchestrator → SSH host / local process / Codex app-server
+caller (human / script / CI / orchestrator)
+        │  REST · SSE · MCP
+        ▼
+Vibe Agent Gateway → Vibe Node → coding agent backend
 ```
 
-Vibe introduces a different boundary:
-
-```
-orchestrator → Vibe Worker Contract → Vibe Node → coding agent backend
-```
-
-The orchestrator stays responsible for task planning, issue lifecycle, retries, and status
-tracking. Vibe handles where and how the work runs.
-
-This MVP proves the contract with [Symphony](https://github.com/JozzyAI/universe-symphony):
-Symphony can dispatch work through an `ExternalExecutor` seam instead of only talking to
-`codex app-server`. The worker runtime is Vibe. The coding agent is mock or Claude Code.
-The relay is E2E encrypted.
+Higher-level systems—including delegation, multi-agent conversations, approvals, and
+workflows—should communicate with Vibe Interface through its public APIs rather than
+extending the execution substrate itself.
 
 **What is working:**
 
